@@ -15,6 +15,7 @@
 #define MLIR_INITALLDIALECTS_H_
 
 #include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/CIM/CIMDialect.h"
 #include "mlir/Dialect/FxpMathOps/FxpMathOps.h"
 #include "mlir/Dialect/GPU/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -37,6 +38,7 @@ namespace mlir {
 inline void registerAllDialects() {
   static bool init_once = []() {
     registerDialect<AffineOpsDialect>();
+    registerDialect<cim::CIMDialect>();
     registerDialect<fxpmath::FxpMathOpsDialect>();
     registerDialect<gpu::GPUDialect>();
     registerDialect<LLVM::LLVMDialect>();

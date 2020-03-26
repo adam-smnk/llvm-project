@@ -24,6 +24,7 @@ set(LIBS
   MLIRAnalysis
   MLIRAffineOps
   MLIRAffineToStandard
+  MLIRCIM
   MLIRDialect
   MLIRLoopsToGPU
   MLIRLinalgToLLVM

@@ -1,5 +1,6 @@
 add_subdirectory(AffineOps)
 add_subdirectory(FxpMathOps)
+add_subdirectory(CIM)
 add_subdirectory(GPU)
 add_subdirectory(Linalg)
 add_subdirectory(LLVMIR)

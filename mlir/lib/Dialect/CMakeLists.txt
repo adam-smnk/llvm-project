@@ -1,4 +1,5 @@
 add_subdirectory(AffineOps)
+add_subdirectory(CIM)
 add_subdirectory(FxpMathOps)
 add_subdirectory(GPU)
 add_subdirectory(Linalg)
@@ -35,6 +36,7 @@ add_llvm_library(MLIRAllDialects
 )
 target_link_libraries(MLIRAllDialects
   MLIRAffineOps
+  MLIRCIM
   MLIRFxpMathOps
   MLIRGPU
   MLIRLLVMIR
