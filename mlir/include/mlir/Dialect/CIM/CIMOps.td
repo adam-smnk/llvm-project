@@ -53,7 +53,7 @@ def CIM_MemcpyToDeviceOp : CIM_Op<"memcpy_to_device", [NoSideEffect]> {
     The provided memory should be contiguous.
   }];
 
-  let arguments = (ins AnyStridedMemRef:$dataMemRef);
+  let arguments = (ins AnyMemRef:$dataMemRef);
 
   let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
 }
@@ -65,7 +65,7 @@ def CIM_MemcpyToHostOp : CIM_Op<"memcpy_to_host", [NoSideEffect]> {
     The provided memory should be contiguous.
   }];
 
-  let arguments = (ins AnyStridedMemRef:$dataMemRef);
+  let arguments = (ins AnyMemRef:$dataMemRef);
 
   let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
 }
