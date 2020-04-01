@@ -53,9 +53,10 @@ def CIM_MemcpyToDeviceOp : CIM_Op<"memcpy_to_device", [NoSideEffect]> {
     The provided memory should be contiguous.
   }];
 
-  let arguments = (ins AnyMemRef:$dataMemRef);
+  let arguments = (ins AnyMemRef:$hostMemRef);
+  let results = (outs AnyMemRef:$deviceMemRef);
 
-  let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
+  let assemblyFormat = "`(` operands `)` attr-dict `:` functional-type(operands, results)";
 }
 
 def CIM_MemcpyToHostOp : CIM_Op<"memcpy_to_host", [NoSideEffect]> {
@@ -65,9 +66,10 @@ def CIM_MemcpyToHostOp : CIM_Op<"memcpy_to_host", [NoSideEffect]> {
     The provided memory should be contiguous.
   }];
 
-  let arguments = (ins AnyMemRef:$dataMemRef);
+  let arguments = (ins AnyMemRef:$deviceMemRef);
+  let results = (outs AnyMemRef:$hostMemRef);
 
-  let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
+  let assemblyFormat = "`(` operands `)` attr-dict `:` functional-type(operands, results)";
 }
 
 #endif // CIM_OPS
