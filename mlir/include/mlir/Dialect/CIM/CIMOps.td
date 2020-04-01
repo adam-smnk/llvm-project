@@ -45,7 +45,7 @@ def CIM_MemcpyOpDirectionAttr : StrEnumAttr<"MemcpyOpDirectionAttr",
 class CIM_Op<string mnemonic, list<OpTrait> traits = []> :
     Op<CIM_Dialect, mnemonic, traits>;
 
-def CIM_MatmulOp : CIM_Op<"matmul", []> {
+def CIM_MatmulOp : CIM_Op<"matmul"> {
   let summary = "matrix multiplication";
   let description = [{
     The "matmul" operation performs matrix multiplication between
@@ -60,11 +60,13 @@ def CIM_MatmulOp : CIM_Op<"matmul", []> {
   let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
 }
 
-def CIM_AllocOp : CIM_Op<"alloc", []> {
+def CIM_AllocOp : CIM_Op<"alloc"> {
   let summary = "allocate memory on CIM device";
   let description = [{
     The "alloc" operation allocates a region of memory, as specified by
     its memref type, on CIM device.
+    The optional list of size operands are bound to the dynamic dimensions
+    specified in its memref type.
   }];
 
   let arguments = (ins Variadic<Index>:$sizes);
@@ -73,7 +75,7 @@ def CIM_AllocOp : CIM_Op<"alloc", []> {
   let assemblyFormat = "`(` ($sizes^)? `)` attr-dict `:` type(results)";
 }
 
-def CIM_DeallocOp : CIM_Op<"dealloc", []> {
+def CIM_DeallocOp : CIM_Op<"dealloc"> {
   let summary = "deallocate memory on CIM device";
   let description = [{
     The "dealloc" operation frees the region of CIM device memory referenced
@@ -85,7 +87,7 @@ def CIM_DeallocOp : CIM_Op<"dealloc", []> {
   let assemblyFormat = "operands attr-dict `:` type(operands)";
 }
 
-def CIM_MemcpyOp : CIM_Op<"memcpy", [NoSideEffect]> {
+def CIM_MemcpyOp : CIM_Op<"memcpy"> {
   let summary = "copy data between host and device";
   let description = [{
     The "memcpy" operation copies data between host and CIM device from
@@ -102,7 +104,7 @@ def CIM_MemcpyOp : CIM_Op<"memcpy", [NoSideEffect]> {
   let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
 }
 
-def CIM_MemcpyToDeviceOp : CIM_Op<"memcpy_to_device", [NoSideEffect]> {
+def CIM_MemcpyToDeviceOp : CIM_Op<"memcpy_to_device"> {
   let summary = "copy data to CIM device";
   let description = [{
     The "memcpy_to_device" operation copies data from host to CIM device.
@@ -115,7 +117,7 @@ def CIM_MemcpyToDeviceOp : CIM_Op<"memcpy_to_device", [NoSideEffect]> {
   let assemblyFormat = "`(` operands `)` attr-dict `:` functional-type(operands, results)";
 }
 
-def CIM_MemcpyToHostOp : CIM_Op<"memcpy_to_host", [NoSideEffect]> {
+def CIM_MemcpyToHostOp : CIM_Op<"memcpy_to_host"> {
   let summary = "copy data from CIM device";
   let description = [{
     The "memcpy_to_host" operation copies data from CIM device to host.
