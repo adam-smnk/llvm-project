@@ -20,6 +20,7 @@
 #include "mlir/Conversion/GPUToROCDL/GPUToROCDLPass.h"
 #include "mlir/Conversion/GPUToSPIRV/ConvertGPUToSPIRVPass.h"
 #include "mlir/Conversion/GPUToVulkan/ConvertGPUToVulkanPass.h"
+#include "mlir/Conversion/LinalgToCIM/LinalgToCIMPass.h"
 #include "mlir/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "mlir/Conversion/LinalgToSPIRV/LinalgToSPIRVPass.h"
 #include "mlir/Conversion/LoopsToGPU/LoopsToGPUPass.h"
@@ -106,6 +107,7 @@ inline void registerAllPasses() {
   createConvertLinalgToParallelLoopsPass();
   createConvertLinalgToAffineLoopsPass();
   createConvertLinalgToLLVMPass();
+  createConvertLinalgToCIMPass();
 
   // LoopOps
   createParallelLoopFusionPass();
