@@ -1,4 +1,4 @@
-//===- CIMDialect.cpp - Implementation of the CIM operations -------===//
+//===- CIMDialect.cpp - Implementation of the CIM operations --------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -45,11 +45,6 @@ static void appendMangledType(llvm::raw_string_ostream &ss, Type t) {
       else
         ss << size << "x";
     appendMangledType(ss, memref.getElementType());
-  } else if (auto vec = t.dyn_cast<VectorType>()) {
-    ss << "vector";
-    interleave(
-        vec.getShape(), [&](int64_t i) { ss << i; }, [&]() { ss << "x"; });
-    appendMangledType(ss, vec.getElementType());
   } else if (t.isSignlessIntOrIndexOrFloat()) {
     ss << t;
   } else {
