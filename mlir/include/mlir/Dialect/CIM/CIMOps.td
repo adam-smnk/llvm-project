@@ -59,6 +59,13 @@ def CIM_MatmulOp : CIM_Op<"matmul"> {
     The "matmul" operation performs matrix multiplication between
     the first two matricies. The result is stored in the third one.
     The shapes of the matricies are expected to be valid.
+
+		Example:
+
+		```mlir
+			// C(m, n) = A(m, k) * B(k, n)
+			cim.matmul(%A, %B, %C) : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
+		```
   }];
 
   let arguments = (ins AnyStridedMemRefOfRank<2>:$A,
@@ -75,6 +82,19 @@ def CIM_AllocOp : CIM_Op<"alloc"> {
     its memref type, on CIM device.
     The optional list of size operands are bound to the dynamic dimensions
     specified in its memref type.
+
+		Example:
+
+		```mlir
+			%0 = cim.alloc() : memref<2x3xf32>
+		```
+
+		The optional list of dimension operands are bound to the dynamic dimensions
+    specified in its memref type.
+
+		```mlir
+			%0 = cim.alloc(%d1, %d2) : memref<?x?xf32>
+		```
   }];
 
   let arguments = (ins Variadic<Index>:$sizes);
@@ -88,6 +108,13 @@ def CIM_DeallocOp : CIM_Op<"dealloc"> {
   let description = [{
     The "dealloc" operation frees the region of CIM device memory referenced
     by a memref which was originally created by the "alloc" operation.
+
+		Example:
+
+		```mlir
+			%0 = cim.alloc(%d1, %d2) : memref<?x?xf32>
+			cim.dealloc %0 : memref<?x?xf32>
+		```
   }];
 
   let arguments = (ins AnyMemRef:$memref);
@@ -102,6 +129,13 @@ def CIM_MemcpyOp : CIM_Op<"memcpy"> {
     the provided source to destination location.
     The memory references are expected to be compatible and have enough
     storage to perform the copy.
+
+		Example:
+
+		```mlir
+			cim.memcpy(%A, %devA) { copyDirection = "toDevice" } : memref<?x?xf32, offset: ?, strides: [?, 1]>, memref<?x?xf32>
+			cim.memcpy(%devA, %A) { copyDirection = "toHost" } : memref<?x?xf32>, memref<?x?xf32, offset: ?, strides: [?, 1]>
+		```
   }];
 
   let arguments = (ins
@@ -117,6 +151,12 @@ def CIM_MemcpyToDeviceOp : CIM_Op<"memcpy_to_device"> {
   let description = [{
     The "memcpy_to_device" operation copies data from host to CIM device.
     The provided memory should be contiguous.
+
+		Example:
+
+		```mlir
+			  %devA = cim.memcpy_to_device(%A) : (memref<?x?xf32>) -> (memref<?x?xf32>)
+		```
   }];
 
   let arguments = (ins AnyMemRef:$hostMemRef);
@@ -130,6 +170,13 @@ def CIM_MemcpyToHostOp : CIM_Op<"memcpy_to_host"> {
   let description = [{
     The "memcpy_to_host" operation copies data from CIM device to host.
     The provided memory should be contiguous.
+
+		Example:
+
+		```mlir
+			%devA = cim.alloc(%d1, %d2) : memref<?x?xf32>
+			%A = cim.memcpy_to_host(%devA) : : (memref<?x?xf32>) -> (memref<?x?xf32>)
+		```
   }];
 
   let arguments = (ins AnyMemRef:$deviceMemRef);
