@@ -52,6 +52,10 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
 
     rewriter.create<cim::MemcpyOp>(op.getLoc(), devC, hostC, "toHost");
 
+    rewriter.create<cim::DeallocOp>(op.getLoc(), devA);
+    rewriter.create<cim::DeallocOp>(op.getLoc(), devB);
+    rewriter.create<cim::DeallocOp>(op.getLoc(), devC);
+
     rewriter.eraseOp(op);
     return matchSuccess();
   }

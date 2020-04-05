@@ -24,3 +24,6 @@ func @matmul(%arg0: memref<?xi8>, %M: index, %N: index, %K: index) {
 //       CHECK: %[[devC:.*]] = cim.memcpy_to_device(%[[C]]) : (memref<?x?xf32, #[[strided2D]]>) -> memref<?x?xf32, #[[strided2D]]>
 //       CHECK: cim.matmul(%[[devA]], %[[devB]], %[[devC]]) : memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32, #[[strided2D]]>
 //       CHECK: cim.memcpy(%[[devC]], %[[C]]) {copyDirection = "toHost"} : memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32, #[[strided2D]]>
+//       CHECK: cim.dealloc %[[devA]] : memref<?x?xf32, #[[strided2D]]>
+//       CHECK: cim.dealloc %[[devB]] : memref<?x?xf32, #[[strided2D]]>
+//       CHECK: cim.dealloc %[[devC]] : memref<?x?xf32, #[[strided2D]]>
