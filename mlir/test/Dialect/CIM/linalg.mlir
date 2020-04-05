@@ -2,7 +2,6 @@
 
 // CHECK-DAG: #[[strided2D:.*]] = affine_map<(d0, d1)[s0, s1] -> (d0 * s1 + s0 + d1)>
 
-
 func @matmul(%arg0: memref<?xi8>, %M: index, %N: index, %K: index) {
   %c0 = constant 0 : index
   %c1 = constant 1 : index
@@ -27,3 +26,34 @@ func @matmul(%arg0: memref<?xi8>, %M: index, %N: index, %K: index) {
 //       CHECK: cim.dealloc %[[devA]] : memref<?x?xf32, #[[strided2D]]>
 //       CHECK: cim.dealloc %[[devB]] : memref<?x?xf32, #[[strided2D]]>
 //       CHECK: cim.dealloc %[[devC]] : memref<?x?xf32, #[[strided2D]]>
+
+
+#matmul_trait = {
+  args_in = 2,
+  args_out = 1,
+  indexing_maps = [
+    affine_map<(d0, d1, d2) -> (d0, d2)>,
+    affine_map<(d0, d1, d2) -> (d2, d1)>,
+    affine_map<(d0, d1, d2) -> (d0, d1)>
+  ],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func @generic_matmul(%arg0: memref<?x?xf32>, %arg1: memref<?x?xf32>, %arg2: memref<?x?xf32>) {
+  linalg.generic #matmul_trait %arg0, %arg1, %arg2 {
+  ^bb0(%arg3: f32, %arg4: f32, %arg5: f32):	// no predecessors
+    %3 = "std.mulf"(%arg3, %arg4) : (f32, f32) -> f32
+    %4 = "std.addf"(%3, %arg5) : (f32, f32) -> f32
+    "linalg.yield"(%4) : (f32) -> ()
+  } : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
+  return
+}
+// CHECK-LABEL: func @generic_matmul(
+// CHECK-SAME: %{{.*}}: memref<?x?xf32>, %{{.*}}: memref<?x?xf32>, %{{.*}}: memref<?x?xf32>) {
+//       CHECK: %{{.*}} = cim.memcpy_to_device(%{{.*}}) : (memref<?x?xf32>) -> memref<?x?xf32>
+//       CHECK: %{{.*}} = cim.memcpy_to_device(%{{.*}}) : (memref<?x?xf32>) -> memref<?x?xf32>
+//       CHECK: %{{.*}} = cim.memcpy_to_device(%{{.*}}) : (memref<?x?xf32>) -> memref<?x?xf32>
+//       CHECK: cim.matmul(%{{.*}}, %{{.*}}) : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
+//       CHECK: cim.memcpy(%{{.*}}, %{{.*}}) {copyDirection = "toHost"} : memref<?x?xf32>, memref<?x?xf32>
+//       CHECK: cim.dealloc %{{.*}} : memref<?x?xf32>
+//       CHECK: cim.dealloc %{{.*}} : memref<?x?xf32>
+//       CHECK: cim.dealloc %{{.*}} : memref<?x?xf32>
