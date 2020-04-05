@@ -36,6 +36,54 @@ CIMDialect::CIMDialect(MLIRContext *context)
       >();
 }
 
+static void appendMangledType(llvm::raw_string_ostream &ss, Type t) {
+  if (auto memref = t.dyn_cast<MemRefType>()) {
+    ss << "view";
+    for (auto size : memref.getShape())
+      if (size < 0)
+        ss << "sx";
+      else
+        ss << size << "x";
+    appendMangledType(ss, memref.getElementType());
+  } else if (auto vec = t.dyn_cast<VectorType>()) {
+    ss << "vector";
+    interleave(
+        vec.getShape(), [&](int64_t i) { ss << i; }, [&]() { ss << "x"; });
+    appendMangledType(ss, vec.getElementType());
+  } else if (t.isSignlessIntOrIndexOrFloat()) {
+    ss << t;
+  } else {
+    llvm_unreachable("Invalid type for cim library name mangling");
+  }
+}
+
+std::string mlir::cim::generateLibraryCallName(Operation *op) {
+  std::string name(op->getName().getStringRef().str());
+  name.reserve(128);
+  std::replace(name.begin(), name.end(), '.', '_');
+  llvm::raw_string_ostream ss(name);
+
+  // Skip types from memory management operations
+  if (!(isa<cim::AllocOp>(op) || isa<cim::DeallocOp>(op))) {
+    ss << "_";
+    auto types = op->getOperandTypes();
+    interleave(
+        types.begin(), types.end(), [&](Type t) { appendMangledType(ss, t); },
+        [&]() { ss << "_"; });
+
+    ss << "_";
+    auto attrs = op->getAttrs();
+    interleave(
+        attrs.begin(), attrs.end(),
+        [&](NamedAttribute attr) {
+          ss << std::get<1>(attr).cast<StringAttr>().getValue();
+        },
+        [&]() { ss << "_"; });
+  }
+
+  return ss.str();
+}
+
 //===----------------------------------------------------------------------===//
 // TableGen'd op method definitions
 //===----------------------------------------------------------------------===//

@@ -15,6 +15,7 @@
 #define MLIR_INITALLPASSES_H_
 
 #include "mlir/Analysis/Passes.h"
+#include "mlir/Conversion/CIMToStandard/CIMToStandardPass.h"
 #include "mlir/Conversion/GPUToCUDA/GPUToCUDAPass.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/GPUToROCDL/GPUToROCDLPass.h"
@@ -77,6 +78,9 @@ inline void registerAllPasses() {
   createInlinerPass();
   createSymbolDCEPass();
   createLocationSnapshotPass({});
+
+  // CIM
+  createConvertCIMToStandardPass();
 
   // GPUtoRODCLPass
   createLowerGpuOpsToROCDLOpsPass();

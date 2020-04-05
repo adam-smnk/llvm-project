@@ -42,8 +42,16 @@ def CIM_MemcpyOpDirectionAttr : StrEnumAttr<"MemcpyOpDirectionAttr",
 //===----------------------------------------------------------------------===//
 
 // Base class for CIM dialect ops.
-class CIM_Op<string mnemonic, list<OpTrait> traits = []> :
-    Op<CIM_Dialect, mnemonic, traits>;
+class CIM_Op<string mnemonic, list<OpTrait> traits = []>
+	: Op<CIM_Dialect, mnemonic, traits> {
+	code libraryCallName = [{
+    std::string getLibraryCallName() {
+      return generateLibraryCallName(getOperation());
+    }
+  }];
+
+	let extraClassDeclaration = libraryCallName;
+}
 
 def CIM_MatmulOp : CIM_Op<"matmul"> {
   let summary = "matrix multiplication";

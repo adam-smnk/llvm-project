@@ -21,8 +21,6 @@
 #include "mlir/IR/SymbolTable.h"
 
 namespace mlir {
-class FuncOp;
-
 namespace cim {
 
 class CIMDialect : public Dialect {
@@ -30,6 +28,14 @@ public:
   CIMDialect(MLIRContext *context);
   static StringRef getDialectNamespace() { return "cim"; }
 };
+
+/// Returns the name mangled library call name to disambiguate between different
+/// overloads at the C level. The name mangling scheme is basic and uses MLIR
+/// type names:
+///   1. form a string which is the concatenation of the cim op name with all
+///      the operand type names, separate by underscores;
+///   2. drop the `cim.` prefix, and the `<`, `>`, `?` symbols from the type.
+std::string generateLibraryCallName(Operation *op);
 
 #define GET_OP_CLASSES
 #include "mlir/Dialect/CIM/CIMOps.h.inc"

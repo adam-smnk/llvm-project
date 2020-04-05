@@ -26,6 +26,7 @@ set(LIBS
   MLIRAffineToStandard
   MLIRCIM
   MLIRLinalgToCIMTransforms
+  MLIRCIMToStandardTransforms
   MLIRDialect
   MLIRLoopsToGPU
   MLIRLinalgToLLVM
