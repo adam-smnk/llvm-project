@@ -42,6 +42,9 @@ def CIM_MemcpyOpDirectionAttr : StrEnumAttr<"MemcpyOpDirectionAttr",
 //===----------------------------------------------------------------------===//
 
 // Base class for CIM dialect ops.
+// TODO(adam-smnk): Fix error that occurs during library call name generation
+// when different memrefs are used with the same functions, e.g.
+// MemcpyOp called first with AnyMemRef and then with StridedMemRef
 class CIM_Op<string mnemonic, list<OpTrait> traits = []>
 	: Op<CIM_Dialect, mnemonic, traits> {
 	code libraryCallName = [{

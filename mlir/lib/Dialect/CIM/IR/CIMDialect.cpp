@@ -66,6 +66,8 @@ std::string mlir::cim::generateLibraryCallName(Operation *op) {
         types.begin(), types.end(), [&](Type t) { appendMangledType(ss, t); },
         [&]() { ss << "_"; });
 
+    // TODO(adam-smnk): Handle attributes differently,
+    // convert memcpy attr to an enum argument?
     ss << "_";
     auto attrs = op->getAttrs();
     interleave(
