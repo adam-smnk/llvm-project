@@ -48,12 +48,12 @@ func @generic_matmul(%arg0: memref<?x?xf32>, %arg1: memref<?x?xf32>, %arg2: memr
   return
 }
 // CHECK-LABEL: func @generic_matmul(
-// CHECK-SAME: %{{.*}}: memref<?x?xf32>, %{{.*}}: memref<?x?xf32>, %{{.*}}: memref<?x?xf32>) {
-//       CHECK: %{{.*}} = cim.memcpy_to_device(%{{.*}}) : (memref<?x?xf32>) -> memref<?x?xf32>
-//       CHECK: %{{.*}} = cim.memcpy_to_device(%{{.*}}) : (memref<?x?xf32>) -> memref<?x?xf32>
-//       CHECK: %{{.*}} = cim.memcpy_to_device(%{{.*}}) : (memref<?x?xf32>) -> memref<?x?xf32>
-//       CHECK: cim.matmul(%{{.*}}, %{{.*}}) : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
-//       CHECK: cim.memcpy(%{{.*}}, %{{.*}}) {copyDirection = "toHost"} : memref<?x?xf32>, memref<?x?xf32>
-//       CHECK: cim.dealloc %{{.*}} : memref<?x?xf32>
-//       CHECK: cim.dealloc %{{.*}} : memref<?x?xf32>
-//       CHECK: cim.dealloc %{{.*}} : memref<?x?xf32>
+// CHECK-SAME: %[[arg0:.*]]: memref<?x?xf32>, %[[arg1:.*]]: memref<?x?xf32>, %[[arg2:.*]]: memref<?x?xf32>) {
+//       CHECK: %[[devA:.*]] = cim.memcpy_to_device(%[[arg0]]) : (memref<?x?xf32>) -> memref<?x?xf32>
+//       CHECK: %[[devB:.*]] = cim.memcpy_to_device(%[[arg1]]) : (memref<?x?xf32>) -> memref<?x?xf32>
+//       CHECK: %[[devC:.*]] = cim.memcpy_to_device(%[[arg2]]) : (memref<?x?xf32>) -> memref<?x?xf32>
+//       CHECK: cim.matmul(%[[devA]], %[[devB]], %[[devC]]) : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
+//       CHECK: cim.memcpy(%[[devC]], %[[arg2]]) {copyDirection = "toHost"} : memref<?x?xf32>, memref<?x?xf32>
+//       CHECK: cim.dealloc %[[devA]] : memref<?x?xf32>
+//       CHECK: cim.dealloc %[[devB]] : memref<?x?xf32>
+//       CHECK: cim.dealloc %[[devC]] : memref<?x?xf32>
