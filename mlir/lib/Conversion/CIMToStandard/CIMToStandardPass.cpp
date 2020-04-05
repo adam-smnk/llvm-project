@@ -1,5 +1,4 @@
-//===- CIMToStandardPass.cpp - MLIR CIM to Standard lowering passes
-//--------===//
+//===- CIMToStandardPass.cpp - MLIR CIM to Standard lowering passes -------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.

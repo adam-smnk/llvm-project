@@ -1,4 +1,4 @@
-//===- LinalgToCIMPass.h - Convert Linalg to CIM dialect -----*- C++ -*-===//
+//===- LinalgToCIMPass.h - Convert Linalg to CIM dialect --------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -16,7 +16,8 @@ class OwningRewritePatternList;
 
 class MLIRContext;
 class ModuleOp;
-template <typename T> class OpPassBase;
+template <typename T>
+class OpPassBase;
 
 /// Populate the given list with patterns that convert from Linalg to CIM.
 void populateLinalgToCIMConversionPatterns(OwningRewritePatternList &patterns,

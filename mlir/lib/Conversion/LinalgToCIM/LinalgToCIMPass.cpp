@@ -1,4 +1,4 @@
-//===- LowerGpuOpsToNVVMOps.cpp - MLIR GPU to NVVM lowering passes --------===//
+//===- LinalgToCIMPass.cpp - MLIR Linalg to CIM lowering passes --------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file implements a pass to generate NVVMIR operations for higher-level
-// GPU operations.
+// This file implements a partial lowering of Linalg operations to CIM
+// operations.
 //
 //===----------------------------------------------------------------------===//
 

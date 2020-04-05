@@ -1,5 +1,4 @@
-//===- CIMToStandardPass.h - Convert CIM to Standard dialect -----*- C++
-//-*-===//
+//===- CIMToStandardPass.h - Convert CIM to Standard dialect ----*- C++--*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
