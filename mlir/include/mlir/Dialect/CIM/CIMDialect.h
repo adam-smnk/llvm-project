@@ -34,8 +34,12 @@ public:
 /// type names:
 ///   1. form a string which is the concatenation of the cim op name with all
 ///      the operand type names, separate by underscores;
-///   2. drop the `cim.` prefix, and the `<`, `>`, `?` symbols from the type.
+///   2. drop the `<`, `>`, `?` symbols from the type.
+/// Assumes `op` is a CimOp.
 std::string generateLibraryCallName(Operation *op);
+
+/// Appends element type to library call name based on an operand type.
+void appendOperandPrecision(llvm::raw_string_ostream &ss, Type t);
 
 #define GET_OP_CLASSES
 #include "mlir/Dialect/CIM/CIMOps.h.inc"

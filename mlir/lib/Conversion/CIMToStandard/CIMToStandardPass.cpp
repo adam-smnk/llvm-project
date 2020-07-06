@@ -105,11 +105,13 @@ public:
 
 void mlir::populateCIMToStandardConversionPatterns(
     OwningRewritePatternList &patterns, MLIRContext *ctx) {
-  patterns
-      .insert<CimOpConversion<cim::AllocOp>, CimOpConversion<cim::DeallocOp>,
-              CimOpConversion<cim::MatmulOp>, CimOpConversion<cim::MemcpyOp>,
-              CimOpConversion<cim::MemcpyToDeviceOp>,
-              CimOpConversion<cim::MemcpyToHostOp>>(ctx);
+  patterns.insert<
+      CimOpConversion<cim::WriteToCrossbarOp>, CimOpConversion<cim::GemmOp>,
+      CimOpConversion<cim::GevmOp>, CimOpConversion<cim::BarrierOp>,
+      CimOpConversion<cim::AllocOp>, CimOpConversion<cim::DeallocOp>,
+      CimOpConversion<cim::MatmulOp>, CimOpConversion<cim::MemcpyOp>,
+      CimOpConversion<cim::MemcpyToDeviceOp>,
+      CimOpConversion<cim::MemcpyToHostOp>>(ctx);
 }
 
 std::unique_ptr<OpPassBase<ModuleOp>> mlir::createConvertCIMToStandardPass() {

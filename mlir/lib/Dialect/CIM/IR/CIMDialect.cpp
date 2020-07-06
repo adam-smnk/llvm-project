@@ -58,27 +58,33 @@ std::string mlir::cim::generateLibraryCallName(Operation *op) {
   std::replace(name.begin(), name.end(), '.', '_');
   llvm::raw_string_ostream ss(name);
 
-  // Skip types from memory management operations
-  if (!(isa<cim::AllocOp>(op) || isa<cim::DeallocOp>(op))) {
-    ss << "_";
-    auto types = op->getOperandTypes();
-    interleave(
-        types.begin(), types.end(), [&](Type t) { appendMangledType(ss, t); },
-        [&]() { ss << "_"; });
+  ss << "_";
+  auto types = op->getOperandTypes();
+  interleave(
+      types.begin(), types.end(), [&](Type t) { appendMangledType(ss, t); },
+      [&]() { ss << "_"; });
 
-    // TODO(adam-smnk): Handle attributes differently,
-    // convert memcpy attr to an enum argument?
-    ss << "_";
-    auto attrs = op->getAttrs();
-    interleave(
-        attrs.begin(), attrs.end(),
-        [&](NamedAttribute attr) {
-          ss << std::get<1>(attr).cast<StringAttr>().getValue();
-        },
-        [&]() { ss << "_"; });
-  }
+  ss << "_";
+  auto attrs = op->getAttrs();
+  interleave(
+      attrs.begin(), attrs.end(),
+      [&](NamedAttribute attr) {
+        ss << std::get<1>(attr).cast<StringAttr>().getValue();
+      },
+      [&]() { ss << "_"; });
 
   return ss.str();
+}
+
+void mlir::cim::appendOperandPrecision(llvm::raw_string_ostream &ss, Type t) {
+  if (auto memref = t.dyn_cast<MemRefType>()) {
+    appendOperandPrecision(ss, memref.getElementType());
+  } else if (t.isSignlessIntOrIndexOrFloat()) {
+    ss << "_";
+    ss << t;
+  } else {
+    llvm_unreachable("Invalid type for cim library precision mangling");
+  }
 }
 
 //===----------------------------------------------------------------------===//

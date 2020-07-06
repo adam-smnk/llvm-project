@@ -27,6 +27,8 @@ using namespace mlir::linalg;
 
 namespace {
 
+// TODO(adam-smnk) Handle case with additional sign extension operation
+// that is present in case of mixed precision arguments
 static bool hasMultiplyAddBody(linalg::GenericOp op) {
   auto &r = op.region();
   if (r.empty())
@@ -41,19 +43,17 @@ static bool hasMultiplyAddBody(linalg::GenericOp op) {
   auto a = m_Val(r.front().getArgument(0));
   auto b = m_Val(r.front().getArgument(1));
   auto c = m_Val(r.front().getArgument(2));
-  // TODO(ntv) Update this detection once we have  matcher support for
-  // specifying that any permutation of operands matches.
-  auto pattern1 = m_Op<YieldOp>(m_Op<AddFOp>(m_Op<MulFOp>(a, b), c));
-  auto pattern2 = m_Op<YieldOp>(m_Op<AddFOp>(c, m_Op<MulFOp>(a, b)));
-  auto pattern3 = m_Op<YieldOp>(m_Op<AddFOp>(m_Op<MulFOp>(b, a), c));
-  auto pattern4 = m_Op<YieldOp>(m_Op<AddFOp>(c, m_Op<MulFOp>(b, a)));
+
+  // TODO(adam-smnk) Generalize permutation matching.
+  auto pattern1 = m_Op<YieldOp>(m_Op<AddIOp>(m_Op<MulIOp>(a, b), c));
+  auto pattern2 = m_Op<YieldOp>(m_Op<AddIOp>(c, m_Op<MulIOp>(a, b)));
+  auto pattern3 = m_Op<YieldOp>(m_Op<AddIOp>(m_Op<MulIOp>(b, a), c));
+  auto pattern4 = m_Op<YieldOp>(m_Op<AddIOp>(c, m_Op<MulIOp>(b, a)));
   return pattern1.match(&ops.back()) || pattern2.match(&ops.back()) ||
          pattern3.match(&ops.back()) || pattern4.match(&ops.back());
 }
 
-// TODO(adam-smnk) Replace with generalize Matmul checks instead of
-// making a copy from Linalg transform?
-static bool isMatmul(linalg::GenericOp genericOp) {
+static bool isGemm(linalg::GenericOp genericOp) {
   auto *ctx = genericOp.getContext();
   auto m = getAffineDimExpr(0, ctx);
   auto n = getAffineDimExpr(1, ctx);
@@ -66,29 +66,43 @@ static bool isMatmul(linalg::GenericOp genericOp) {
          genericOp.indexing_maps() == maps && hasMultiplyAddBody(genericOp);
 }
 
+static bool isGevm(linalg::GenericOp genericOp) {
+  auto *ctx = genericOp.getContext();
+  auto k = getAffineDimExpr(0, ctx);
+  auto n = getAffineDimExpr(1, ctx);
+  auto mapA = AffineMapAttr::get(AffineMap::get(2, 0, {k}));
+  auto mapB = AffineMapAttr::get(AffineMap::get(2, 0, {k, n}));
+  auto mapC = AffineMapAttr::get(AffineMap::get(2, 0, {n}));
+  auto maps = ArrayAttr::get({mapA, mapB, mapC}, ctx);
+  return genericOp.getNumInputs() == 2 && genericOp.getNumOutputs() == 1 &&
+         genericOp.indexing_maps() == maps && hasMultiplyAddBody(genericOp);
+}
+
+// TODO(adam-smnk) Extend check to handle cases with implicit transposition
+// and automatically add transposition where needed
+// TODO(adam-smnk) Extend check to also cover tensor contraction
+static bool isMatmul(linalg::GenericOp genericOp) {
+  return isGemm(genericOp) || isGevm(genericOp);
+}
+
 static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
-  auto hostA = op->getOperand(0);
-  auto hostB = op->getOperand(1);
-  auto hostC = op->getOperand(2);
+  auto matA = op->getOperand(0);
+  auto matB = op->getOperand(1);
+  auto matC = op->getOperand(2);
 
-  auto aType = hostA.getType();
-  auto bType = hostB.getType();
-  auto cType = hostC.getType();
+  auto cimTileID = rewriter.create<ConstantOp>(
+      op->getLoc(), rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
 
-  auto devA = rewriter.create<cim::MemcpyToDeviceOp>(op->getLoc(), aType, hostA)
-                  .getResult();
-  auto devB = rewriter.create<cim::MemcpyToDeviceOp>(op->getLoc(), bType, hostB)
-                  .getResult();
-  auto devC = rewriter.create<cim::MemcpyToDeviceOp>(op->getLoc(), cType, hostC)
-                  .getResult();
+  rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), cimTileID, matB);
 
-  rewriter.create<cim::MatmulOp>(op->getLoc(), devA, devB, devC);
+  // TODO(adam-smnk) Check if MatmulOp can be replaced by vector-matrix mul
+  if (isa<linalg::MatmulOp>(op) || isGemm(cast<linalg::GenericOp>(op))) {
+    rewriter.create<cim::GemmOp>(op->getLoc(), cimTileID, matA, matC);
+  } else {
+    rewriter.create<cim::GevmOp>(op->getLoc(), cimTileID, matA, matC);
+  }
 
-  rewriter.create<cim::MemcpyOp>(op->getLoc(), devC, hostC, "toHost");
-
-  rewriter.create<cim::DeallocOp>(op->getLoc(), devA);
-  rewriter.create<cim::DeallocOp>(op->getLoc(), devB);
-  rewriter.create<cim::DeallocOp>(op->getLoc(), devC);
+  rewriter.create<cim::BarrierOp>(op->getLoc(), cimTileID);
 
   rewriter.eraseOp(op);
 }
@@ -128,6 +142,7 @@ public:
     ConversionTarget target(getContext());
     target.addLegalDialect<linalg::LinalgDialect>();
     target.addLegalDialect<cim::CIMDialect>();
+    target.addLegalOp<ConstantOp>();
     target.addIllegalOp<linalg::MatmulOp>();
     target.addDynamicallyLegalOp<linalg::GenericOp>(
         [&](linalg::GenericOp op) { return !isMatmul(op); });
