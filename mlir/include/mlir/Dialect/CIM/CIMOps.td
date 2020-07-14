@@ -70,7 +70,7 @@ def CIM_WriteToCrossbarOp : CIM_Op<"write_to_crossbar"> {
 
     ```mlir
       // C(m, n) = A(m, k) * B(k, n)
-      cim.write_to_crossbar(%tileId, %B) : i32, memref<1x?xi32>
+      cim.write_to_crossbar(%tileId, %B) : i32, memref<?x?xi32>
     ```
   }];
 
