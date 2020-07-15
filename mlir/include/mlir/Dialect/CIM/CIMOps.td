@@ -163,6 +163,37 @@ def CIM_GevmOp : CIM_Op<"gevm"> {
   let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
 }
 
+def CIM_ContractionOp : CIM_Op<"contraction"> {
+  let summary = "tensor contraction";
+  let description = [{
+    The "contraction" operation is a placeholder for general tensor
+    contraction computation.
+    At the moment, contraction has no implementation for further
+    lowering.
+
+    Example:
+
+    ```mlir
+      // C(a,b,c) = A(a,e,f,g) * B(e,f,g,b,c)
+      cim.contraction(%tileId, %A, %B, %C)
+          : i32, memref<?x?x?x?xi32>, memref<?x?x?x?x?xi32>, memref<?x?x?xi32>
+    ```
+  }];
+
+  code libraryCallName = [{
+    std::string getLibraryCallName() {
+      return "";
+    }
+  }];
+
+  let arguments = (ins SignlessIntegerLike:$tileId,
+                       AnyStridedMemRef:$A,
+                       AnyStridedMemRef:$B,
+                       AnyStridedMemRef:$C);
+
+  let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
+}
+
 def CIM_BarrierOp : CIM_Op<"barrier"> {
   let summary = "Waits until the specified CIM tile finishes computation";
   let description = [{

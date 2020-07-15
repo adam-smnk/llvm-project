@@ -70,18 +70,14 @@ static auto getResultDims(linalg::GenericOp genericOp) {
 }
 
 static bool isGemm(linalg::GenericOp genericOp) {
-  auto *ctx = genericOp.getContext();
-  // TODO(adam-smnk) Generalize dimension order (fails when the order is
-  // swapped).
-  auto m = getAffineDimExpr(0, ctx);
-  auto n = getAffineDimExpr(1, ctx);
-  auto k = getAffineDimExpr(2, ctx);
-  auto mapA = AffineMapAttr::get(AffineMap::get(3, 0, {m, k}));
-  auto mapB = AffineMapAttr::get(AffineMap::get(3, 0, {k, n}));
-  auto mapC = AffineMapAttr::get(AffineMap::get(3, 0, {m, n}));
-  auto maps = ArrayAttr::get({mapA, mapB, mapC}, ctx);
-  return genericOp.getNumInputs() == 2 && genericOp.getNumOutputs() == 1 &&
-         genericOp.indexing_maps() == maps && hasMultiplyAddBody(genericOp);
+  auto resultDims = getResultDims(genericOp);
+
+  auto dimsA = resultDims[0];
+  auto dimsB = resultDims[1];
+  auto dimsC = resultDims[2];
+
+  // C(m, n) = A(m, k) * B(k, n)
+  return dimsA.size() == 2 && dimsB.size() == 2 && dimsC.size() == 2;
 }
 
 static bool isGevm(linalg::GenericOp genericOp) {
@@ -291,6 +287,75 @@ static Value transposeMemRef(Operation *op, PatternRewriter &rewriter,
   return transposedMemory;
 }
 
+static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
+                                   ConstantOp &tileId) {
+  auto genOp = cast<GenericOp>(op);
+  auto *ctx = genOp.getContext();
+
+  auto matA = op->getOperand(0);
+  auto matB = op->getOperand(1);
+  auto matC = op->getOperand(2);
+
+  auto resultMaps = getResultMaps(genOp);
+
+  AffineMap mapA = resultMaps[0];
+  AffineMap mapB = resultMaps[1];
+  AffineMap mapC = resultMaps[2];
+
+  ArrayRef<AffineExpr> dimsA = mapA.getResults();
+  ArrayRef<AffineExpr> dimsB = mapB.getResults();
+  ArrayRef<AffineExpr> dimsC = mapC.getResults();
+
+  std::vector<unsigned> dimsPosA = getDimsPositions(dimsA);
+  std::vector<unsigned> dimsPosB = getDimsPositions(dimsB);
+  std::vector<unsigned> dimsPosC = getDimsPositions(dimsC);
+
+  std::set<unsigned> dimsSetA(dimsPosA.begin(), dimsPosA.end());
+  std::set<unsigned> dimsSetB(dimsPosB.begin(), dimsPosB.end());
+  std::set<unsigned> dimsSetC(dimsPosC.begin(), dimsPosC.end());
+
+  auto uncontrDimsA = setIntersection<unsigned>(dimsSetA, dimsSetC);
+  auto uncontrDimsB = setIntersection<unsigned>(dimsSetB, dimsSetC);
+  auto contractionDims = setIntersection<unsigned>(dimsSetA, dimsSetB);
+
+  auto transposeReqs = checkContractionTransposes(dimsPosA, dimsPosB, dimsPosC);
+
+  Value inputA = matA;
+  Value inputB = matB;
+
+  if (transposeReqs.transposeA) {
+    SmallVector<AffineExpr, 8U> reqDimsA;
+    for (unsigned i = 0; i < uncontrDimsA.size(); ++i) {
+      reqDimsA.push_back(getAffineDimExpr(dimsPosC[i], ctx));
+    }
+    for (auto pos : contractionDims) {
+      reqDimsA.push_back(getAffineDimExpr(pos, ctx));
+    }
+    auto transposeMap =
+        AffineMap::get(mapA.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsA));
+
+    inputA = transposeMemRef(op, rewriter, matA, mapA, transposeMap);
+  }
+
+  if (transposeReqs.transposeB) {
+    SmallVector<AffineExpr, 8U> reqDimsB;
+    for (auto pos : contractionDims) {
+      reqDimsB.push_back(getAffineDimExpr(pos, ctx));
+    }
+    for (unsigned i = 0; i < uncontrDimsB.size(); ++i) {
+      unsigned cPos = uncontrDimsA.size() + i;
+      reqDimsB.push_back(getAffineDimExpr(dimsPosC[cPos], ctx));
+    }
+    auto transposeMap =
+        AffineMap::get(mapB.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsB));
+
+    inputB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
+  }
+
+  rewriter.create<cim::ContractionOp>(op->getLoc(), tileId, inputA, inputB,
+                                      matC);
+}
+
 static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
                             ConstantOp &tileId) {
   auto genOp = cast<GenericOp>(op);
@@ -413,8 +478,10 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
     rewriter.create<cim::GemmOp>(op->getLoc(), cimTileID, matA, matC);
   } else if (isGevm(cast<linalg::GenericOp>(op))) {
     createCIMGevmOp(op, rewriter, cimTileID);
-  } else {
+  } else if (isGemm(cast<linalg::GenericOp>(op))) {
     createCIMGemmOp(op, rewriter, cimTileID);
+  } else {
+    createCIMContractionOp(op, rewriter, cimTileID);
   }
 
   rewriter.create<cim::BarrierOp>(op->getLoc(), cimTileID);
