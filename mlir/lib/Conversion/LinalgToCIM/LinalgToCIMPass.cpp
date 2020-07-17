@@ -69,6 +69,7 @@ static auto getResultDims(linalg::GenericOp genericOp) {
       [](AffineMapAttr a) { return a.getValue().getResults(); }, mapsRange);
 }
 
+// Assumes that the genericOp is a contraction
 static bool isGemm(linalg::GenericOp genericOp) {
   auto resultDims = getResultDims(genericOp);
 
@@ -80,6 +81,7 @@ static bool isGemm(linalg::GenericOp genericOp) {
   return dimsA.size() == 2 && dimsB.size() == 2 && dimsC.size() == 2;
 }
 
+// Assumes that the genericOp is a contraction
 static bool isGevm(linalg::GenericOp genericOp) {
   auto resultDims = getResultDims(genericOp);
 
@@ -136,8 +138,6 @@ std::set<T> setUnion(const std::set<T> &setA, const std::set<T> &setB) {
 static bool isContraction(linalg::GenericOp genericOp) {
   if (!(genericOp.getNumInputs() == 2 && genericOp.getNumOutputs() == 1 &&
         hasMultiplyAddBody(genericOp))) {
-    llvm::errs() << "Invalid Op body"
-                 << "\n";
     return false;
   }
 
@@ -154,9 +154,15 @@ static bool isContraction(linalg::GenericOp genericOp) {
   auto uncontrDimsA = setIntersection<unsigned>(dimsA, dimsC);
   auto uncontrDimsB = setIntersection<unsigned>(dimsB, dimsC);
 
+  auto contrDimsA = setDifference<unsigned>(dimsA, uncontrDimsA);
+  auto contrDimsB = setDifference<unsigned>(dimsB, uncontrDimsB);
+  auto contrDims = setUnion<unsigned>(contrDimsA, contrDimsB);
+
   auto outputDims = setUnion<unsigned>(uncontrDimsA, uncontrDimsB);
 
-  return outputDims == dimsC;
+  return contrDims.size() > 0 && contrDimsA == contrDimsB &&
+         dimsC.size() == (uncontrDimsA.size() + uncontrDimsB.size()) &&
+         outputDims == dimsC;
 }
 
 struct TransposeAnalysisResults {
