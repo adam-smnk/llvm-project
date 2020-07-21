@@ -503,6 +503,7 @@ struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
   }
 };
 
+// TODO(adam-smnk) Check for contiguous memory
 struct GenericOpLowering : public OpRewritePattern<linalg::GenericOp> {
   using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
 

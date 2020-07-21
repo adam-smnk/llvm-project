@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Defines some operations of the CIM dialect.
+// Defines operations of the CIM dialect.
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,9 +42,6 @@ def CIM_MemcpyOpDirectionAttr : StrEnumAttr<"MemcpyOpDirectionAttr",
 //===----------------------------------------------------------------------===//
 
 // Base class for CIM dialect ops.
-// TODO(adam-smnk): Fix error that occurs during library call name generation
-// when different memrefs are used with the same functions, e.g.
-// MemcpyOp called first with AnyMemRef and then with StridedMemRef
 class CIM_Op<string mnemonic, list<OpTrait> traits = []>
   : Op<CIM_Dialect, mnemonic, traits> {
   code libraryCallName = [{
@@ -57,14 +54,12 @@ class CIM_Op<string mnemonic, list<OpTrait> traits = []>
 }
 
 def CIM_WriteToCrossbarOp : CIM_Op<"write_to_crossbar"> {
-  let summary = "Writes a matrix into a CIM crossbar";
+  let summary = "Write a matrix into a CIM crossbar";
   let description = [{
-    The "write_to_crossbar" operation writes the matrix into the specified
-    crossbar.
-    the provided vector and the matrix stored on a crossbar. The result is
-    stored in the provided matrix.
-    The shapes of the vector and matricies are expected to be valid.
-    The tile ID specifies which crossbar executes the operation.
+    The "write_to_crossbar" operation writes the provided matrix into
+    the crossbar specified by its tile ID.
+    The shapes of the matrix is expected to fit into the crossbar.
+    The operation expects contiguous memref.
 
     Example:
 
@@ -92,19 +87,20 @@ def CIM_WriteToCrossbarOp : CIM_Op<"write_to_crossbar"> {
 }
 
 def CIM_GemmOp : CIM_Op<"gemm"> {
-  let summary = "general matrix-matrix multiplication";
+  let summary = "Perform general matrix-matrix multiplication on CIM";
   let description = [{
     The "gemm" operation performs matrix-matrix multiplication between
     the first matrix and the one stored on a crossbar. The result is
     stored in the second matrix.
-    The shapes of the matricies are expected to be valid.
     The tile ID specifies which crossbar executes the operation.
+    The shapes of the matricies are expected to be valid.
+    The operation expects contiguous memrefs.
 
     Example:
 
     ```mlir
       // C(m, n) = A(m, k) * B(k, n)
-      cim.write_to_crossbar(%tileId, %B) : i32, memref<1x?xi32>
+      cim.write_to_crossbar(%tileId, %B) : i32, memref<?x?xi32>
       cim.gemm(%tileId, %A, %C) : i32, memref<?x?xi32>, memref<?x?xi32>
     ```
   }];
@@ -128,13 +124,14 @@ def CIM_GemmOp : CIM_Op<"gemm"> {
 }
 
 def CIM_GevmOp : CIM_Op<"gevm"> {
-  let summary = "general vector-matrix multiplication";
+  let summary = "Perform general vector-matrix multiplication on CIM";
   let description = [{
     The "gevm" operation performs vector-matrix multiplication between
     the first vector and the matrix stored on a crossbar. The result is
     stored in the second vector.
-    The shapes of the vector and matricies are expected to be valid.
     The tile ID specifies which crossbar executes the operation.
+    The shapes of the vector and matricies are expected to be valid.
+    The operation expects contiguous memrefs.
 
     Example:
 
@@ -164,7 +161,7 @@ def CIM_GevmOp : CIM_Op<"gevm"> {
 }
 
 def CIM_ContractionOp : CIM_Op<"contraction"> {
-  let summary = "tensor contraction";
+  let summary = "Represent tensor contraction";
   let description = [{
     The "contraction" operation is a placeholder for general tensor
     contraction computation.
@@ -195,7 +192,7 @@ def CIM_ContractionOp : CIM_Op<"contraction"> {
 }
 
 def CIM_BarrierOp : CIM_Op<"barrier"> {
-  let summary = "Waits until the specified CIM tile finishes computation";
+  let summary = "Wait until the specified CIM tile finishes computation";
   let description = [{
     The "barrier" operation blocks program execution until computation on
     the specified tile is finished.
@@ -345,7 +342,7 @@ def CIM_MemcpyToHostOp : CIM_Op<"memcpy_to_host"> {
 
     ```mlir
       %devA = cim.alloc(%d1, %d2) : memref<?x?xi32>
-      %A = cim.memcpy_to_host(%devA) : : (memref<?x?xi32>) -> (memref<?x?xi32>)
+      %A = cim.memcpy_to_host(%devA) : (memref<?x?xi32>) -> (memref<?x?xi32>)
     ```
   }];
 
