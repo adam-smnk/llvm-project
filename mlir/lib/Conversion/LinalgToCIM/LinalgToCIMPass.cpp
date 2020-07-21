@@ -174,8 +174,9 @@ struct TransposeAnalysisResults {
       : transposeA(transposeA_), transposeB(transposeB_){};
 };
 
-// TODO(adam-smnk) Consider splitting need to transpose contracted and
-// uncontracted dimensions.
+// TODO(adam-smnk) Split the need to transpose contracted and
+// uncontracted dimensions to avoid unnecessary tranposition when
+// contraction dimensions already match.
 static TransposeAnalysisResults
 checkContractionTransposes(const std::vector<unsigned> &dimsPosA,
                            const std::vector<unsigned> &dimsPosB,
@@ -197,13 +198,10 @@ checkContractionTransposes(const std::vector<unsigned> &dimsPosA,
     }
   }
 
-  TransposeAnalysisResults reqs(false, false);
-
   // check if A and C dimensions match
   for (unsigned i = 0; i < uncontrDimsA.size(); ++i) {
     if (dimsPosA[i] != dimsPosC[i]) {
-      reqs.transposeA = true;
-      break;
+      return TransposeAnalysisResults(true, true);
     }
   }
 
@@ -213,12 +211,11 @@ checkContractionTransposes(const std::vector<unsigned> &dimsPosA,
     unsigned cPos = uncontrDimsA.size() + i;
 
     if (dimsPosB[bPos] != dimsPosC[cPos]) {
-      reqs.transposeB = true;
-      break;
+      return TransposeAnalysisResults(true, true);
     }
   }
 
-  return reqs;
+  return TransposeAnalysisResults(false, false);
 }
 
 static Value transposeMemRef(Operation *op, PatternRewriter &rewriter,
@@ -249,7 +246,7 @@ static Value transposeMemRef(Operation *op, PatternRewriter &rewriter,
   auto outputPermutationMap = AffineMap::get(
       memRefMap.getNumResults(), 0, ArrayRef<AffineExpr>(outputPermutation));
 
-  // Check if there are any memory layout changes required
+  // Copy only if there are any memory layout changes required
   if (inputPermutation != outputPermutation) {
     ArrayRef<int64_t> memShape = memRefType.getShape();
     SmallVector<int64_t, 8U> transposedShape;
