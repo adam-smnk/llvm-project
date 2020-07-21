@@ -25,7 +25,7 @@ namespace cim {
 
 class CIMDialect : public Dialect {
 public:
-  CIMDialect(MLIRContext *context);
+  explicit CIMDialect(MLIRContext *context);
   static StringRef getDialectNamespace() { return "cim"; }
 };
 
