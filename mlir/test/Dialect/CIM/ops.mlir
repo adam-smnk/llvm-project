@@ -4,75 +4,31 @@
 // Verify the generic form can be parsed.
 // RUN: mlir-opt -mlir-print-op-generic %s | mlir-opt | FileCheck %s
 
-// CHECK-DAG: #[[strided2D:.*]] = affine_map<(d0, d1)[s0, s1] -> (d0 * s1 + s0 + d1)>
 
-
-func @matmul_directional_memcpy(%arg0: memref<?xi8>, %M: index, %N: index, %K: index) {
-  %c0 = constant 0 : index
-  %A = view %arg0[%c0][%M, %K] : memref<?xi8> to memref<?x?xf32, offset: ?, strides: [?, 1]>
-  %B = view %arg0[%c0][%K, %N] : memref<?xi8> to memref<?x?xf32, offset: ?, strides: [?, 1]>
-  %C = view %arg0[%c0][%M, %N] : memref<?xi8> to memref<?x?xf32, offset: ?, strides: [?, 1]>
-  %devA = cim.memcpy_to_device(%A) : (memref<?x?xf32, offset: ?, strides: [?, 1]>) -> (memref<?x?xf32, offset: ?, strides: [?, 1]>)
-  %devB = cim.memcpy_to_device(%B) : (memref<?x?xf32, offset: ?, strides: [?, 1]>) -> (memref<?x?xf32, offset: ?, strides: [?, 1]>)
-  %devC = cim.memcpy_to_device(%C) : (memref<?x?xf32, offset: ?, strides: [?, 1]>) -> (memref<?x?xf32, offset: ?, strides: [?, 1]>)
-  cim.matmul(%devA, %devB, %devC) : memref<?x?xf32, offset: ?, strides: [?, 1]>, memref<?x?xf32, offset: ?, strides: [?, 1]>, memref<?x?xf32, offset: ?, strides: [?, 1]>
-  %matmulResult = cim.memcpy_to_host(%devC) : (memref<?x?xf32, offset: ?, strides: [?, 1]>) -> (memref<?x?xf32, offset: ?, strides: [?, 1]>)
-  cim.dealloc %devA : memref<?x?xf32, offset: ?, strides: [?, 1]>
-  cim.dealloc %devB : memref<?x?xf32, offset: ?, strides: [?, 1]>
-  cim.dealloc %devC : memref<?x?xf32, offset: ?, strides: [?, 1]>
-  linalg.copy(%matmulResult, %C) : memref<?x?xf32, offset: ?, strides: [?, 1]>, memref<?x?xf32, offset: ?, strides: [?, 1]>
+func @cim_gemm_32(%arg0: memref<?x?xi32>, %arg1: memref<?x?xi32>, %arg2: memref<?x?xi32>) {
+  %c0_i32 = constant 0 : i32
+  cim.write_to_crossbar(%c0_i32, %arg1) : i32, memref<?x?xi32>
+  cim.gemm(%c0_i32, %arg0, %arg2) : i32, memref<?x?xi32>, memref<?x?xi32>
+  cim.barrier %c0_i32 : i32
   return
 }
-// CHECK-LABEL: func @matmul_directional_memcpy(%{{.*}}: memref<?xi8>,
-// CHECK-SAME: [[M:arg[0-9]+]]: index
-// CHECK-SAME: [[N:arg[0-9]+]]: index
-// CHECK-SAME: [[K:arg[0-9]+]]: index
-//       CHECK: %[[A:.*]] = std.view %{{.*}}[{{.*}}] : memref<?xi8> to memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[B:.*]] = std.view %{{.*}}[{{.*}}] : memref<?xi8> to memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[C:.*]] = std.view %{{.*}}[{{.*}}] : memref<?xi8> to memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[devA:.*]] = cim.memcpy_to_device(%[[A]]) : (memref<?x?xf32, #[[strided2D]]>) -> memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[devB:.*]] = cim.memcpy_to_device(%[[B]]) : (memref<?x?xf32, #[[strided2D]]>) -> memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[devC:.*]] = cim.memcpy_to_device(%[[C]]) : (memref<?x?xf32, #[[strided2D]]>) -> memref<?x?xf32, #[[strided2D]]>
-//       CHECK: cim.matmul(%[[devA]], %[[devB]], %[[devC]]) : memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[matmulResult:.*]] = cim.memcpy_to_host(%[[devC]]) : (memref<?x?xf32, #[[strided2D]]>) -> memref<?x?xf32, #[[strided2D]]>
-//       CHECK: cim.dealloc %[[devA]] : memref<?x?xf32, #[[strided2D]]>
-//       CHECK: cim.dealloc %[[devB]] : memref<?x?xf32, #[[strided2D]]>
-//       CHECK: cim.dealloc %[[devC]] : memref<?x?xf32, #[[strided2D]]>
-//       CHECK: linalg.copy(%[[matmulResult]], %[[C]]) : memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32, #[[strided2D]]>
+// CHECK-LABEL: func @cim_gemm_32(
+// CHECK-SAME: %[[arg0:.*]]: memref<?x?xi32>, %[[arg1:.*]]: memref<?x?xi32>, %[[arg2:.*]]: memref<?x?xi32>) {
+//       CHECK: %[[tileId:.*]] = constant 0 : i32
+//       CHECK: cim.write_to_crossbar(%[[tileId]], %[[arg1]]) : i32, memref<?x?xi32>
+//       CHECK: cim.gemm(%[[tileId]], %[[arg0]], %[[arg2]]) : i32, memref<?x?xi32>, memref<?x?xi32>
+//       CHECK: cim.barrier %[[tileId]] : i32
 
-func @matmul_generic_memcpy(%arg0: memref<?xi8>, %M: index, %N: index, %K: index) {
-  %c0 = constant 0 : index
-  %A = view %arg0[%c0][%M, %K] : memref<?xi8> to memref<?x?xf32, offset: ?, strides: [?, 1]>
-  %B = view %arg0[%c0][%K, %N] : memref<?xi8> to memref<?x?xf32, offset: ?, strides: [?, 1]>
-  %C = view %arg0[%c0][%M, %N] : memref<?xi8> to memref<?x?xf32, offset: ?, strides: [?, 1]>
-  %devA = cim.alloc(%M, %K) : memref<?x?xf32>
-  %devB = cim.alloc(%K, %N) : memref<?x?xf32>
-  %devC = cim.alloc(%M, %N) : memref<?x?xf32>
-  cim.memcpy(%A, %devA) { copyDirection = "toDevice" } : memref<?x?xf32, offset: ?, strides: [?, 1]>, memref<?x?xf32>
-  cim.memcpy(%B, %devB) { copyDirection = "toDevice" } : memref<?x?xf32, offset: ?, strides: [?, 1]>, memref<?x?xf32>
-  cim.memcpy(%C, %devC) { copyDirection = "toDevice" } : memref<?x?xf32, offset: ?, strides: [?, 1]>, memref<?x?xf32>
-  cim.matmul(%devA, %devB, %devC) : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
-  cim.memcpy(%devC, %C) { copyDirection = "toHost" } : memref<?x?xf32>, memref<?x?xf32, offset: ?, strides: [?, 1]>
-  cim.dealloc %devA : memref<?x?xf32>
-  cim.dealloc %devB : memref<?x?xf32>
-  cim.dealloc %devC : memref<?x?xf32>
+func @cim_gevm_32(%arg0: memref<?xi32>, %arg1: memref<?x?xi32>, %arg2: memref<?xi32>) {
+  %c0_i32 = constant 0 : i32
+  cim.write_to_crossbar(%c0_i32, %arg1) : i32, memref<?x?xi32>
+  cim.gevm(%c0_i32, %arg0, %arg2) : i32, memref<?xi32>, memref<?xi32>
+  cim.barrier %c0_i32 : i32
   return
 }
-// CHECK-LABEL: func @matmul_generic_memcpy(%{{.*}}: memref<?xi8>,
-// CHECK-SAME: [[M:arg[0-9]+]]: index
-// CHECK-SAME: [[N:arg[0-9]+]]: index
-// CHECK-SAME: [[K:arg[0-9]+]]: index
-//       CHECK: %[[A:.*]] = std.view %{{.*}}[{{.*}}] : memref<?xi8> to memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[B:.*]] = std.view %{{.*}}[{{.*}}] : memref<?xi8> to memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[C:.*]] = std.view %{{.*}}[{{.*}}] : memref<?xi8> to memref<?x?xf32, #[[strided2D]]>
-//       CHECK: %[[devA:.*]] = cim.alloc(%{{.*}} : memref<?x?xf32>
-//       CHECK: %[[devB:.*]] = cim.alloc(%{{.*}} : memref<?x?xf32>
-//       CHECK: %[[devC:.*]] = cim.alloc(%{{.*}} : memref<?x?xf32>
-//       CHECK: cim.memcpy(%[[A]], %[[devA]]) {copyDirection = "toDevice"} : memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32>
-//       CHECK: cim.memcpy(%[[B]], %[[devB]]) {copyDirection = "toDevice"} : memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32>
-//       CHECK: cim.memcpy(%[[C]], %[[devC]]) {copyDirection = "toDevice"} : memref<?x?xf32, #[[strided2D]]>, memref<?x?xf32>
-//       CHECK: cim.matmul(%[[devA]], %[[devB]], %[[devC]]) : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
-//       CHECK: cim.memcpy(%[[devC]], %[[C]]) {copyDirection = "toHost"} : memref<?x?xf32>, memref<?x?xf32, #[[strided2D]]>
-//       CHECK: cim.dealloc %[[devA]] : memref<?x?xf32>
-//       CHECK: cim.dealloc %[[devB]] : memref<?x?xf32>
-//       CHECK: cim.dealloc %[[devC]] : memref<?x?xf32>
+// CHECK-LABEL: func @cim_gevm_32(
+// CHECK-SAME: %[[arg0:.*]]: memref<?xi32>, %[[arg1:.*]]: memref<?x?xi32>, %[[arg2:.*]]: memref<?xi32>) {
+//       CHECK: %[[tileId:.*]] = constant 0 : i32
+//       CHECK: cim.write_to_crossbar(%[[tileId]], %[[arg1]]) : i32, memref<?x?xi32>
+//       CHECK: cim.gevm(%[[tileId]], %[[arg0]], %[[arg2]]) : i32, memref<?xi32>, memref<?xi32>
+//       CHECK: cim.barrier %[[tileId]] : i32
