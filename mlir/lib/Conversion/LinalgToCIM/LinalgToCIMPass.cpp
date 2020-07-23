@@ -15,6 +15,7 @@
 
 #include "mlir/Dialect/CIM/CIMDialect.h"
 #include "mlir/Dialect/Linalg/IR/LinalgOps.h"
+#include "mlir/Dialect/LoopOps/LoopOps.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
@@ -290,6 +291,128 @@ static Value transposeMemRef(Operation *op, PatternRewriter &rewriter,
   return transposedMemory;
 }
 
+static Value flattenTensorToMatrix(Operation *op, PatternRewriter &rewriter,
+                                   const Value &memRef,
+                                   const AffineMap &memRefMap,
+                                   const AffineMap &targetMap,
+                                   uint32_t numLeftDims,
+                                   uint32_t numRightDims) {
+  auto *ctx = cast<GenericOp>(op).getContext();
+  Value transposedMemory = memRef;
+
+  auto memRefDimsPos = getDimsPositions(memRefMap.getResults());
+  auto reqDimsPos = getDimsPositions(targetMap.getResults());
+  auto memRefType = memRef.getType().cast<MemRefType>();
+
+  // Map the original memref to its own order and make output permutation
+  // match post-transposition order
+  SmallVector<AffineExpr, 8U> inputPermutation;
+  SmallVector<AffineExpr, 8U> outputPermutation;
+  for (unsigned i = 0; i < reqDimsPos.size(); ++i) {
+    inputPermutation.push_back(getAffineDimExpr(i, ctx));
+
+    auto it =
+        std::find(memRefDimsPos.begin(), memRefDimsPos.end(), reqDimsPos[i]);
+    int pos = std::distance(memRefDimsPos.begin(), it);
+    outputPermutation.push_back(getAffineDimExpr(pos, ctx));
+  }
+
+  auto inputPermutationMap = AffineMap::get(
+      memRefMap.getNumResults(), 0, ArrayRef<AffineExpr>(inputPermutation));
+  auto outputPermutationMap = AffineMap::get(
+      memRefMap.getNumResults(), 0, ArrayRef<AffineExpr>(outputPermutation));
+
+  MemRefType transposedMemRef =
+      MemRefType::Builder({-1, -1}, memRefType.getElementType());
+
+  auto outputPermutationPos =
+      getDimsPositions(ArrayRef<AffineExpr>(outputPermutation));
+
+  SmallVector<Value, 8U> dimOperands;
+  for (unsigned i = 0; i < outputPermutationPos.size(); ++i) {
+    dimOperands.push_back(
+        rewriter.create<DimOp>(op->getLoc(), memRef, outputPermutationPos[i]));
+  }
+
+  Value leftDimsSize = rewriter.create<ConstantOp>(
+      op->getLoc(), rewriter.getIndexType(),
+      rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
+  for (unsigned i = 0; i < numLeftDims; ++i) {
+    leftDimsSize = rewriter.create<MulIOp>(
+        op->getLoc(), rewriter.getIndexType(), leftDimsSize, dimOperands[i]);
+  }
+  Value rightDimsSize = rewriter.create<ConstantOp>(
+      op->getLoc(), rewriter.getIndexType(),
+      rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
+  for (unsigned i = numLeftDims; i < dimOperands.size(); ++i) {
+    rightDimsSize = rewriter.create<MulIOp>(
+        op->getLoc(), rewriter.getIndexType(), rightDimsSize, dimOperands[i]);
+  }
+
+  transposedMemory =
+      rewriter
+          .create<AllocOp>(op->getLoc(), transposedMemRef,
+                           ArrayRef<Value>{leftDimsSize, rightDimsSize})
+          .getResult();
+  auto deallocOp =
+      rewriter.create<DeallocOp>(op->getLoc(), transposedMemory).getOperation();
+  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+  // rewriter.create<linalg::CopyOp>(op->getLoc(), memRef, transposedMemory,
+  //                                 AffineMapAttr::get(inputPermutationMap),
+  //                                 AffineMapAttr::get(outputPermutationMap));
+
+  Value lowerBound = rewriter.create<ConstantOp>(
+      op->getLoc(), rewriter.getIndexType(),
+      rewriter.getIntegerAttr(rewriter.getIndexType(), 0));
+  Value step = rewriter.create<ConstantOp>(
+      op->getLoc(), rewriter.getIndexType(),
+      rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
+
+  SmallVector<loop::ForOp, 8U> loops;
+  for (unsigned i = 0; i < dimOperands.size(); ++i) {
+    auto it =
+        std::find(outputPermutationPos.begin(), outputPermutationPos.end(), i);
+    int pos = std::distance(outputPermutationPos.begin(), it);
+    Value upperBound = dimOperands[pos];
+
+    auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
+                                             upperBound, step);
+    loops.push_back(loop);
+
+    // Set insertion point inside the loop
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  // Perform copy in the inner-most loop body
+  SmallVector<Value, 8U> loopIterators;
+  for (auto loop : loops) {
+    loopIterators.push_back(loop.getInductionVar());
+  }
+
+  Value element = rewriter.create<LoadOp>(
+      op->getLoc(), memRef, ValueRange(ArrayRef<Value>(loopIterators)));
+
+  SmallVector<int64_t, 8U> strides;
+  int64_t offset;
+  getStridesAndOffset(memRefType, strides, offset);
+
+  // Copy based on strides, loop: a, b, c, d:
+  // flatA[a * stride b + b][c * stride d + d] = A[a][b][c][d]
+
+  // Value leftDimsSize = rewriter.create<ConstantOp>(
+  //     op->getLoc(), rewriter.getIndexType(),
+  //     rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
+  // for (unsigned i = 0; i < numLeftDims; ++i) {
+  //   leftDimsSize = rewriter.create<MulIOp>(
+  //       op->getLoc(), rewriter.getIndexType(), leftDimsSize, dimOperands[i]);
+  // }
+
+  // Set insertion point back at main body outside of loops
+  rewriter.setInsertionPoint(op);
+
+  return transposedMemory;
+}
+
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
                                    ConstantOp &tileId) {
   auto genOp = cast<GenericOp>(op);
@@ -337,7 +460,9 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
     auto transposeMap =
         AffineMap::get(mapA.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsA));
 
-    inputA = transposeMemRef(op, rewriter, matA, mapA, transposeMap);
+    // inputA = transposeMemRef(op, rewriter, matA, mapA, transposeMap);
+    inputA = flattenTensorToMatrix(op, rewriter, matA, mapA, transposeMap,
+                                   uncontrDimsA.size(), contractionDims.size());
   }
 
   if (transposeReqs.transposeB) {
@@ -352,7 +477,9 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
     auto transposeMap =
         AffineMap::get(mapB.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsB));
 
-    inputB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
+    // inputB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
+    inputB = flattenTensorToMatrix(op, rewriter, matB, mapB, transposeMap,
+                                   contractionDims.size(), uncontrDimsB.size());
   }
 
   rewriter.create<cim::ContractionOp>(op->getLoc(), tileId, inputA, inputB,
@@ -528,10 +655,12 @@ public:
     ConversionTarget target(getContext());
     target.addLegalDialect<linalg::LinalgDialect>();
     target.addLegalDialect<cim::CIMDialect>();
-    target.addLegalOp<ConstantOp>();
-    target.addLegalOp<AllocOp>();
-    target.addLegalOp<DeallocOp>();
-    target.addLegalOp<DimOp>();
+    // target.addLegalOp<ConstantOp>();
+    // target.addLegalOp<AllocOp>();
+    // target.addLegalOp<DeallocOp>();
+    // target.addLegalOp<DimOp>();
+    target.addLegalDialect<StandardOpsDialect>();
+    target.addLegalDialect<loop::LoopOpsDialect>();
     target.addIllegalOp<linalg::MatmulOp>();
     target.addDynamicallyLegalOp<linalg::GenericOp>(
         [&](linalg::GenericOp op) { return !isContraction(op); });
