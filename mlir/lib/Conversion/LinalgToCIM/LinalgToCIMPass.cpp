@@ -95,7 +95,6 @@ static bool isGevm(linalg::GenericOp genericOp) {
 
 static std::vector<unsigned>
 getDimsPositions(const ArrayRef<AffineExpr> &affineDims) {
-
   std::vector<unsigned> dims;
 
   for (auto dim : affineDims) {
@@ -154,15 +153,32 @@ static bool isContraction(linalg::GenericOp genericOp) {
   auto uncontrDimsA = setIntersection<unsigned>(dimsA, dimsC);
   auto uncontrDimsB = setIntersection<unsigned>(dimsB, dimsC);
 
+  // The uncontracted dimensions of either input tensor cannot
+  // exceed the size of the output tensor C
+  if ((uncontrDimsA.size() > dimsPosC.size()) ||
+      (uncontrDimsB.size() > dimsPosC.size())) {
+    return false;
+  }
+
   auto contrDimsA = setDifference<unsigned>(dimsA, uncontrDimsA);
   auto contrDimsB = setDifference<unsigned>(dimsB, uncontrDimsB);
   auto contrDims = setUnion<unsigned>(contrDimsA, contrDimsB);
 
+  // Check if the remaining uncontracted dimensions match those of C
   auto outputDims = setUnion<unsigned>(uncontrDimsA, uncontrDimsB);
+
+  // Check if the uncontracted dimensions from A match the left
+  // part of C and if the uncontracted dimensions from B match
+  // the remaining right part of C
+  std::set<unsigned> cDimsFromA(dimsPosC.begin(),
+                                dimsPosC.begin() + uncontrDimsA.size());
+  std::set<unsigned> cDimsFromB(dimsPosC.begin() + uncontrDimsA.size(),
+                                dimsPosC.end());
 
   return contrDims.size() > 0 && contrDimsA == contrDimsB &&
          dimsC.size() == (uncontrDimsA.size() + uncontrDimsB.size()) &&
-         outputDims == dimsC;
+         outputDims == dimsC && uncontrDimsA == cDimsFromA &&
+         uncontrDimsB == cDimsFromB;
 }
 
 struct TransposeAnalysisResults {
