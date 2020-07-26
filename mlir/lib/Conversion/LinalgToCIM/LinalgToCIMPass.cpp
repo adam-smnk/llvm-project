@@ -725,6 +725,8 @@ static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
   } else {
     rewriter.create<cim::GemmOp>(op->getLoc(), tileId, matA, matC);
   }
+
+  rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
 }
 
 static void createCIMGevmOp(Operation *op, PatternRewriter &rewriter,
@@ -761,6 +763,7 @@ static void createCIMGevmOp(Operation *op, PatternRewriter &rewriter,
   }
 
   rewriter.create<cim::GevmOp>(op->getLoc(), tileId, matA, matC);
+  rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
 }
 
 static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
@@ -771,11 +774,12 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
   auto cimTileID = rewriter.create<ConstantOp>(
       op->getLoc(), rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
 
-  // TODO(adam-smnk) Check if MatmulOp can be replaced by vector-matrix mul
+  // TODO(adam-smnk) Check if MatmulOp/GEMM can be replaced by vector-matrix mul
   if (isa<linalg::MatmulOp>(op)) {
     // Assumes that linalg.matmul always has correct values and memrefs
     rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), cimTileID, matB);
     rewriter.create<cim::GemmOp>(op->getLoc(), cimTileID, matA, matC);
+    rewriter.create<cim::BarrierOp>(op->getLoc(), cimTileID);
   } else if (isGevm(cast<linalg::GenericOp>(op))) {
     createCIMGevmOp(op, rewriter, cimTileID);
   } else if (isGemm(cast<linalg::GenericOp>(op))) {
@@ -783,8 +787,6 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
   } else {
     createCIMContractionOp(op, rewriter, cimTileID);
   }
-
-  rewriter.create<cim::BarrierOp>(op->getLoc(), cimTileID);
 
   rewriter.eraseOp(op);
 }
