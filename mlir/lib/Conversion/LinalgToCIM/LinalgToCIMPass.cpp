@@ -64,6 +64,11 @@ static auto getResultMaps(linalg::GenericOp genericOp) {
                          mapsRange);
 }
 
+static auto getResultMaps(ArrayAttr affineMaps) {
+  return functional::map([](AffineMapAttr a) { return a.getValue(); },
+                         affineMaps.getAsRange<AffineMapAttr>());
+}
+
 static auto getResultDims(linalg::GenericOp genericOp) {
   auto mapsRange = genericOp.indexing_maps().getAsRange<AffineMapAttr>();
   return functional::map(
@@ -415,6 +420,7 @@ static void copyMatrixToTensor(Operation *op, PatternRewriter &rewriter,
 
   Value element = rewriter.create<LoadOp>(
       op->getLoc(), targetMemRef, ValueRange(ArrayRef<Value>{rowPos, colPos}));
+
   rewriter.create<StoreOp>(op->getLoc(), element, memRef,
                            ValueRange(ArrayRef<Value>(loopIterators)));
 
@@ -506,54 +512,63 @@ static SmallVector<AffineExpr, 8U> getPermutation(const AffineMap &originalMap,
 static Value flattenTensorToMatrix(Operation *op, PatternRewriter &rewriter,
                                    const Value &memRef,
                                    const AffineMap &memRefMap,
-                                   const AffineMap &targetMap,
-                                   uint32_t numLeftDims,
-                                   uint32_t numRightDims) {
+                                   const ArrayAttr &reassociation) {
   auto *ctx = cast<GenericOp>(op).getContext();
   Value transposedMemory = memRef;
 
-  auto memRefDimsPos = getDimsPositions(memRefMap.getResults());
-  auto reqDimsPos = getDimsPositions(targetMap.getResults());
+  auto targetMaps = getResultMaps(reassociation);
+
+  SmallVector<AffineExpr, 8U> targetDims;
+  for (auto &map : targetMaps) {
+    auto dims = map.getResults();
+    for (auto dim : dims) {
+      targetDims.push_back(dim);
+    }
+  }
+
+  AffineMap targetMap = AffineMap::get(targetDims.size(), 0, targetDims);
 
   // Map the original memref to its own order and make output permutation
   // match post-transposition order
-  SmallVector<AffineExpr, 8U> inputPermutation =
-      getPermutation(memRefMap, memRefMap, ctx);
   SmallVector<AffineExpr, 8U> outputPermutation =
       getPermutation(memRefMap, targetMap, ctx);
-
-  auto inputPermutationMap =
-      AffineMap::get(memRefMap.getNumResults(), 0, inputPermutation);
-  auto outputPermutationMap =
-      AffineMap::get(memRefMap.getNumResults(), 0, outputPermutation);
-
   auto outputPermutationPos = getDimsPositions(outputPermutation);
 
   SmallVector<Value, 8U> dimOperands =
       getMemRefSizes(op, rewriter, memRef, outputPermutationPos);
-  SmallVector<Value, 8U> leftDimOperands(dimOperands.begin(),
-                                         dimOperands.begin() + numLeftDims);
-  SmallVector<Value, 8U> rightDimOperands(dimOperands.begin() + numLeftDims,
-                                          dimOperands.end());
 
-  Value leftDimsSize = calculateDimsSize(op, rewriter, leftDimOperands);
-  Value rightDimsSize = calculateDimsSize(op, rewriter, rightDimOperands);
+  SmallVector<SmallVector<Value, 8U>, 8U> targetDimOperands;
+  auto itBegin = dimOperands.begin();
+  for (auto map : targetMaps) {
+    auto itEnd = itBegin + map.getNumResults();
+    targetDimOperands.push_back(SmallVector<Value, 8U>(itBegin, itEnd));
+    itBegin = itEnd;
+  }
+
+  SmallVector<Value, 8U> targetDimSizes;
+  for (auto operands : targetDimOperands) {
+    targetDimSizes.push_back(calculateDimsSize(op, rewriter, operands));
+  }
+
+  SmallVector<int64_t, 8U> targetMemRefSizes;
+  for (unsigned i = 0; i < reassociation.size(); ++i) {
+    targetMemRefSizes.push_back(-1);
+  }
 
   MemRefType transposedMemRef = MemRefType::Builder(
-      {-1, -1}, memRef.getType().cast<MemRefType>().getElementType());
+      targetMemRefSizes, memRef.getType().cast<MemRefType>().getElementType());
   transposedMemory =
-      rewriter
-          .create<AllocOp>(op->getLoc(), transposedMemRef,
-                           ArrayRef<Value>{leftDimsSize, rightDimsSize})
+      rewriter.create<AllocOp>(op->getLoc(), transposedMemRef, targetDimSizes)
           .getResult();
   auto deallocOp =
       rewriter.create<DeallocOp>(op->getLoc(), transposedMemory).getOperation();
   deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
 
-  SmallVector<Value, 8U> leftDimStrides =
-      calculateDimsStrides(op, rewriter, leftDimOperands);
-  SmallVector<Value, 8U> rightDimStrides =
-      calculateDimsStrides(op, rewriter, rightDimOperands);
+  SmallVector<SmallVector<Value, 8U>, 8U> targetDimStrides;
+  for (unsigned i = 0; i < targetDimOperands.size(); ++i) {
+    targetDimStrides.push_back(
+        calculateDimsStrides(op, rewriter, targetDimOperands[i]));
+  }
 
   Value lowerBound = rewriter.create<ConstantOp>(
       op->getLoc(), rewriter.getIndexType(),
@@ -585,22 +600,26 @@ static Value flattenTensorToMatrix(Operation *op, PatternRewriter &rewriter,
   Value element =
       rewriter.create<LoadOp>(op->getLoc(), memRef, ValueRange(loopIterators));
 
-  SmallVector<Value, 8U> leftDimsIters;
-  for (unsigned i = 0; i < numLeftDims; ++i) {
-    leftDimsIters.push_back(loopIterators[outputPermutationPos[i]]);
-  }
-  SmallVector<Value, 8U> rightDimsIters;
-  for (unsigned i = numLeftDims; i < loopIterators.size(); ++i) {
-    rightDimsIters.push_back(loopIterators[outputPermutationPos[i]]);
+  SmallVector<SmallVector<Value, 8U>, 8U> targetDimIters;
+  unsigned start = 0;
+  for (unsigned i = 0; i < targetDimOperands.size(); ++i) {
+    unsigned end = start + targetDimOperands[i].size();
+    SmallVector<Value, 8U> iters;
+    for (unsigned j = start; j < end; ++j) {
+      iters.push_back(loopIterators[outputPermutationPos[j]]);
+    }
+    targetDimIters.push_back(iters);
+    start = end;
   }
 
-  Value rowPos =
-      calculateLinearIndex(op, rewriter, leftDimsIters, leftDimStrides);
-  Value colPos =
-      calculateLinearIndex(op, rewriter, rightDimsIters, rightDimStrides);
+  SmallVector<Value, 8U> indices;
+  for (unsigned i = 0; i < targetDimIters.size(); ++i) {
+    indices.push_back(calculateLinearIndex(op, rewriter, targetDimIters[i],
+                                           targetDimStrides[i]));
+  }
 
   rewriter.create<StoreOp>(op->getLoc(), element, transposedMemory,
-                           ValueRange(ArrayRef<Value>{rowPos, colPos}));
+                           ValueRange(indices));
 
   // Set insertion point back at main body outside of loops
   rewriter.setInsertionPoint(op);
@@ -639,37 +658,78 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
   auto uncontrDimsB = setIntersection<unsigned>(dimsSetB, dimsSetC);
   auto contractionDims = setIntersection<unsigned>(dimsSetA, dimsSetB);
 
-  SmallVector<AffineExpr, 8U> reqDimsA;
+  // SmallVector<AffineExpr, 8U> reqDimsA;
+  // for (unsigned i = 0; i < uncontrDimsA.size(); ++i) {
+  //   reqDimsA.push_back(getAffineDimExpr(dimsPosC[i], ctx));
+  // }
+  // for (auto pos : contractionDims) {
+  //   reqDimsA.push_back(getAffineDimExpr(pos, ctx));
+  // }
+  // auto transposeMapA =
+  //     AffineMap::get(mapA.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsA));
+
+  SmallVector<AffineExpr, 8U> reqLeftDimsA;
   for (unsigned i = 0; i < uncontrDimsA.size(); ++i) {
-    reqDimsA.push_back(getAffineDimExpr(dimsPosC[i], ctx));
+    reqLeftDimsA.push_back(getAffineDimExpr(dimsPosC[i], ctx));
   }
+  SmallVector<AffineExpr, 8U> reqRightDimsA;
   for (auto pos : contractionDims) {
-    reqDimsA.push_back(getAffineDimExpr(pos, ctx));
+    reqRightDimsA.push_back(getAffineDimExpr(pos, ctx));
   }
-  auto transposeMapA =
-      AffineMap::get(mapA.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsA));
+  auto leftDimsA =
+      AffineMapAttr::get(AffineMap::get(mapA.getNumInputs(), 0, reqLeftDimsA));
+  auto rightDimsA =
+      AffineMapAttr::get(AffineMap::get(mapA.getNumInputs(), 0, reqRightDimsA));
 
-  Value flatA =
-      flattenTensorToMatrix(op, rewriter, matA, mapA, transposeMapA,
-                            uncontrDimsA.size(), contractionDims.size());
+  Value flatA = flattenTensorToMatrix(
+      op, rewriter, matA, mapA, ArrayAttr::get({leftDimsA, rightDimsA}, ctx));
 
-  SmallVector<AffineExpr, 8U> reqDimsB;
+  // SmallVector<AffineExpr, 8U> reqDimsB;
+  // for (auto pos : contractionDims) {
+  //   reqDimsB.push_back(getAffineDimExpr(pos, ctx));
+  // }
+  // for (unsigned i = 0; i < uncontrDimsB.size(); ++i) {
+  //   unsigned cPos = uncontrDimsA.size() + i;
+  //   reqDimsB.push_back(getAffineDimExpr(dimsPosC[cPos], ctx));
+  // }
+  // auto transposeMapB =
+  //     AffineMap::get(mapB.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsB));
+
+  // Value flatB =
+  //     flattenTensorToMatrix(op, rewriter, matB, mapB, transposeMapB,
+  //                           contractionDims.size(), uncontrDimsB.size());
+
+  SmallVector<AffineExpr, 8U> reqLeftDimsB;
   for (auto pos : contractionDims) {
-    reqDimsB.push_back(getAffineDimExpr(pos, ctx));
+    reqLeftDimsB.push_back(getAffineDimExpr(pos, ctx));
   }
+  SmallVector<AffineExpr, 8U> reqRightDimsB;
   for (unsigned i = 0; i < uncontrDimsB.size(); ++i) {
     unsigned cPos = uncontrDimsA.size() + i;
-    reqDimsB.push_back(getAffineDimExpr(dimsPosC[cPos], ctx));
+    reqRightDimsB.push_back(getAffineDimExpr(dimsPosC[cPos], ctx));
   }
-  auto transposeMapB =
-      AffineMap::get(mapB.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsB));
+  auto leftDimsB =
+      AffineMapAttr::get(AffineMap::get(mapB.getNumInputs(), 0, reqLeftDimsB));
+  auto rightDimsB =
+      AffineMapAttr::get(AffineMap::get(mapB.getNumInputs(), 0, reqRightDimsB));
 
-  Value flatB =
-      flattenTensorToMatrix(op, rewriter, matB, mapB, transposeMapB,
-                            contractionDims.size(), uncontrDimsB.size());
+  Value flatB = flattenTensorToMatrix(
+      op, rewriter, matB, mapB, ArrayAttr::get({leftDimsB, rightDimsB}, ctx));
 
-  Value flatC = flattenTensorToMatrix(op, rewriter, matC, mapC, mapC,
-                                      uncontrDimsA.size(), uncontrDimsB.size());
+  // Value flatC = flattenTensorToMatrix(op, rewriter, matC, mapC, mapC,
+  //                                     uncontrDimsA.size(),
+  //                                     uncontrDimsB.size());
+
+  auto leftDimsC = AffineMapAttr::get(
+      AffineMap::get(mapC.getNumInputs(), 0,
+                     ArrayRef<AffineExpr>(
+                         dimsC.begin(), dimsC.begin() + uncontrDimsA.size())));
+  auto rightDimsC = AffineMapAttr::get(AffineMap::get(
+      mapC.getNumInputs(), 0,
+      ArrayRef<AffineExpr>(dimsC.begin() + uncontrDimsA.size(), dimsC.end())));
+
+  Value flatC = flattenTensorToMatrix(
+      op, rewriter, matC, mapC, ArrayAttr::get({leftDimsC, rightDimsC}, ctx));
 
   rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, flatB);
   rewriter.create<cim::GemmOp>(op->getLoc(), tileId, flatA, flatC);
