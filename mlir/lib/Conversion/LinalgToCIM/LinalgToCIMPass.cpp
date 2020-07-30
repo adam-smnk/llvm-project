@@ -379,126 +379,19 @@ static SmallVector<AffineExpr, 8U> getPermutation(const AffineMap &originalMap,
   return permutation;
 }
 
-static Value transposeCollapse(Operation *op, PatternRewriter &rewriter,
-                               const Value &memRef, const AffineMap &memRefMap,
-                               const ArrayAttr &reassociation) {
-  auto *ctx = op->getContext();
-  Value transposedMemory = memRef;
-
-  SmallVector<AffineMap, 8U> targetMaps = getResultMaps(reassociation);
-
-  SmallVector<AffineExpr, 8U> targetDims;
-  for (const auto &map : targetMaps) {
-    auto dims = map.getResults();
-    targetDims.insert(targetDims.end(), dims.begin(), dims.end());
-  }
-
-  // Map the original memref to its own order and make output permutation
-  // match post-transposition order
-  SmallVector<AffineExpr, 8U> outputPermutation = getPermutation(
-      memRefMap, AffineMap::get(targetDims.size(), 0, targetDims), ctx);
-  auto outputPermutationPos = getDimsPositions(outputPermutation);
-
-  SmallVector<Value, 8U> dimOperands =
-      getMemRefSizes(op, rewriter, memRef, outputPermutationPos);
-
-  SmallVector<SmallVector<Value, 8U>, 8U> targetDimOperands;
-  auto itBegin = dimOperands.begin();
-  for (const auto &map : targetMaps) {
-    auto itEnd = itBegin + map.getNumResults();
-    targetDimOperands.push_back(SmallVector<Value, 8U>(itBegin, itEnd));
-    itBegin = itEnd;
-  }
-
-  SmallVector<Value, 8U> targetDimSizes;
-  for (const auto &operands : targetDimOperands) {
-    targetDimSizes.push_back(calculateDimsSize(op, rewriter, operands));
-  }
-
-  SmallVector<int64_t, 8U> targetMemRefSizes;
-  for (unsigned i = 0; i < reassociation.size(); ++i) {
-    targetMemRefSizes.push_back(-1);
-  }
-
-  MemRefType transposedMemRef = MemRefType::Builder(
-      targetMemRefSizes, memRef.getType().cast<MemRefType>().getElementType());
-  transposedMemory =
-      rewriter.create<AllocOp>(op->getLoc(), transposedMemRef, targetDimSizes)
-          .getResult();
-  auto deallocOp =
-      rewriter.create<DeallocOp>(op->getLoc(), transposedMemory).getOperation();
-  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
-
-  SmallVector<SmallVector<Value, 8U>, 8U> targetDimStrides;
-  for (unsigned i = 0; i < targetDimOperands.size(); ++i) {
-    targetDimStrides.push_back(
-        calculateDimsStrides(op, rewriter, targetDimOperands[i]));
-  }
-
-  Value lowerBound = rewriter.create<ConstantOp>(
-      op->getLoc(), rewriter.getIndexType(),
-      rewriter.getIntegerAttr(rewriter.getIndexType(), 0));
-  Value step = rewriter.create<ConstantOp>(
-      op->getLoc(), rewriter.getIndexType(),
-      rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
-
-  // Loop over tensor dimensions
-  SmallVector<loop::ForOp, 8U> loops;
-  SmallVector<Value, 8U> loopIterators;
-  for (unsigned i = 0; i < dimOperands.size(); ++i) {
-    // Iterate in the original dimension order before tranposition
-    auto it =
-        std::find(outputPermutationPos.begin(), outputPermutationPos.end(), i);
-    int pos = std::distance(outputPermutationPos.begin(), it);
-    Value upperBound = dimOperands[pos];
-
-    auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
-                                             upperBound, step);
-    loops.push_back(loop);
-    loopIterators.push_back(loop.getInductionVar());
-
-    // Set insertion point inside the loop
-    rewriter.setInsertionPointToStart(loop.getBody());
-  }
-
-  // Perform copy in the inner-most loop
-  Value element =
-      rewriter.create<LoadOp>(op->getLoc(), memRef, ValueRange(loopIterators));
-
-  SmallVector<SmallVector<Value, 8U>, 8U> targetDimIters;
-  unsigned start = 0;
-  for (unsigned i = 0; i < targetDimOperands.size(); ++i) {
-    unsigned end = start + targetDimOperands[i].size();
-    SmallVector<Value, 8U> iters;
-    for (unsigned j = start; j < end; ++j) {
-      iters.push_back(loopIterators[outputPermutationPos[j]]);
-    }
-    targetDimIters.push_back(iters);
-    start = end;
-  }
-
-  SmallVector<Value, 8U> indices;
-  for (unsigned i = 0; i < targetDimIters.size(); ++i) {
-    indices.push_back(calculateLinearIndex(op, rewriter, targetDimIters[i],
-                                           targetDimStrides[i]));
-  }
-
-  rewriter.create<StoreOp>(op->getLoc(), element, transposedMemory,
-                           ValueRange(indices));
-
-  // Set insertion point back at main body outside of loops
-  rewriter.setInsertionPoint(op);
-
-  return transposedMemory;
-}
-
-// Reassociation defines dimension groupings for the lower rank memref
-// Expects both memrefs to be contiguous
-static void copyReshape(Operation *op, PatternRewriter &rewriter,
+// Performs reshape with copy.
+// Reassociation defines continuous dimension groupings for the lower rank
+// memref.
+// Expects both memrefs to point to contiguous memory.
+// Permutation list should reorder all the dimensions present in the higher rank
+// memref or be empty, otherwise the behavior is undefined.
+static void reshapeCopy(Operation *op, PatternRewriter &rewriter,
                         const Value &inputMemRef, const Value &outputMemRef,
-                        const ArrayAttr &reassociation) {
+                        const ArrayAttr &reassociation,
+                        ArrayRef<unsigned> permutation = ArrayRef<unsigned>()) {
   Value memRef = inputMemRef;
 
+  // In case of dimension expansion, treat reassociation as inverse maps
   unsigned inputNumDims =
       inputMemRef.getType().cast<MemRefType>().getShape().size();
   unsigned outputNumDims =
@@ -513,21 +406,22 @@ static void copyReshape(Operation *op, PatternRewriter &rewriter,
 
   SmallVector<AffineMap, 8U> targetMaps = getResultMaps(reassociation);
 
-  SmallVector<AffineExpr, 8U> targetDims;
-  for (const auto &map : targetMaps) {
-    auto dims = map.getResults();
-    targetDims.insert(targetDims.end(), dims.begin(), dims.end());
-  }
+  // Determine desired order of the dimensions of the higher rank memref.
+  // In case of no permutation, use the default dimension order.
+  SmallVector<unsigned, 8U> positions;
+  if (permutation.empty()) {
+    unsigned numDims = memRef.getType().cast<MemRefType>().getShape().size();
+    for (unsigned i = 0; i < numDims; ++i) {
+      positions.push_back(i);
+    }
 
-  SmallVector<unsigned, 8U> dimPositions;
-  unsigned numDims = memRef.getType().cast<MemRefType>().getShape().size();
-  for (unsigned i = 0; i < numDims; ++i) {
-    dimPositions.push_back(i);
+    permutation = positions;
   }
 
   SmallVector<Value, 8U> dimOperands =
-      getMemRefSizes(op, rewriter, memRef, dimPositions);
+      getMemRefSizes(op, rewriter, memRef, permutation);
 
+  // For each grouping, gather corresponding dimension sizes
   SmallVector<SmallVector<Value, 8U>, 8U> targetDimOperands;
   auto itBegin = dimOperands.begin();
   for (const auto &map : targetMaps) {
@@ -536,6 +430,7 @@ static void copyReshape(Operation *op, PatternRewriter &rewriter,
     itBegin = itEnd;
   }
 
+  // For each grouping, compute their strides at runtime
   SmallVector<SmallVector<Value, 8U>, 8U> targetDimStrides;
   for (unsigned i = 0; i < targetDimOperands.size(); ++i) {
     targetDimStrides.push_back(
@@ -549,11 +444,14 @@ static void copyReshape(Operation *op, PatternRewriter &rewriter,
       op->getLoc(), rewriter.getIndexType(),
       rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
 
-  // Loop over tensor dimensions
+  // Loop over higher rank memref dimensions
   SmallVector<loop::ForOp, 8U> loops;
   SmallVector<Value, 8U> loopIterators;
   for (unsigned i = 0; i < dimOperands.size(); ++i) {
-    Value upperBound = dimOperands[i];
+    // Iterate in the original dimension order before permutation
+    auto it = std::find(permutation.begin(), permutation.end(), i);
+    int pos = std::distance(permutation.begin(), it);
+    Value upperBound = dimOperands[pos];
 
     auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
                                              upperBound, step);
@@ -571,12 +469,13 @@ static void copyReshape(Operation *op, PatternRewriter &rewriter,
     unsigned end = start + targetDimOperands[i].size();
     SmallVector<Value, 8U> iters;
     for (unsigned j = start; j < end; ++j) {
-      iters.push_back(loopIterators[j]);
+      iters.push_back(loopIterators[permutation[j]]);
     }
     targetDimIters.push_back(iters);
     start = end;
   }
 
+  // For each grouping, compute their linear indices at runtime
   SmallVector<Value, 8U> indices;
   for (unsigned i = 0; i < targetDimIters.size(); ++i) {
     indices.push_back(calculateLinearIndex(op, rewriter, targetDimIters[i],
@@ -595,8 +494,70 @@ static void copyReshape(Operation *op, PatternRewriter &rewriter,
                              ValueRange(loopIterators));
   }
 
-  // Set insertion point back at main body outside of loops
+  // Set insertion point back at main body outside of the loops
   rewriter.setInsertionPoint(op);
+}
+
+// Groups (collapses) dimensions of the input memref based on a reassociation
+// map. Allows for permutation.
+// Performs alloc and copy of the original data.
+static Value groupDimensions(Operation *op, PatternRewriter &rewriter,
+                             const Value &memRef, const AffineMap &memRefMap,
+                             const ArrayAttr &reassociation) {
+  auto *ctx = op->getContext();
+
+  SmallVector<AffineMap, 8U> targetMaps = getResultMaps(reassociation);
+
+  SmallVector<AffineExpr, 8U> targetDims;
+  for (const auto &map : targetMaps) {
+    auto dims = map.getResults();
+    targetDims.insert(targetDims.end(), dims.begin(), dims.end());
+  }
+  SmallVector<AffineExpr, 8U> outputPermutation = getPermutation(
+      memRefMap, AffineMap::get(targetDims.size(), 0, targetDims), ctx);
+
+  auto outputPermutationPos = getDimsPositions(outputPermutation);
+
+  // Get input memref sizes at runtime
+  SmallVector<Value, 8U> dimOperands =
+      getMemRefSizes(op, rewriter, memRef, outputPermutationPos);
+
+  // For each grouping, gather corresponding dimension sizes
+  SmallVector<SmallVector<Value, 8U>, 8U> targetDimOperands;
+  auto itBegin = dimOperands.begin();
+  for (const auto &map : targetMaps) {
+    auto itEnd = itBegin + map.getNumResults();
+    targetDimOperands.push_back(SmallVector<Value, 8U>(itBegin, itEnd));
+    itBegin = itEnd;
+  }
+
+  // For each grouping, calculate their sizes at runtime
+  SmallVector<Value, 8U> targetDimSizes;
+  for (const auto &operands : targetDimOperands) {
+    targetDimSizes.push_back(calculateDimsSize(op, rewriter, operands));
+  }
+  SmallVector<int64_t, 8U> targetMemRefSizes;
+  for (unsigned i = 0; i < reassociation.size(); ++i) {
+    targetMemRefSizes.push_back(-1);
+  }
+
+  MemRefType outputMemRefType = MemRefType::Builder(
+      targetMemRefSizes, memRef.getType().cast<MemRefType>().getElementType());
+
+  Value outputMemRef =
+      rewriter.create<AllocOp>(op->getLoc(), outputMemRefType, targetDimSizes)
+          .getResult();
+
+  // Deallocate the data at the end of block after CIM computations are
+  // finished
+  auto deallocOp =
+      rewriter.create<DeallocOp>(op->getLoc(), outputMemRef).getOperation();
+  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+
+  reshapeCopy(op, rewriter, memRef, outputMemRef, reassociation,
+              outputPermutationPos);
+
+  return outputMemRef;
 }
 
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
@@ -644,8 +605,8 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
       AffineMapAttr::get(AffineMap::get(mapA.getNumInputs(), 0, reqRightDimsA));
 
   // Flatten tensor to matrix
-  Value flatA = transposeCollapse(op, rewriter, matA, mapA,
-                                  ArrayAttr::get({leftDimsA, rightDimsA}, ctx));
+  Value flatA = groupDimensions(op, rewriter, matA, mapA,
+                                ArrayAttr::get({leftDimsA, rightDimsA}, ctx));
 
   SmallVector<AffineExpr, 8U> reqLeftDimsB;
   for (const auto &pos : contractionDims) {
@@ -662,8 +623,8 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
       AffineMapAttr::get(AffineMap::get(mapB.getNumInputs(), 0, reqRightDimsB));
 
   // Flatten tensor to matrix
-  Value flatB = transposeCollapse(op, rewriter, matB, mapB,
-                                  ArrayAttr::get({leftDimsB, rightDimsB}, ctx));
+  Value flatB = groupDimensions(op, rewriter, matB, mapB,
+                                ArrayAttr::get({leftDimsB, rightDimsB}, ctx));
 
   auto leftDimsC = AffineMapAttr::get(
       AffineMap::get(mapC.getNumInputs(), 0,
@@ -674,14 +635,15 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
       ArrayRef<AffineExpr>(dimsC.begin() + uncontrDimsA.size(), dimsC.end())));
 
   // Flatten tensor to matrix
-  Value flatC = transposeCollapse(op, rewriter, matC, mapC,
-                                  ArrayAttr::get({leftDimsC, rightDimsC}, ctx));
+  Value flatC = groupDimensions(op, rewriter, matC, mapC,
+                                ArrayAttr::get({leftDimsC, rightDimsC}, ctx));
 
   rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, flatB);
   rewriter.create<cim::GemmOp>(op->getLoc(), tileId, flatA, flatC);
   rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
 
-  copyReshape(op, rewriter, flatC, matC,
+  // Unflatten the contraction result and copy to the output tensor
+  reshapeCopy(op, rewriter, flatC, matC,
               ArrayAttr::get({leftDimsC, rightDimsC}, ctx));
 }
 
