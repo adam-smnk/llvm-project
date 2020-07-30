@@ -298,138 +298,6 @@ static Value transposeMemRef(Operation *op, PatternRewriter &rewriter,
   return transposedMemory;
 }
 
-static void copyMatrixToTensor(Operation *op, PatternRewriter &rewriter,
-                               const Value &memRef, const AffineMap &memRefMap,
-                               const Value &targetMemRef,
-                               const AffineMap &targetMap, uint32_t numLeftDims,
-                               uint32_t numRightDims) {
-  auto *ctx = cast<GenericOp>(op).getContext();
-
-  auto memRefDimsPos = getDimsPositions(memRefMap.getResults());
-  auto reqDimsPos = getDimsPositions(targetMap.getResults());
-  auto memRefType = memRef.getType().cast<MemRefType>();
-
-  // Map the original memref to its own order and make output permutation
-  // match post-transposition order
-  SmallVector<AffineExpr, 8U> inputPermutation;
-  SmallVector<AffineExpr, 8U> outputPermutation;
-  for (unsigned i = 0; i < reqDimsPos.size(); ++i) {
-    inputPermutation.push_back(getAffineDimExpr(i, ctx));
-
-    auto it =
-        std::find(memRefDimsPos.begin(), memRefDimsPos.end(), reqDimsPos[i]);
-    int pos = std::distance(memRefDimsPos.begin(), it);
-    outputPermutation.push_back(getAffineDimExpr(pos, ctx));
-  }
-
-  auto inputPermutationMap = AffineMap::get(
-      memRefMap.getNumResults(), 0, ArrayRef<AffineExpr>(inputPermutation));
-  auto outputPermutationMap = AffineMap::get(
-      memRefMap.getNumResults(), 0, ArrayRef<AffineExpr>(outputPermutation));
-
-  MemRefType transposedMemRef =
-      MemRefType::Builder({-1, -1}, memRefType.getElementType());
-
-  auto outputPermutationPos =
-      getDimsPositions(ArrayRef<AffineExpr>(outputPermutation));
-
-  SmallVector<Value, 8U> dimOperands;
-  for (unsigned i = 0; i < outputPermutationPos.size(); ++i) {
-    dimOperands.push_back(
-        rewriter.create<DimOp>(op->getLoc(), memRef, outputPermutationPos[i]));
-  }
-
-  Value one = rewriter.create<ConstantOp>(
-      op->getLoc(), rewriter.getIndexType(),
-      rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
-
-  SmallVector<Value, 8U> leftDimStrides;
-  leftDimStrides.push_back(one);
-  for (unsigned i = 1; i < numLeftDims; ++i) {
-    leftDimStrides.push_back(rewriter.create<MulIOp>(
-        op->getLoc(), rewriter.getIndexType(), leftDimStrides.back(),
-        dimOperands[numLeftDims - i]));
-  }
-  std::reverse(leftDimStrides.begin(), leftDimStrides.end());
-
-  SmallVector<Value, 8U> rightDimStrides;
-  rightDimStrides.push_back(one);
-  for (unsigned i = 1; i < numRightDims; ++i) {
-    rightDimStrides.push_back(rewriter.create<MulIOp>(
-        op->getLoc(), rewriter.getIndexType(), rightDimStrides.back(),
-        dimOperands[dimOperands.size() - i]));
-  }
-  std::reverse(rightDimStrides.begin(), rightDimStrides.end());
-
-  Value lowerBound = rewriter.create<ConstantOp>(
-      op->getLoc(), rewriter.getIndexType(),
-      rewriter.getIntegerAttr(rewriter.getIndexType(), 0));
-  Value step = rewriter.create<ConstantOp>(
-      op->getLoc(), rewriter.getIndexType(),
-      rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
-
-  SmallVector<loop::ForOp, 8U> loops;
-  for (unsigned i = 0; i < dimOperands.size(); ++i) {
-    auto it =
-        std::find(outputPermutationPos.begin(), outputPermutationPos.end(), i);
-    int pos = std::distance(outputPermutationPos.begin(), it);
-    Value upperBound = dimOperands[pos];
-
-    auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
-                                             upperBound, step);
-    loops.push_back(loop);
-
-    // Set insertion point inside the loop
-    rewriter.setInsertionPointToStart(loop.getBody());
-  }
-
-  // Perform copy in the inner-most loop body
-  SmallVector<Value, 8U> loopIterators;
-  for (auto &loop : loops) {
-    loopIterators.push_back(loop.getInductionVar());
-  }
-
-  // Copy based on strides, loop: a, b, c, d:
-  // flatA[a * stride b + b][c * stride d + d] = A[a][b][c][d]
-
-  Value zero = rewriter.create<ConstantOp>(
-      op->getLoc(), rewriter.getIndexType(),
-      rewriter.getIntegerAttr(rewriter.getIndexType(), 0));
-  Value rowPos = rewriter.create<AddIOp>(
-      op->getLoc(), rewriter.getIndexType(), zero,
-      loopIterators[outputPermutationPos[numLeftDims - 1]]);
-
-  for (unsigned i = 0; i < numLeftDims - 1; ++i) {
-    Value mulRes = rewriter.create<MulIOp>(
-        op->getLoc(), rewriter.getIndexType(),
-        loopIterators[outputPermutationPos[i]], leftDimStrides[i]);
-    rowPos = rewriter.create<AddIOp>(op->getLoc(), rewriter.getIndexType(),
-                                     rowPos, mulRes);
-  }
-
-  Value colPos =
-      rewriter.create<AddIOp>(op->getLoc(), rewriter.getIndexType(), zero,
-                              loopIterators[outputPermutationPos.back()]);
-
-  for (unsigned i = 0; i < numRightDims - 1; ++i) {
-    Value mulRes = rewriter.create<MulIOp>(
-        op->getLoc(), rewriter.getIndexType(),
-        loopIterators[outputPermutationPos[numLeftDims + i]],
-        rightDimStrides[i]);
-    colPos = rewriter.create<AddIOp>(op->getLoc(), rewriter.getIndexType(),
-                                     colPos, mulRes);
-  }
-
-  Value element = rewriter.create<LoadOp>(
-      op->getLoc(), targetMemRef, ValueRange(ArrayRef<Value>{rowPos, colPos}));
-
-  rewriter.create<StoreOp>(op->getLoc(), element, memRef,
-                           ValueRange(ArrayRef<Value>(loopIterators)));
-
-  // Set insertion point back at main body outside of loops
-  rewriter.setInsertionPoint(op);
-}
-
 static SmallVector<Value, 8U>
 getMemRefSizes(Operation *op, PatternRewriter &rewriter, const Value &memRef,
                const ArrayRef<unsigned> &dimsPositions) {
@@ -514,7 +382,7 @@ static SmallVector<AffineExpr, 8U> getPermutation(const AffineMap &originalMap,
 static Value transposeCollapse(Operation *op, PatternRewriter &rewriter,
                                const Value &memRef, const AffineMap &memRefMap,
                                const ArrayAttr &reassociation) {
-  auto *ctx = cast<GenericOp>(op).getContext();
+  auto *ctx = op->getContext();
   Value transposedMemory = memRef;
 
   SmallVector<AffineMap, 8U> targetMaps = getResultMaps(reassociation);
@@ -629,7 +497,7 @@ static Value transposeCollapse(Operation *op, PatternRewriter &rewriter,
 static void copyReshape(Operation *op, PatternRewriter &rewriter,
                         const Value &inputMemRef, const Value &outputMemRef,
                         const ArrayAttr &reassociation) {
-  auto *ctx = cast<GenericOp>(op).getContext();
+  Value memRef = inputMemRef;
 
   unsigned inputNumDims =
       inputMemRef.getType().cast<MemRefType>().getShape().size();
@@ -639,7 +507,6 @@ static void copyReshape(Operation *op, PatternRewriter &rewriter,
 
   // All loops and strides are calculated based on the memref
   // with higher rank
-  Value memRef = inputMemRef;
   if (isInverseMap) {
     memRef = outputMemRef;
   }
