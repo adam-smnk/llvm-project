@@ -101,6 +101,18 @@ static bool isGevm(linalg::GenericOp genericOp) {
   return dimsA.size() == 1 && dimsB.size() == 2 && dimsC.size() == 1;
 }
 
+// Assumes that the genericOp is a contraction
+static bool isGemv(linalg::GenericOp genericOp) {
+  auto resultDims = getResultDims(genericOp);
+
+  auto dimsA = resultDims[0];
+  auto dimsB = resultDims[1];
+  auto dimsC = resultDims[2];
+
+  // C(n) = A(k) * B(k, n)
+  return dimsA.size() == 2 && dimsB.size() == 1 && dimsC.size() == 1;
+}
+
 static std::vector<unsigned>
 getDimsPositions(const ArrayRef<AffineExpr> &affineDims) {
 
@@ -757,6 +769,41 @@ static void createCIMGevmOp(Operation *op, PatternRewriter &rewriter,
   rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
 }
 
+static void createCIMGemvOp(Operation *op, PatternRewriter &rewriter,
+                            ConstantOp &tileId) {
+  auto genOp = cast<GenericOp>(op);
+  auto ctx = op->getContext();
+
+  auto matB = op->getOperand(1);
+
+  auto resultMaps = getResultMaps(genOp);
+  auto dimsB = resultMaps[1].getResults();
+  auto constDimOne = getAffineConstantExpr(1, ctx);
+
+  auto memRefType = matB.getType().cast<MemRefType>();
+  MemRefType vector2dType = MemRefType::Builder(memRefType).setShape({1, -1});
+  auto vector2dDims =
+      AffineMapAttr::get(AffineMap::get(2, 0, {constDimOne, dimsB[0]}));
+
+  SmallVector<Value, 8U> memRefSize = getMemRefSizes(op, rewriter, matB, {0});
+
+  Value vector2d =
+      rewriter.create<AllocOp>(op->getLoc(), vector2dType, memRefSize)
+          .getResult();
+  // Deallocate the data at the end of block after CIM computations are
+  // finished
+  auto deallocOp =
+      rewriter.create<DeallocOp>(op->getLoc(), vector2d).getOperation();
+  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+
+  reshapeCopy(op, rewriter, matB, vector2d,
+              ArrayAttr::get({vector2dDims}, ctx));
+
+  op->setOperand(1, vector2d);
+
+  createCIMGemmOp(op, rewriter, tileId);
+}
+
 static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
   auto matA = op->getOperand(0);
   auto matB = op->getOperand(1);
@@ -775,6 +822,8 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
     createCIMGevmOp(op, rewriter, cimTileID);
   } else if (isGemm(cast<linalg::GenericOp>(op))) {
     createCIMGemmOp(op, rewriter, cimTileID);
+  } else if (isGemv(cast<linalg::GenericOp>(op))) {
+    createCIMGemvOp(op, rewriter, cimTileID);
   } else {
     createCIMContractionOp(op, rewriter, cimTileID);
   }
