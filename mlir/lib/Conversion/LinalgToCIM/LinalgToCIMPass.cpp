@@ -774,34 +774,36 @@ static void createCIMGemvOp(Operation *op, PatternRewriter &rewriter,
   auto genOp = cast<GenericOp>(op);
   auto ctx = op->getContext();
 
+  auto matA = op->getOperand(0);
   auto matB = op->getOperand(1);
 
   auto resultMaps = getResultMaps(genOp);
-  auto dimsB = resultMaps[1].getResults();
-  auto constDimOne = getAffineConstantExpr(1, ctx);
 
-  auto memRefType = matB.getType().cast<MemRefType>();
-  MemRefType vector2dType = MemRefType::Builder(memRefType).setShape({1, -1});
-  auto vector2dDims =
-      AffineMapAttr::get(AffineMap::get(2, 0, {constDimOne, dimsB[0]}));
+  auto mapA = resultMaps[0];
+  auto mapB = resultMaps[1];
+  auto mapC = resultMaps[2];
 
-  SmallVector<Value, 8U> memRefSize = getMemRefSizes(op, rewriter, matB, {0});
+  auto dimsA = mapA.getResults();
 
-  Value vector2d =
-      rewriter.create<AllocOp>(op->getLoc(), vector2dType, memRefSize)
-          .getResult();
-  // Deallocate the data at the end of block after CIM computations are
-  // finished
-  auto deallocOp =
-      rewriter.create<DeallocOp>(op->getLoc(), vector2d).getOperation();
-  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+  // Convert GEMV to GEVM through tranposition:
+  // (A*B)^T = B^T * A^T
+  // B and C don't need to be tranposed as they are represented by
+  // one dimensional vectors
+  auto aTranposeMap = AffineMap::get(2, 0, {dimsA[1], dimsA[0]});
+  Value matAt = transposeMemRef(op, rewriter, matA, mapA, aTranposeMap);
 
-  reshapeCopy(op, rewriter, matB, vector2d,
-              ArrayAttr::get({vector2dDims}, ctx));
+  // Remap operator indexing
+  auto indexingMapsAttr = ArrayAttr::get({AffineMapAttr::get(mapB),
+                                          AffineMapAttr::get(aTranposeMap),
+                                          AffineMapAttr::get(mapC)},
+                                         ctx);
+  op->setAttr(getIndexingMapsAttrName(), indexingMapsAttr);
 
-  op->setOperand(1, vector2d);
+  // Rearrange operands to fit GEVM op
+  op->setOperand(0, matB);
+  op->setOperand(1, matAt);
 
-  createCIMGemmOp(op, rewriter, tileId);
+  createCIMGevmOp(op, rewriter, tileId);
 }
 
 static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
