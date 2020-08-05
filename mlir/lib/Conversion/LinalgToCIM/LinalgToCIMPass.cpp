@@ -416,7 +416,8 @@ static SmallVector<AffineExpr, 8U> getPermutation(const AffineMap &originalMap,
 static void reshapeCopy(Operation *op, PatternRewriter &rewriter,
                         const Value &inputMemRef, const Value &outputMemRef,
                         const ArrayAttr &reassociation,
-                        ArrayRef<unsigned> permutation = ArrayRef<unsigned>()) {
+                        ArrayRef<unsigned> permutation = ArrayRef<unsigned>(),
+                        bool performElementwiseSum = false) {
   Value memRef = inputMemRef;
 
   // In case of dimension expansion, treat reassociation as inverse maps
@@ -510,17 +511,115 @@ static void reshapeCopy(Operation *op, PatternRewriter &rewriter,
                                            targetDimStrides[i]));
   }
 
-  if (!isInverseMap) {
-    Value element = rewriter.create<LoadOp>(op->getLoc(), inputMemRef,
-                                            ValueRange(loopIterators));
-    rewriter.create<StoreOp>(op->getLoc(), element, outputMemRef,
-                             ValueRange(indices));
-  } else {
-    Value element =
-        rewriter.create<LoadOp>(op->getLoc(), inputMemRef, ValueRange(indices));
-    rewriter.create<StoreOp>(op->getLoc(), element, outputMemRef,
-                             ValueRange(loopIterators));
+  ValueRange inputIndices = ValueRange(loopIterators);
+  ValueRange outputIndices = ValueRange(indices);
+
+  if (isInverseMap) {
+    inputIndices = ValueRange(indices);
+    outputIndices = ValueRange(loopIterators);
   }
+
+  Value inputElement =
+      rewriter.create<LoadOp>(op->getLoc(), inputMemRef, inputIndices);
+
+  // TODO(adam-smnk) Refactor bool flag into more modular solution.
+  if (performElementwiseSum) {
+    Value outputElement =
+        rewriter.create<LoadOp>(op->getLoc(), outputMemRef, outputIndices);
+    inputElement = rewriter.create<AddIOp>(
+        op->getLoc(), inputMemRef.getType().cast<MemRefType>().getElementType(),
+        inputElement, outputElement);
+  }
+
+  rewriter.create<StoreOp>(op->getLoc(), inputElement, outputMemRef,
+                           outputIndices);
+
+  // Set insertion point back at main body outside of the loops
+  rewriter.setInsertionPoint(op);
+}
+
+static Value allocateDuplicate(Operation *op, PatternRewriter &rewriter,
+                               const Value &memRef) {
+  const auto memRefType = memRef.getType().cast<MemRefType>();
+
+  SmallVector<unsigned, 8U> dimPositions;
+  SmallVector<int64_t, 8U> duplicateSizes;
+
+  const unsigned numDims = memRefType.getShape().size();
+  for (unsigned i = 0; i < numDims; ++i) {
+    dimPositions.push_back(i);
+    duplicateSizes.push_back(-1);
+  }
+
+  // Get input memref sizes at runtime
+  SmallVector<Value, 8U> dimOperands =
+      getMemRefSizes(op, rewriter, memRef, dimPositions);
+
+  MemRefType duplicateMemRefType =
+      MemRefType::Builder(duplicateSizes, memRefType.getElementType());
+
+  Value duplicateMemRef =
+      rewriter.create<AllocOp>(op->getLoc(), duplicateMemRefType, dimOperands)
+          .getResult();
+
+  // Deallocate the data at the end of block after CIM computations are
+  // finished
+  auto deallocOp =
+      rewriter.create<DeallocOp>(op->getLoc(), duplicateMemRef).getOperation();
+  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+
+  return duplicateMemRef;
+}
+
+static void elementwiseAddition(Operation *op, PatternRewriter &rewriter,
+                                const Value &inputMemRef,
+                                const Value &outputMemRef) {
+  assert(inputMemRef.getType().cast<MemRefType>().getShape() ==
+             outputMemRef.getType().cast<MemRefType>().getShape() &&
+         "Input and output shapes differ");
+
+  const auto memRefType = inputMemRef.getType().cast<MemRefType>();
+  const unsigned numDims = memRefType.getShape().size();
+
+  SmallVector<unsigned, 8U> dimPositions;
+  for (unsigned i = 0; i < numDims; ++i) {
+    dimPositions.push_back(i);
+  }
+
+  // Get memref sizes at runtime
+  SmallVector<Value, 8U> dimOperands =
+      getMemRefSizes(op, rewriter, inputMemRef, dimPositions);
+
+  Value lowerBound = rewriter.create<ConstantOp>(
+      op->getLoc(), rewriter.getIndexType(),
+      rewriter.getIntegerAttr(rewriter.getIndexType(), 0));
+  Value step = rewriter.create<ConstantOp>(
+      op->getLoc(), rewriter.getIndexType(),
+      rewriter.getIntegerAttr(rewriter.getIndexType(), 1));
+
+  // Loop over higher rank memref dimensions
+  SmallVector<loop::ForOp, 8U> loops;
+  SmallVector<Value, 8U> loopIterators;
+  for (unsigned i = 0; i < numDims; ++i) {
+    Value upperBound = dimOperands[i];
+
+    auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
+                                             upperBound, step);
+    loops.push_back(loop);
+    loopIterators.push_back(loop.getInductionVar());
+
+    // Set insertion point inside the loop
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  Value inputElement = rewriter.create<LoadOp>(op->getLoc(), inputMemRef,
+                                               ValueRange(loopIterators));
+  Value outputElement = rewriter.create<LoadOp>(op->getLoc(), outputMemRef,
+                                                ValueRange(loopIterators));
+  Value sumResult = rewriter.create<AddIOp>(
+      op->getLoc(), memRefType.getElementType(), inputElement, outputElement);
+  rewriter.create<StoreOp>(op->getLoc(), sumResult, outputMemRef,
+                           ValueRange(loopIterators));
 
   // Set insertion point back at main body outside of the loops
   rewriter.setInsertionPoint(op);
@@ -672,7 +771,8 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
 
   // Unflatten the contraction result and copy to the output tensor
   reshapeCopy(op, rewriter, flatC, matC,
-              ArrayAttr::get({leftDimsC, rightDimsC}, ctx));
+              ArrayAttr::get({leftDimsC, rightDimsC}, ctx),
+              ArrayRef<unsigned>(), true);
 }
 
 static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
@@ -708,6 +808,8 @@ static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
 
   auto transposeReqs = checkContractionTransposes(dimsPosA, dimsPosB, dimsPosC);
 
+  Value inputB = matB;
+
   if (transposeReqs.transposeB) {
     SmallVector<AffineExpr, 8U> reqDimsB;
     for (const auto &pos : contractionDims) {
@@ -720,12 +822,13 @@ static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
     auto transposeMap =
         AffineMap::get(mapB.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsB));
 
-    Value transposedB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
-
-    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, transposedB);
-  } else {
-    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, matB);
+    inputB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
   }
+
+  rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, inputB);
+
+  Value inputA = matA;
+  Value outputC = allocateDuplicate(op, rewriter, matC);
 
   if (transposeReqs.transposeA) {
     SmallVector<AffineExpr, 8U> reqDimsA;
@@ -738,14 +841,13 @@ static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
     auto transposeMap =
         AffineMap::get(mapA.getNumInputs(), 0, ArrayRef<AffineExpr>(reqDimsA));
 
-    Value transposedA = transposeMemRef(op, rewriter, matA, mapA, transposeMap);
-
-    rewriter.create<cim::GemmOp>(op->getLoc(), tileId, transposedA, matC);
-  } else {
-    rewriter.create<cim::GemmOp>(op->getLoc(), tileId, matA, matC);
+    inputA = transposeMemRef(op, rewriter, matA, mapA, transposeMap);
   }
 
+  rewriter.create<cim::GemmOp>(op->getLoc(), tileId, inputA, outputC);
   rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+
+  elementwiseAddition(op, rewriter, outputC, matC);
 }
 
 static void createCIMGevmOp(Operation *op, PatternRewriter &rewriter,
@@ -772,17 +874,19 @@ static void createCIMGevmOp(Operation *op, PatternRewriter &rewriter,
   }
   auto transposeMap = AffineMap::get(2, 0, ArrayRef<AffineExpr>(reqDimsB));
 
+  Value inputB = matB;
+  Value outputC = allocateDuplicate(op, rewriter, matC);
+
   // Check if B needs to be transposed
   if (mapB != transposeMap) {
-    Value transposedB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
-
-    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, transposedB);
-  } else {
-    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, matB);
+    inputB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
   }
 
-  rewriter.create<cim::GevmOp>(op->getLoc(), tileId, matA, matC);
+  rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, inputB);
+  rewriter.create<cim::GevmOp>(op->getLoc(), tileId, matA, outputC);
   rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+
+  elementwiseAddition(op, rewriter, outputC, matC);
 }
 
 static void createCIMGemvOp(Operation *op, PatternRewriter &rewriter,
