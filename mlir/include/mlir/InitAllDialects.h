@@ -15,7 +15,7 @@
 #define MLIR_INITALLDIALECTS_H_
 
 #include "mlir/Dialect/AffineOps/AffineOps.h"
-#include "mlir/Dialect/CIM/CIMDialect.h"
+#include "mlir/Dialect/CIM/IR/CIMDialect.h"
 #include "mlir/Dialect/FxpMathOps/FxpMathOps.h"
 #include "mlir/Dialect/GPU/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"

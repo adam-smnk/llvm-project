@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/CIM/CIMDialect.h"
+#include "mlir/Dialect/CIM/IR/CIMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/IR/Builders.h"
@@ -32,7 +32,7 @@ CIMDialect::CIMDialect(MLIRContext *context)
     : Dialect(getDialectNamespace(), context) {
   addOperations<
 #define GET_OP_LIST
-#include "mlir/Dialect/CIM/CIMOps.cpp.inc"
+#include "mlir/Dialect/CIM/IR/CIMOps.cpp.inc"
       >();
 }
 
@@ -94,6 +94,6 @@ void mlir::cim::appendOperandPrecision(llvm::raw_string_ostream &ss, Type t) {
 namespace mlir {
 namespace cim {
 #define GET_OP_CLASSES
-#include "mlir/Dialect/CIM/CIMOps.cpp.inc"
+#include "mlir/Dialect/CIM/IR/CIMOps.cpp.inc"
 } // namespace cim
 } // namespace mlir

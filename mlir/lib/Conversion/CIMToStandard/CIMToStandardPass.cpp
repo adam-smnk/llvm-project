@@ -13,7 +13,7 @@
 
 #include "mlir/Conversion/CIMToStandard/CIMToStandardPass.h"
 
-#include "mlir/Dialect/CIM/CIMDialect.h"
+#include "mlir/Dialect/CIM/IR/CIMDialect.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
