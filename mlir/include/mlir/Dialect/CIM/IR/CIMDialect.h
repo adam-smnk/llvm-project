@@ -42,7 +42,7 @@ std::string generateLibraryCallName(Operation *op);
 void appendOperandPrecision(llvm::raw_string_ostream &ss, Type t);
 
 #define GET_OP_CLASSES
-#include "mlir/Dialect/CIM/CIMOps.h.inc"
+#include "mlir/Dialect/CIM/IR/CIMOps.h.inc"
 
 } // end namespace cim
 } // end namespace mlir
