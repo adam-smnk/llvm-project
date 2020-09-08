@@ -41,6 +41,20 @@ mlir::cim::getDimsPositions(const ArrayRef<AffineExpr> &affineDims) {
   return dims;
 }
 
+AffineMap mlir::cim::combineMaps(const ArrayRef<AffineMap> &affineMaps) {
+  SmallVector<AffineExpr, 8U> combinedDims;
+  for (const auto &map : affineMaps) {
+    auto dims = map.getResults();
+    combinedDims.insert(combinedDims.end(), dims.begin(), dims.end());
+  }
+
+  return AffineMap::get(combinedDims.size(), 0, combinedDims);
+}
+
+AffineMap mlir::cim::combineMaps(const ArrayAttr &affineMaps) {
+  return combineMaps(getResultMaps(affineMaps));
+}
+
 SmallVector<AffineExpr, 8U>
 mlir::cim::getPermutation(const AffineMap &originalMap,
                           const AffineMap &targetMap, MLIRContext *context) {
@@ -61,42 +75,42 @@ mlir::cim::getPermutation(const AffineMap &originalMap,
 // uncontracted dimensions to avoid unnecessary tranposition when
 // contraction dimensions already match.
 TransposeAnalysisResults
-mlir::cim::checkContractionTransposes(const std::vector<unsigned> &dimsPosA,
-                                      const std::vector<unsigned> &dimsPosB,
-                                      const std::vector<unsigned> &dimsPosC) {
+mlir::cim::checkGEMMTransposes(const std::vector<unsigned> &dimsPosA,
+                               const std::vector<unsigned> &dimsPosB,
+                               const std::vector<unsigned> &dimsPosC) {
   std::set<unsigned> dimsSetA(dimsPosA.begin(), dimsPosA.end());
   std::set<unsigned> dimsSetB(dimsPosB.begin(), dimsPosB.end());
   std::set<unsigned> dimsSetC(dimsPosC.begin(), dimsPosC.end());
 
-  auto uncontrDimsA = setIntersection<unsigned>(dimsSetA, dimsSetC);
-  auto uncontrDimsB = setIntersection<unsigned>(dimsSetB, dimsSetC);
-  auto contractionDims = setIntersection<unsigned>(dimsSetA, dimsSetB);
+  auto contractionDims = contractionReductionDims<unsigned>(dimsSetA, dimsSetB);
+  auto uncontrDimsA = setDifference<unsigned>(dimsSetA, contractionDims);
+  auto uncontrDimsB = setDifference<unsigned>(dimsSetB, contractionDims);
+
+  TransposeAnalysisResults result(false, false, false);
 
   // check if A and B dimensions match
   for (unsigned i = 0; i < contractionDims.size(); ++i) {
     unsigned aPos = uncontrDimsA.size() + i;
 
     if (dimsPosA[aPos] != dimsPosB[i]) {
-      return TransposeAnalysisResults(true, true);
+      result.transposeA = true;
+      result.transposeB = true;
+      break;
     }
   }
 
-  // check if A and C dimensions match
-  for (unsigned i = 0; i < uncontrDimsA.size(); ++i) {
-    if (dimsPosA[i] != dimsPosC[i]) {
-      return TransposeAnalysisResults(true, true);
-    }
+  // check if A*B result matches C
+  std::vector<unsigned> outputDimsPos;
+  for (const auto &pos : uncontrDimsA) {
+    outputDimsPos.push_back(pos);
+  }
+  for (const auto &pos : uncontrDimsB) {
+    outputDimsPos.push_back(pos);
   }
 
-  // check if B and C dimensions match
-  for (unsigned i = 0; i < uncontrDimsB.size(); ++i) {
-    unsigned bPos = contractionDims.size() + i;
-    unsigned cPos = uncontrDimsA.size() + i;
-
-    if (dimsPosB[bPos] != dimsPosC[cPos]) {
-      return TransposeAnalysisResults(true, true);
-    }
+  if (dimsPosC != outputDimsPos) {
+    result.transposeResult = true;
   }
 
-  return TransposeAnalysisResults(false, false);
+  return result;
 }

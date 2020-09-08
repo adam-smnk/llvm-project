@@ -15,10 +15,13 @@ namespace cim {
 struct TransposeAnalysisResults {
   bool transposeA;
   bool transposeB;
+  bool transposeResult;
 
-  TransposeAnalysisResults() : TransposeAnalysisResults(false, false){};
-  TransposeAnalysisResults(bool transposeA_, bool transposeB_)
-      : transposeA(transposeA_), transposeB(transposeB_){};
+  TransposeAnalysisResults() : TransposeAnalysisResults(false, false, false){};
+  TransposeAnalysisResults(bool transposeA_, bool transposeB_,
+                           bool transposeResult_)
+      : transposeA(transposeA_), transposeB(transposeB_),
+        transposeResult(transposeResult_){};
 };
 
 SmallVector<AffineMap, 8U> getResultMaps(ArrayAttr affineMaps);
@@ -32,14 +35,18 @@ getResultDims(linalg::GenericOp genericOp);
 
 std::vector<unsigned> getDimsPositions(const ArrayRef<AffineExpr> &affineDims);
 
+AffineMap combineMaps(const ArrayRef<AffineMap> &affineMaps);
+
+AffineMap combineMaps(const ArrayAttr &affineMaps);
+
 SmallVector<AffineExpr, 8U> getPermutation(const AffineMap &originalMap,
                                            const AffineMap &targetMap,
                                            MLIRContext *context);
 
 TransposeAnalysisResults
-checkContractionTransposes(const std::vector<unsigned> &dimsPosA,
-                           const std::vector<unsigned> &dimsPosB,
-                           const std::vector<unsigned> &dimsPosC);
+checkGEMMTransposes(const std::vector<unsigned> &dimsPosA,
+                    const std::vector<unsigned> &dimsPosB,
+                    const std::vector<unsigned> &dimsPosC);
 
 template <typename T>
 std::set<T> setIntersection(const std::set<T> &setA, const std::set<T> &setB) {
