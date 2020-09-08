@@ -247,13 +247,9 @@ Value mlir::cim::groupDimensions(Operation *op, PatternRewriter &rewriter,
 
   SmallVector<AffineMap, 8U> targetMaps = getResultMaps(reassociation);
 
-  SmallVector<AffineExpr, 8U> targetDims;
-  for (const auto &map : targetMaps) {
-    auto dims = map.getResults();
-    targetDims.insert(targetDims.end(), dims.begin(), dims.end());
-  }
-  SmallVector<AffineExpr, 8U> outputPermutation = getPermutation(
-      memRefMap, AffineMap::get(targetDims.size(), 0, targetDims), ctx);
+  AffineMap targetMap = combineMaps(targetMaps);
+  SmallVector<AffineExpr, 8U> outputPermutation =
+      getPermutation(memRefMap, targetMap, ctx);
 
   auto outputPermutationPos = getDimsPositions(outputPermutation);
 
