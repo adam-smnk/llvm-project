@@ -69,6 +69,21 @@ std::set<T> setUnion(const std::set<T> &setA, const std::set<T> &setB) {
   return unionSet;
 }
 
+template <typename T>
+std::set<T> contractionReductionDims(std::set<T> dimsA, std::set<T> dimsB) {
+  return setIntersection<T>(dimsA, dimsB);
+}
+
+template <typename T>
+std::set<T> contractionOutputDims(std::set<T> dimsA, std::set<T> dimsB) {
+  auto contrDims = contractionReductionDims<T>(dimsA, dimsB);
+
+  auto uncontrDimsA = setDifference<T>(dimsA, contrDims);
+  auto uncontrDimsB = setDifference<T>(dimsB, contrDims);
+
+  return setUnion<T>(uncontrDimsA, uncontrDimsB);
+}
+
 } // namespace cim
 } // namespace mlir
 

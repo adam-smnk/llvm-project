@@ -113,35 +113,40 @@ static bool isContraction(linalg::GenericOp genericOp) {
   std::set<unsigned> dimsB(dimsPosB.begin(), dimsPosB.end());
   std::set<unsigned> dimsC(dimsPosC.begin(), dimsPosC.end());
 
-  auto uncontrDimsA = setIntersection<unsigned>(dimsA, dimsC);
-  auto uncontrDimsB = setIntersection<unsigned>(dimsB, dimsC);
+  auto contrDims = contractionReductionDims<unsigned>(dimsA, dimsB);
+  auto outputDims = contractionOutputDims<unsigned>(dimsA, dimsB);
 
-  // The uncontracted dimensions of either input tensor cannot
-  // exceed the size of the output tensor C
-  if ((uncontrDimsA.size() > dimsPosC.size()) ||
-      (uncontrDimsB.size() > dimsPosC.size())) {
-    return false;
-  }
+  // auto uncontrDimsA = setIntersection<unsigned>(dimsA, dimsC);
+  // auto uncontrDimsB = setIntersection<unsigned>(dimsB, dimsC);
 
-  auto contrDimsA = setDifference<unsigned>(dimsA, uncontrDimsA);
-  auto contrDimsB = setDifference<unsigned>(dimsB, uncontrDimsB);
-  auto contrDims = setUnion<unsigned>(contrDimsA, contrDimsB);
+  // // The uncontracted dimensions of either input tensor cannot
+  // // exceed the size of the output tensor C
+  // if ((uncontrDimsA.size() > dimsPosC.size()) ||
+  //     (uncontrDimsB.size() > dimsPosC.size())) {
+  //   return false;
+  // }
 
-  // Check if the remaining uncontracted dimensions match those of C
-  auto outputDims = setUnion<unsigned>(uncontrDimsA, uncontrDimsB);
+  // auto contrDimsA = setDifference<unsigned>(dimsA, uncontrDimsA);
+  // auto contrDimsB = setDifference<unsigned>(dimsB, uncontrDimsB);
+  // auto contrDims = setUnion<unsigned>(contrDimsA, contrDimsB);
+
+  // // Check if the remaining uncontracted dimensions match those of C
+  // auto outputDims = setUnion<unsigned>(uncontrDimsA, uncontrDimsB);
 
   // Check if the uncontracted dimensions from A match the left
   // part of C and if the uncontracted dimensions from B match
   // the remaining right part of C
-  std::set<unsigned> cDimsFromA(dimsPosC.begin(),
-                                dimsPosC.begin() + uncontrDimsA.size());
-  std::set<unsigned> cDimsFromB(dimsPosC.begin() + uncontrDimsA.size(),
-                                dimsPosC.end());
+  // std::set<unsigned> cDimsFromA(dimsPosC.begin(),
+  //                               dimsPosC.begin() + uncontrDimsA.size());
+  // std::set<unsigned> cDimsFromB(dimsPosC.begin() + uncontrDimsA.size(),
+  //                               dimsPosC.end());
 
-  return contrDims.size() > 0 && contrDimsA == contrDimsB &&
-         dimsC.size() == (uncontrDimsA.size() + uncontrDimsB.size()) &&
-         outputDims == dimsC && uncontrDimsA == cDimsFromA &&
-         uncontrDimsB == cDimsFromB;
+  // return contrDims.size() > 0 && contrDimsA == contrDimsB &&
+  //        dimsC.size() == (uncontrDimsA.size() + uncontrDimsB.size()) &&
+  //        outputDims == dimsC;
+  // && uncontrDimsA == cDimsFromA &&
+  //  uncontrDimsB == cDimsFromB;
+  return contrDims.size() > 0 && outputDims == dimsC;
 }
 
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
@@ -171,13 +176,16 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
   std::set<unsigned> dimsSetB(dimsPosB.begin(), dimsPosB.end());
   std::set<unsigned> dimsSetC(dimsPosC.begin(), dimsPosC.end());
 
-  auto uncontrDimsA = setIntersection<unsigned>(dimsSetA, dimsSetC);
-  auto uncontrDimsB = setIntersection<unsigned>(dimsSetB, dimsSetC);
-  auto contractionDims = setIntersection<unsigned>(dimsSetA, dimsSetB);
+  auto contractionDims = contractionReductionDims<unsigned>(dimsSetA, dimsSetB);
+  auto uncontrDimsA = setDifference<unsigned>(dimsSetA, contractionDims);
+  auto uncontrDimsB = setDifference<unsigned>(dimsSetB, contractionDims);
 
   SmallVector<AffineExpr, 8U> reqLeftDimsA;
-  for (unsigned i = 0; i < uncontrDimsA.size(); ++i) {
-    reqLeftDimsA.push_back(getAffineDimExpr(dimsPosC[i], ctx));
+  // for (unsigned i = 0; i < uncontrDimsA.size(); ++i) {
+  //   reqLeftDimsA.push_back(getAffineDimExpr(uncontrDimsA[i], ctx));
+  // }
+  for (const auto &pos : uncontrDimsA) {
+    reqLeftDimsA.push_back(getAffineDimExpr(pos, ctx));
   }
   SmallVector<AffineExpr, 8U> reqRightDimsA;
   for (const auto &pos : contractionDims) {
@@ -197,10 +205,13 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
     reqLeftDimsB.push_back(getAffineDimExpr(pos, ctx));
   }
   SmallVector<AffineExpr, 8U> reqRightDimsB;
-  for (unsigned i = 0; i < uncontrDimsB.size(); ++i) {
-    unsigned cPos = uncontrDimsA.size() + i;
-    reqRightDimsB.push_back(getAffineDimExpr(dimsPosC[cPos], ctx));
+  for (const auto &pos : uncontrDimsB) {
+    reqRightDimsB.push_back(getAffineDimExpr(pos, ctx));
   }
+  // for (unsigned i = 0; i < uncontrDimsB.size(); ++i) {
+  //   // unsigned cPos = uncontrDimsA.size() + i;
+  //   reqRightDimsB.push_back(getAffineDimExpr(uncontrDimsB[i], ctx));
+  // }
   auto leftDimsB =
       AffineMapAttr::get(AffineMap::get(mapB.getNumInputs(), 0, reqLeftDimsB));
   auto rightDimsB =
@@ -220,16 +231,36 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
 
   // Flatten tensor to matrix
   Value flatC = groupDimensions(op, rewriter, matC, mapC,
-                                ArrayAttr::get({leftDimsC, rightDimsC}, ctx));
+                                ArrayAttr::get({leftDimsA, rightDimsB}, ctx));
 
   rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, flatB);
   rewriter.create<cim::GemmOp>(op->getLoc(), tileId, flatA, flatC);
   rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
 
+  SmallVector<AffineMap, 8U> inputMaps =
+      getResultMaps(ArrayAttr::get({leftDimsA, rightDimsB}, ctx));
+  SmallVector<AffineExpr, 8U> inputDims;
+  for (const auto &map : inputMaps) {
+    auto dims = map.getResults();
+    inputDims.insert(inputDims.end(), dims.begin(), dims.end());
+  }
+  SmallVector<AffineMap, 8U> targetMaps =
+      getResultMaps(ArrayAttr::get({leftDimsC, rightDimsC}, ctx));
+  SmallVector<AffineExpr, 8U> targetDims;
+  for (const auto &map : targetMaps) {
+    auto dims = map.getResults();
+    targetDims.insert(targetDims.end(), dims.begin(), dims.end());
+  }
+
+  SmallVector<AffineExpr, 8U> outputPermutation =
+      getPermutation(AffineMap::get(inputDims.size(), 0, inputDims),
+                     AffineMap::get(targetDims.size(), 0, targetDims), ctx);
+  auto outputPermutationPos = getDimsPositions(outputPermutation);
+
   // Unflatten the contraction result and copy to the output tensor
   reshapeCopy(op, rewriter, flatC, matC,
-              ArrayAttr::get({leftDimsC, rightDimsC}, ctx),
-              ArrayRef<unsigned>(), true);
+              ArrayAttr::get({leftDimsA, rightDimsB}, ctx),
+              outputPermutationPos, true);
 }
 
 static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
