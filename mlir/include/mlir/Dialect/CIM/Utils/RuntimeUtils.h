@@ -45,6 +45,14 @@ void reshapeCopy(Operation *op, PatternRewriter &rewriter,
                  ArrayRef<unsigned> permutation = ArrayRef<unsigned>(),
                  bool performElementwiseSum = false);
 
+Value allocateTile(Operation *op, PatternRewriter &rewriter, const Value &mat,
+                   const Value &row, const Value &col, const Value &tileSize,
+                   bool copyData = false);
+
+void storeTile(Operation *op, PatternRewriter &rewriter, const Value &tile,
+               const Value &mat, const Value &row, const Value &col,
+               const Value &tileSize);
+
 } // namespace cim
 } // namespace mlir
 

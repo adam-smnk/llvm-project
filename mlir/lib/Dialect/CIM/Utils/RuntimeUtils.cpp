@@ -425,3 +425,142 @@ void mlir::cim::reshapeCopy(Operation *op, PatternRewriter &rewriter,
   // Set insertion point back at main body outside of the loops
   rewriter.setInsertionPoint(op);
 }
+
+Value createIndexConst(Operation *op, PatternRewriter &rewriter,
+                       int64_t value) {
+  return rewriter.create<ConstantOp>(
+      op->getLoc(), rewriter.getIndexType(),
+      rewriter.getIntegerAttr(rewriter.getIndexType(), value));
+}
+
+Value minSigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
+                const Value &rhs) {
+  Value cond =
+      rewriter.create<CmpIOp>(op->getLoc(), CmpIPredicate::slt, lhs, rhs);
+  return rewriter.create<SelectOp>(op->getLoc(), cond, lhs, rhs);
+}
+
+Value maxSigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
+                const Value &rhs) {
+  Value cond =
+      rewriter.create<CmpIOp>(op->getLoc(), CmpIPredicate::sgt, lhs, rhs);
+  return rewriter.create<SelectOp>(op->getLoc(), cond, lhs, rhs);
+}
+
+static Value calculateTileEndIndex(Operation *op, PatternRewriter &rewriter,
+                                   const Value &tilePos, const Value &tileSize,
+                                   const Value &dimMaxSize) {
+  Value one = createIndexConst(op, rewriter, 1);
+
+  const IntegerType intType = rewriter.getIntegerType(32);
+  Value nextTilePos =
+      rewriter.create<AddIOp>(op->getLoc(), intType, tilePos, one);
+  Value tileEndPos =
+      rewriter.create<MulIOp>(op->getLoc(), intType, nextTilePos, tileSize);
+
+  return minSigned(op, rewriter, tileEndPos, dimMaxSize);
+}
+
+Value allocateTile(Operation *op, PatternRewriter &rewriter, const Value &mat,
+                   const Value &row, const Value &col, const Value &tileSize,
+                   bool copyData) {
+  Value matRows = rewriter.create<DimOp>(op->getLoc(), mat, 0);
+  Value matCols = rewriter.create<DimOp>(op->getLoc(), mat, 1);
+
+  // Tile size is limited by the matrix boundaries
+  auto indexType = rewriter.getIndexType();
+  Value startRow =
+      rewriter.create<MulIOp>(op->getLoc(), indexType, row, tileSize);
+  Value endRow = calculateTileEndIndex(op, rewriter, row, tileSize, matRows);
+
+  Value startCol =
+      rewriter.create<MulIOp>(op->getLoc(), indexType, col, tileSize);
+  Value endCol = calculateTileEndIndex(op, rewriter, col, tileSize, matCols);
+
+  Value numRows =
+      rewriter.create<SubIOp>(op->getLoc(), indexType, endRow, startRow);
+  Value numCols =
+      rewriter.create<SubIOp>(op->getLoc(), indexType, endCol, startCol);
+
+  SmallVector<int64_t, 8U> tileSizes = {-1, -1};
+  MemRefType tileType = MemRefType::Builder(
+      tileSizes, mat.getType().cast<MemRefType>().getElementType());
+  SmallVector<Value, 8U> allocOperands = {numRows, numCols};
+  Value tile = rewriter.create<AllocOp>(op->getLoc(), tileType, allocOperands);
+
+  if (copyData) {
+    // Copy data from the matrix to the tile
+    Value lowerBound = createIndexConst(op, rewriter, 0);
+    Value step = createIndexConst(op, rewriter, 1);
+    SmallVector<Value, 8U> upperBounds = {numRows, numCols};
+
+    SmallVector<Value, 8U> loopIterators;
+    for (const Value &ub : upperBounds) {
+      auto loop =
+          rewriter.create<loop::ForOp>(op->getLoc(), lowerBound, ub, step);
+      loopIterators.push_back(loop.getInductionVar());
+
+      // Set insertion point inside the loop
+      rewriter.setInsertionPointToStart(loop.getBody());
+    }
+
+    Value matRowPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startRow,
+                                              loopIterators[0]);
+    Value matColPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startCol,
+                                              loopIterators[1]);
+    Value matElement = rewriter.create<LoadOp>(
+        op->getLoc(), mat, ValueRange({matRowPos, matColPos}));
+    rewriter.create<StoreOp>(op->getLoc(), matElement, tile,
+                             ValueRange(loopIterators));
+
+    // Set insertion point back at main body outside of the loops
+    rewriter.setInsertionPoint(op);
+  } else {
+    // Zero-initialize the tile
+    Value zero = rewriter.create<ConstantOp>(
+        op->getLoc(), rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
+    rewriter.create<FillOp>(op->getLoc(), tile, zero);
+  }
+
+  return tile;
+}
+
+void storeTile(Operation *op, PatternRewriter &rewriter, const Value &tile,
+               const Value &mat, const Value &row, const Value &col,
+               const Value &tileSize) {
+  Value tileRows = rewriter.create<DimOp>(op->getLoc(), tile, 0);
+  Value tileCols = rewriter.create<DimOp>(op->getLoc(), tile, 1);
+
+  auto indexType = rewriter.getIndexType();
+  Value startRow =
+      rewriter.create<MulIOp>(op->getLoc(), indexType, row, tileSize);
+  Value startCol =
+      rewriter.create<MulIOp>(op->getLoc(), indexType, col, tileSize);
+
+  Value lowerBound = createIndexConst(op, rewriter, 0);
+  Value step = createIndexConst(op, rewriter, 1);
+  SmallVector<Value, 8U> upperBounds = {tileRows, tileCols};
+
+  // Loop over higher rank memref dimensions
+  SmallVector<Value, 8U> loopIterators;
+  for (const Value &ub : upperBounds) {
+    auto loop =
+        rewriter.create<loop::ForOp>(op->getLoc(), lowerBound, ub, step);
+    loopIterators.push_back(loop.getInductionVar());
+
+    // Set insertion point inside the loop
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  Value matRowPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startRow,
+                                            loopIterators[0]);
+  Value matColPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startCol,
+                                            loopIterators[1]);
+  Value tileElement =
+      rewriter.create<LoadOp>(op->getLoc(), tile, ValueRange(loopIterators));
+  rewriter.create<StoreOp>(op->getLoc(), tileElement, mat,
+                           ValueRange({matRowPos, matColPos}));
+
+  // Set insertion point back at main body outside of the loops
+  rewriter.setInsertionPoint(op);
+}
