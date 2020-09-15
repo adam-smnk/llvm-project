@@ -21,10 +21,13 @@ class OpPassBase;
 
 /// Populate the given list with patterns that convert from Linalg to CIM.
 void populateLinalgToCIMConversionPatterns(OwningRewritePatternList &patterns,
-                                           MLIRContext *ctx);
+                                           MLIRContext *ctx,
+                                           uint32_t tileSize = 0,
+                                           bool minWrites = false);
 
 /// Create a pass to convert Linalg operations to the CIM dialect.
-std::unique_ptr<OpPassBase<ModuleOp>> createConvertLinalgToCIMPass();
+std::unique_ptr<OpPassBase<ModuleOp>>
+createConvertLinalgToCIMPass(uint32_t tileSize = 0, bool minWrites = false);
 
 } // namespace mlir
 
