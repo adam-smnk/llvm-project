@@ -35,6 +35,21 @@ using namespace mlir::cim;
 
 namespace {
 
+static llvm::cl::OptionCategory clOptionsCategory(DEBUG_TYPE " options");
+
+static llvm::cl::opt<unsigned> clTileSize(
+    "cim-tile-size",
+    llvm::cl::desc("CIM device tile sizes by which to tile cim operations"),
+    llvm::cl::Optional, llvm::cl::MiscFlags::DefaultOption,
+    llvm::cl::cat(clOptionsCategory));
+
+static llvm::cl::opt<bool>
+    clMinimizeWrites("cim-min-writes",
+                     llvm::cl::desc("Performs additional transformations to "
+                                    "minimize writes to CIM crossbar"),
+                     llvm::cl::Optional, llvm::cl::MiscFlags::DefaultOption,
+                     llvm::cl::cat(clOptionsCategory));
+
 // TODO(adam-smnk) Handle case with additional sign extension operation
 // that is present in case of mixed precision arguments
 static bool hasMultiplyAddBody(linalg::GenericOp op) {
@@ -120,7 +135,8 @@ static bool isContraction(linalg::GenericOp genericOp) {
 }
 
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
-                                   ConstantOp &tileId) {
+                                   ConstantOp &tileId, uint32_t tileSize,
+                                   bool minWrites) {
   auto genOp = cast<GenericOp>(op);
   auto *ctx = genOp.getContext();
 
@@ -203,7 +219,8 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
 }
 
 static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
-                            ConstantOp &tileId) {
+                            ConstantOp &tileId, uint32_t tileSize,
+                            bool minWrites) {
   auto genOp = cast<GenericOp>(op);
   auto *ctx = genOp.getContext();
 
@@ -382,7 +399,8 @@ static void createCIMGemvOp(Operation *op, PatternRewriter &rewriter,
 
 // TODO(adam-smnk) Make lowering more progressive, move some of the conversions
 // into CIMtoSTD pass
-static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
+static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter,
+                                   uint32_t tileSize, bool minWrites) {
   auto matA = op->getOperand(0);
   auto matB = op->getOperand(1);
   auto matC = op->getOperand(2);
@@ -399,11 +417,11 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
   } else if (isGevm(cast<linalg::GenericOp>(op))) {
     createCIMGevmOp(op, rewriter, cimTileID);
   } else if (isGemm(cast<linalg::GenericOp>(op))) {
-    createCIMGemmOp(op, rewriter, cimTileID);
+    createCIMGemmOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else if (isGemv(cast<linalg::GenericOp>(op))) {
     createCIMGemvOp(op, rewriter, cimTileID);
   } else {
-    createCIMContractionOp(op, rewriter, cimTileID);
+    createCIMContractionOp(op, rewriter, cimTileID, tileSize, minWrites);
   }
 
   rewriter.eraseOp(op);
@@ -411,24 +429,36 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter) {
 
 // TODO(adam-smnk) Add support for matmul with accumulation
 struct MatmulOpLowering : public OpRewritePattern<linalg::MatmulOp> {
-  using OpRewritePattern<linalg::MatmulOp>::OpRewritePattern;
+  // using OpRewritePattern<linalg::MatmulOp>::OpRewritePattern;
+  MatmulOpLowering() = delete;
+  MatmulOpLowering(MLIRContext *ctx, uint32_t tileSize_, bool minWrites_)
+      : OpRewritePattern(ctx), tileSize(tileSize_), minWrites(minWrites_) {}
 
   PatternMatchResult matchAndRewrite(linalg::MatmulOp op,
                                      PatternRewriter &rewriter) const final {
-    replaceOpWithCIMMatmul(op, rewriter);
+    replaceOpWithCIMMatmul(op, rewriter, tileSize, minWrites);
     return matchSuccess();
   }
+
+  uint32_t tileSize;
+  bool minWrites;
 };
 
 // TODO(adam-smnk) Check for contiguous memory
 struct GenericOpLowering : public OpRewritePattern<linalg::GenericOp> {
-  using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
+  // using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
+  GenericOpLowering() = delete;
+  GenericOpLowering(MLIRContext *ctx, uint32_t tileSize_, bool minWrites_)
+      : OpRewritePattern(ctx), tileSize(tileSize_), minWrites(minWrites_) {}
 
   PatternMatchResult matchAndRewrite(linalg::GenericOp op,
                                      PatternRewriter &rewriter) const final {
-    replaceOpWithCIMMatmul(op, rewriter);
+    replaceOpWithCIMMatmul(op, rewriter, tileSize, minWrites);
     return matchSuccess();
   }
+
+  uint32_t tileSize;
+  bool minWrites;
 };
 
 /// A pass that replaces Linalg operations with their corresponding CIM
@@ -436,11 +466,17 @@ struct GenericOpLowering : public OpRewritePattern<linalg::GenericOp> {
 class LowerLinalgOpsToCIMOpsPass
     : public OperationPass<LowerLinalgOpsToCIMOpsPass, ModuleOp> {
 public:
+  LowerLinalgOpsToCIMOpsPass() { LowerLinalgOpsToCIMOpsPass(0, false); }
+
+  LowerLinalgOpsToCIMOpsPass(uint32_t tileSize_, bool minWrites_)
+      : tileSize(tileSize_), minWrites(minWrites_) {}
+
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
     OwningRewritePatternList patterns;
-    populateLinalgToCIMConversionPatterns(patterns, &getContext());
+    populateLinalgToCIMConversionPatterns(patterns, &getContext(), tileSize,
+                                          minWrites);
 
     ConversionTarget target(getContext());
     target.addLegalDialect<linalg::LinalgDialect>();
@@ -454,18 +490,28 @@ public:
     if (failed(applyPartialConversion(m, target, patterns)))
       signalPassFailure();
   }
+
+  uint32_t tileSize;
+  bool minWrites;
 };
 } // anonymous namespace
 
 void mlir::populateLinalgToCIMConversionPatterns(
-    OwningRewritePatternList &patterns, MLIRContext *ctx) {
-  patterns.insert<MatmulOpLowering, GenericOpLowering>(ctx);
+    OwningRewritePatternList &patterns, MLIRContext *ctx, uint32_t tileSize,
+    bool minWrites) {
+  patterns.insert<MatmulOpLowering, GenericOpLowering>(ctx, tileSize,
+                                                       minWrites);
 }
 
-std::unique_ptr<OpPassBase<ModuleOp>> mlir::createConvertLinalgToCIMPass() {
-  return std::make_unique<LowerLinalgOpsToCIMOpsPass>();
+std::unique_ptr<OpPassBase<ModuleOp>>
+mlir::createConvertLinalgToCIMPass(uint32_t tileSize, bool minWrites) {
+  return std::make_unique<LowerLinalgOpsToCIMOpsPass>(tileSize, minWrites);
 }
 
 static PassRegistration<LowerLinalgOpsToCIMOpsPass>
     pass("convert-linalg-to-cim",
-         "Convert the operations from the linalg dialect into the CIM dialect");
+         "Convert the operations from the linalg dialect into the CIM dialect",
+         [] {
+           return std::make_unique<LowerLinalgOpsToCIMOpsPass>(
+               clTileSize, clMinimizeWrites);
+         });
