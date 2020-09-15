@@ -233,7 +233,7 @@ void mlir::cim::elementwiseAddition(Operation *op, PatternRewriter &rewriter,
                            ValueRange(loopIterators));
 
   // Set insertion point back at main body outside of the loops
-  rewriter.setInsertionPoint(op);
+  rewriter.setInsertionPointAfter(loops.front());
 }
 
 // Groups (collapses) dimensions of the input memref based on a reassociation
@@ -423,28 +423,64 @@ void mlir::cim::reshapeCopy(Operation *op, PatternRewriter &rewriter,
                            outputIndices);
 
   // Set insertion point back at main body outside of the loops
-  rewriter.setInsertionPoint(op);
+  rewriter.setInsertionPointAfter(loops.front());
 }
 
-Value createIndexConst(Operation *op, PatternRewriter &rewriter,
-                       int64_t value) {
+Value mlir::cim::createIndexConst(Operation *op, PatternRewriter &rewriter,
+                                  int64_t value) {
   return rewriter.create<ConstantOp>(
       op->getLoc(), rewriter.getIndexType(),
       rewriter.getIntegerAttr(rewriter.getIndexType(), value));
 }
 
-Value minSigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
-                const Value &rhs) {
+Value mlir::cim::minSigned(Operation *op, PatternRewriter &rewriter,
+                           const Value &lhs, const Value &rhs) {
   Value cond =
       rewriter.create<CmpIOp>(op->getLoc(), CmpIPredicate::slt, lhs, rhs);
   return rewriter.create<SelectOp>(op->getLoc(), cond, lhs, rhs);
 }
 
-Value maxSigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
-                const Value &rhs) {
+Value mlir::cim::maxSigned(Operation *op, PatternRewriter &rewriter,
+                           const Value &lhs, const Value &rhs) {
   Value cond =
       rewriter.create<CmpIOp>(op->getLoc(), CmpIPredicate::sgt, lhs, rhs);
   return rewriter.create<SelectOp>(op->getLoc(), cond, lhs, rhs);
+}
+
+Value mlir::cim::minUnsigned(Operation *op, PatternRewriter &rewriter,
+                             const Value &lhs, const Value &rhs) {
+  Value cond =
+      rewriter.create<CmpIOp>(op->getLoc(), CmpIPredicate::ult, lhs, rhs);
+  return rewriter.create<SelectOp>(op->getLoc(), cond, lhs, rhs);
+}
+
+Value mlir::cim::maxUnsigned(Operation *op, PatternRewriter &rewriter,
+                             const Value &lhs, const Value &rhs) {
+  Value cond =
+      rewriter.create<CmpIOp>(op->getLoc(), CmpIPredicate::ugt, lhs, rhs);
+  return rewriter.create<SelectOp>(op->getLoc(), cond, lhs, rhs);
+}
+
+// Calculates number of tiles rounded up
+Value mlir::cim::calculateNumTiles(Operation *op, PatternRewriter &rewriter,
+                                   const Value &tileSize,
+                                   const Value &dimMaxSize) {
+  const auto resType = rewriter.getIndexType();
+
+  Value numFullTiles = rewriter.create<UnsignedDivIOp>(op->getLoc(), resType,
+                                                       dimMaxSize, tileSize);
+  Value numPartialTiles = rewriter.create<UnsignedRemIOp>(op->getLoc(), resType,
+                                                          dimMaxSize, tileSize);
+
+  Value one = createIndexConst(op, rewriter, 1);
+  Value numFullTilesPlusOne =
+      rewriter.create<AddIOp>(op->getLoc(), resType, numFullTiles, one);
+
+  Value zero = createIndexConst(op, rewriter, 0);
+  Value cond = rewriter.create<CmpIOp>(op->getLoc(), CmpIPredicate::eq,
+                                       numPartialTiles, zero);
+  return rewriter.create<SelectOp>(op->getLoc(), cond, numFullTiles,
+                                   numFullTilesPlusOne);
 }
 
 static Value calculateTileEndIndex(Operation *op, PatternRewriter &rewriter,
@@ -452,18 +488,19 @@ static Value calculateTileEndIndex(Operation *op, PatternRewriter &rewriter,
                                    const Value &dimMaxSize) {
   Value one = createIndexConst(op, rewriter, 1);
 
-  const IntegerType intType = rewriter.getIntegerType(32);
+  const auto resType = rewriter.getIndexType();
   Value nextTilePos =
-      rewriter.create<AddIOp>(op->getLoc(), intType, tilePos, one);
+      rewriter.create<AddIOp>(op->getLoc(), resType, tilePos, one);
   Value tileEndPos =
-      rewriter.create<MulIOp>(op->getLoc(), intType, nextTilePos, tileSize);
+      rewriter.create<MulIOp>(op->getLoc(), resType, nextTilePos, tileSize);
 
-  return minSigned(op, rewriter, tileEndPos, dimMaxSize);
+  return minUnsigned(op, rewriter, tileEndPos, dimMaxSize);
 }
 
-Value allocateTile(Operation *op, PatternRewriter &rewriter, const Value &mat,
-                   const Value &row, const Value &col, const Value &tileSize,
-                   bool copyData) {
+Value mlir::cim::allocateTile(Operation *op, PatternRewriter &rewriter,
+                              const Value &mat, const Value &row,
+                              const Value &col, const Value &tileSize,
+                              bool copyData) {
   Value matRows = rewriter.create<DimOp>(op->getLoc(), mat, 0);
   Value matCols = rewriter.create<DimOp>(op->getLoc(), mat, 1);
 
@@ -486,7 +523,8 @@ Value allocateTile(Operation *op, PatternRewriter &rewriter, const Value &mat,
   MemRefType tileType = MemRefType::Builder(
       tileSizes, mat.getType().cast<MemRefType>().getElementType());
   SmallVector<Value, 8U> allocOperands = {numRows, numCols};
-  Value tile = rewriter.create<AllocOp>(op->getLoc(), tileType, allocOperands);
+  Value tile = rewriter.create<AllocOp>(op->getLoc(), tileType, allocOperands)
+                   .getResult();
 
   if (copyData) {
     // Copy data from the matrix to the tile
@@ -494,10 +532,12 @@ Value allocateTile(Operation *op, PatternRewriter &rewriter, const Value &mat,
     Value step = createIndexConst(op, rewriter, 1);
     SmallVector<Value, 8U> upperBounds = {numRows, numCols};
 
+    SmallVector<loop::ForOp, 8U> loops;
     SmallVector<Value, 8U> loopIterators;
     for (const Value &ub : upperBounds) {
       auto loop =
           rewriter.create<loop::ForOp>(op->getLoc(), lowerBound, ub, step);
+      loops.push_back(loop);
       loopIterators.push_back(loop.getInductionVar());
 
       // Set insertion point inside the loop
@@ -514,7 +554,7 @@ Value allocateTile(Operation *op, PatternRewriter &rewriter, const Value &mat,
                              ValueRange(loopIterators));
 
     // Set insertion point back at main body outside of the loops
-    rewriter.setInsertionPoint(op);
+    rewriter.setInsertionPointAfter(loops.front());
   } else {
     // Zero-initialize the tile
     Value zero = rewriter.create<ConstantOp>(
@@ -525,9 +565,9 @@ Value allocateTile(Operation *op, PatternRewriter &rewriter, const Value &mat,
   return tile;
 }
 
-void storeTile(Operation *op, PatternRewriter &rewriter, const Value &tile,
-               const Value &mat, const Value &row, const Value &col,
-               const Value &tileSize) {
+void mlir::cim::storeTile(Operation *op, PatternRewriter &rewriter,
+                          const Value &tile, const Value &mat, const Value &row,
+                          const Value &col, const Value &tileSize) {
   Value tileRows = rewriter.create<DimOp>(op->getLoc(), tile, 0);
   Value tileCols = rewriter.create<DimOp>(op->getLoc(), tile, 1);
 
@@ -541,11 +581,12 @@ void storeTile(Operation *op, PatternRewriter &rewriter, const Value &tile,
   Value step = createIndexConst(op, rewriter, 1);
   SmallVector<Value, 8U> upperBounds = {tileRows, tileCols};
 
-  // Loop over higher rank memref dimensions
+  SmallVector<loop::ForOp, 8U> loops;
   SmallVector<Value, 8U> loopIterators;
   for (const Value &ub : upperBounds) {
     auto loop =
         rewriter.create<loop::ForOp>(op->getLoc(), lowerBound, ub, step);
+    loops.push_back(loop);
     loopIterators.push_back(loop.getInductionVar());
 
     // Set insertion point inside the loop
@@ -562,5 +603,5 @@ void storeTile(Operation *op, PatternRewriter &rewriter, const Value &tile,
                            ValueRange({matRowPos, matColPos}));
 
   // Set insertion point back at main body outside of the loops
-  rewriter.setInsertionPoint(op);
+  rewriter.setInsertionPointAfter(loops.front());
 }

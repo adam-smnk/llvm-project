@@ -134,6 +134,72 @@ static bool isContraction(linalg::GenericOp genericOp) {
   return contrDims.size() > 0 && outputDims == dimsC;
 }
 
+static void createCIMTiledGEMM(Operation *op, PatternRewriter &rewriter,
+                               ConstantOp &tileId, const Value &matA,
+                               const Value &matB, const Value &matC,
+                               uint32_t tileSize, bool minWrites) {
+  auto dimsA = getMemRefSizes(op, rewriter, matA, {0, 1});
+  auto dimsC = getMemRefSizes(op, rewriter, matC, {0, 1});
+
+  Value dimM = dimsC[0];
+  Value dimN = dimsC[1];
+  Value dimK = dimsA[1];
+
+  Value sizeTile = createIndexConst(op, rewriter, tileSize);
+
+  Value tiledRows = calculateNumTiles(op, rewriter, sizeTile, dimM);
+  Value tiledCols = calculateNumTiles(op, rewriter, sizeTile, dimN);
+  Value numTiles = calculateNumTiles(op, rewriter, sizeTile, dimK);
+
+  Value lowerBound = createIndexConst(op, rewriter, 0);
+  Value step = createIndexConst(op, rewriter, 1);
+  // Iterators: m, n, k
+  SmallVector<Value, 8U> upperBounds = {tiledRows, tiledCols, numTiles};
+
+  SmallVector<loop::ForOp, 8U> loops;
+  SmallVector<Value, 8U> loopIterators;
+  for (const Value &ub : upperBounds) {
+    auto loop =
+        rewriter.create<loop::ForOp>(op->getLoc(), lowerBound, ub, step);
+    loops.push_back(loop);
+    loopIterators.push_back(loop.getInductionVar());
+
+    // Set insertion point inside the loop
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  Value &iterM = loopIterators[0];
+  Value &iterN = loopIterators[1];
+  Value &iterK = loopIterators[2];
+
+  rewriter.setInsertionPointToStart(loops[1].getBody());
+  Value tileC = allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, true);
+  Value partRes =
+      allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, false);
+
+  rewriter.setInsertionPointToStart(loops[2].getBody());
+  Value tileA = allocateTile(op, rewriter, matA, iterM, iterK, sizeTile, true);
+  Value tileB = allocateTile(op, rewriter, matB, iterK, iterN, sizeTile, true);
+
+  rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, tileB);
+  rewriter.create<cim::GemmOp>(op->getLoc(), tileId, tileA, partRes);
+  rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+
+  elementwiseAddition(op, rewriter, partRes, tileC);
+
+  rewriter.create<DeallocOp>(op->getLoc(), tileA);
+  rewriter.create<DeallocOp>(op->getLoc(), tileB);
+
+  rewriter.setInsertionPoint(loops[1].getBody(), --(loops[1].getBody()->end()));
+  storeTile(op, rewriter, tileC, matC, iterM, iterN, sizeTile);
+
+  rewriter.create<DeallocOp>(op->getLoc(), tileC);
+  rewriter.create<DeallocOp>(op->getLoc(), partRes);
+
+  // Set insertion point back at main body outside of the loops
+  rewriter.setInsertionPointAfter(loops.front());
+}
+
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
                                    ConstantOp &tileId, uint32_t tileSize,
                                    bool minWrites) {
@@ -205,9 +271,14 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
   // Flatten tensor to matrix
   Value flatC = groupDimensions(op, rewriter, matC, mapC, dimsFlatC);
 
-  rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, flatB);
-  rewriter.create<cim::GemmOp>(op->getLoc(), tileId, flatA, flatC);
-  rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+  if (tileSize > 0) {
+    createCIMTiledGEMM(op, rewriter, tileId, flatA, flatB, flatC, tileSize,
+                       minWrites);
+  } else {
+    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, flatB);
+    rewriter.create<cim::GemmOp>(op->getLoc(), tileId, flatA, flatC);
+    rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+  }
 
   AffineMap mapFlatC = combineMaps(dimsFlatC);
   SmallVector<AffineExpr, 8U> outputPermutation =
@@ -268,8 +339,6 @@ static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
     inputB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
   }
 
-  rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, inputB);
-
   Value inputA = matA;
   Value outputC = allocateDuplicate(op, rewriter, matC);
 
@@ -287,8 +356,18 @@ static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
     inputA = transposeMemRef(op, rewriter, matA, mapA, transposeMap);
   }
 
-  rewriter.create<cim::GemmOp>(op->getLoc(), tileId, inputA, outputC);
-  rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+  if (tileSize > 0) {
+    Value zero = rewriter.create<ConstantOp>(
+        op->getLoc(), rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
+    rewriter.create<FillOp>(op->getLoc(), outputC, zero);
+
+    createCIMTiledGEMM(op, rewriter, tileId, inputA, inputB, outputC, tileSize,
+                       minWrites);
+  } else {
+    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, inputB);
+    rewriter.create<cim::GemmOp>(op->getLoc(), tileId, inputA, outputC);
+    rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+  }
 
   if (transposeReqs.transposeResult) {
     SmallVector<AffineExpr, 8U> reqLeftDimsOutput;

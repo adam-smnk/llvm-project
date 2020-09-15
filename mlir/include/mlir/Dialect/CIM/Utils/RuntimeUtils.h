@@ -45,6 +45,23 @@ void reshapeCopy(Operation *op, PatternRewriter &rewriter,
                  ArrayRef<unsigned> permutation = ArrayRef<unsigned>(),
                  bool performElementwiseSum = false);
 
+Value createIndexConst(Operation *op, PatternRewriter &rewriter, int64_t value);
+
+Value minSigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
+                const Value &rhs);
+
+Value maxSigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
+                const Value &rhs);
+
+Value minUnsigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
+                  const Value &rhs);
+
+Value maxUnsigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
+                  const Value &rhs);
+
+Value calculateNumTiles(Operation *op, PatternRewriter &rewriter,
+                        const Value &tileSize, const Value &dimMaxSize);
+
 Value allocateTile(Operation *op, PatternRewriter &rewriter, const Value &mat,
                    const Value &row, const Value &col, const Value &tileSize,
                    bool copyData = false);
