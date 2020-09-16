@@ -138,12 +138,23 @@ static void createCIMTiledGEMM(Operation *op, PatternRewriter &rewriter,
                                ConstantOp &tileId, const Value &matA,
                                const Value &matB, const Value &matC,
                                uint32_t tileSize, bool minWrites) {
-  auto dimsA = getMemRefSizes(op, rewriter, matA, {0, 1});
-  auto dimsC = getMemRefSizes(op, rewriter, matC, {0, 1});
+  auto dimsA = getMemRefSizes(op, rewriter, matA);
+  auto dimsC = getMemRefSizes(op, rewriter, matC);
 
-  Value dimM = dimsC[0];
-  Value dimN = dimsC[1];
-  Value dimK = dimsA[1];
+  bool isMatrix = dimsC.size() == 2;
+
+  Value dimM;
+  Value dimN;
+  Value dimK;
+  if (isMatrix) {
+    dimM = dimsC[0];
+    dimN = dimsC[1];
+    dimK = dimsA[1];
+  } else {
+    dimM = createIndexConst(op, rewriter, 1);
+    dimN = dimsC[0];
+    dimK = dimsA[0];
+  }
 
   Value sizeTile = createIndexConst(op, rewriter, tileSize);
 
@@ -182,7 +193,13 @@ static void createCIMTiledGEMM(Operation *op, PatternRewriter &rewriter,
   Value tileB = allocateTile(op, rewriter, matB, iterK, iterN, sizeTile, true);
 
   rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, tileB);
-  rewriter.create<cim::GemmOp>(op->getLoc(), tileId, tileA, partRes);
+
+  if (isMatrix) {
+    rewriter.create<cim::GemmOp>(op->getLoc(), tileId, tileA, partRes);
+  } else {
+    rewriter.create<cim::GevmOp>(op->getLoc(), tileId, tileA, partRes);
+  }
+
   rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
 
   elementwiseAddition(op, rewriter, partRes, tileC);
@@ -401,7 +418,8 @@ static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
 }
 
 static void createCIMGevmOp(Operation *op, PatternRewriter &rewriter,
-                            ConstantOp &tileId) {
+                            ConstantOp &tileId, uint32_t tileSize,
+                            bool minWrites) {
   auto genOp = cast<GenericOp>(op);
 
   auto matA = op->getOperand(0);
@@ -425,22 +443,29 @@ static void createCIMGevmOp(Operation *op, PatternRewriter &rewriter,
   auto transposeMap = AffineMap::get(2, 0, ArrayRef<AffineExpr>(reqDimsB));
 
   Value inputB = matB;
-  Value outputC = allocateDuplicate(op, rewriter, matC);
 
   // Check if B needs to be transposed
   if (mapB != transposeMap) {
     inputB = transposeMemRef(op, rewriter, matB, mapB, transposeMap);
   }
 
-  rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, inputB);
-  rewriter.create<cim::GevmOp>(op->getLoc(), tileId, matA, outputC);
-  rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+  if (tileSize > 0) {
+    createCIMTiledGEMM(op, rewriter, tileId, matA, inputB, matC, tileSize,
+                       minWrites);
+  } else {
+    Value outputC = allocateDuplicate(op, rewriter, matC);
 
-  elementwiseAddition(op, rewriter, outputC, matC);
+    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, inputB);
+    rewriter.create<cim::GevmOp>(op->getLoc(), tileId, matA, outputC);
+    rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+
+    elementwiseAddition(op, rewriter, outputC, matC);
+  }
 }
 
 static void createCIMGemvOp(Operation *op, PatternRewriter &rewriter,
-                            ConstantOp &tileId) {
+                            ConstantOp &tileId, uint32_t tileSize,
+                            bool minWrites) {
   auto genOp = cast<GenericOp>(op);
   auto ctx = op->getContext();
 
@@ -473,7 +498,7 @@ static void createCIMGemvOp(Operation *op, PatternRewriter &rewriter,
   op->setOperand(0, matB);
   op->setOperand(1, matAt);
 
-  createCIMGevmOp(op, rewriter, tileId);
+  createCIMGevmOp(op, rewriter, tileId, tileSize, minWrites);
 }
 
 // TODO(adam-smnk) Make lowering more progressive, move some of the conversions
@@ -494,11 +519,11 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter,
     rewriter.create<cim::GemmOp>(op->getLoc(), cimTileID, matA, matC);
     rewriter.create<cim::BarrierOp>(op->getLoc(), cimTileID);
   } else if (isGevm(cast<linalg::GenericOp>(op))) {
-    createCIMGevmOp(op, rewriter, cimTileID);
+    createCIMGevmOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else if (isGemm(cast<linalg::GenericOp>(op))) {
     createCIMGemmOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else if (isGemv(cast<linalg::GenericOp>(op))) {
-    createCIMGemvOp(op, rewriter, cimTileID);
+    createCIMGemvOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else {
     createCIMContractionOp(op, rewriter, cimTileID, tileSize, minWrites);
   }

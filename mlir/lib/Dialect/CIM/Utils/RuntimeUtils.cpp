@@ -89,8 +89,16 @@ mlir::cim::getMemRefSizes(Operation *op, PatternRewriter &rewriter,
                           const ArrayRef<unsigned> &dimsPositions) {
   SmallVector<Value, 8U> dimOperands;
 
-  for (const auto &pos : dimsPositions) {
-    dimOperands.push_back(rewriter.create<DimOp>(op->getLoc(), memRef, pos));
+  if (!dimsPositions.empty()) {
+    for (const auto &pos : dimsPositions) {
+      dimOperands.push_back(rewriter.create<DimOp>(op->getLoc(), memRef, pos));
+    }
+  } else {
+    int numDims = memRef.getType().cast<MemRefType>().getShape().size();
+
+    for (int i = 0; i < numDims; ++i) {
+      dimOperands.push_back(rewriter.create<DimOp>(op->getLoc(), memRef, i));
+    }
   }
 
   return dimOperands;
@@ -497,32 +505,43 @@ static Value calculateTileEndIndex(Operation *op, PatternRewriter &rewriter,
   return minUnsigned(op, rewriter, tileEndPos, dimMaxSize);
 }
 
+// Supports both vectors and matrices
 Value mlir::cim::allocateTile(Operation *op, PatternRewriter &rewriter,
                               const Value &mat, const Value &row,
                               const Value &col, const Value &tileSize,
                               bool copyData) {
-  Value matRows = rewriter.create<DimOp>(op->getLoc(), mat, 0);
-  Value matCols = rewriter.create<DimOp>(op->getLoc(), mat, 1);
+  auto indexType = rewriter.getIndexType();
+  SmallVector<Value, 8U> allocOperands;
+
+  int numDims = mat.getType().cast<MemRefType>().getShape().size();
+  bool isMatrix = numDims == 2;
 
   // Tile size is limited by the matrix boundaries
-  auto indexType = rewriter.getIndexType();
-  Value startRow =
-      rewriter.create<MulIOp>(op->getLoc(), indexType, row, tileSize);
-  Value endRow = calculateTileEndIndex(op, rewriter, row, tileSize, matRows);
+  Value startRow;
+  if (isMatrix) {
+    Value matRows = rewriter.create<DimOp>(op->getLoc(), mat, 0);
+    startRow = rewriter.create<MulIOp>(op->getLoc(), indexType, row, tileSize);
+    Value endRow = calculateTileEndIndex(op, rewriter, row, tileSize, matRows);
+    Value numRows =
+        rewriter.create<SubIOp>(op->getLoc(), indexType, endRow, startRow);
+    allocOperands.push_back(numRows);
+  }
 
+  Value matCols = rewriter.create<DimOp>(op->getLoc(), mat, numDims - 1);
   Value startCol =
       rewriter.create<MulIOp>(op->getLoc(), indexType, col, tileSize);
   Value endCol = calculateTileEndIndex(op, rewriter, col, tileSize, matCols);
-
-  Value numRows =
-      rewriter.create<SubIOp>(op->getLoc(), indexType, endRow, startRow);
   Value numCols =
       rewriter.create<SubIOp>(op->getLoc(), indexType, endCol, startCol);
+  allocOperands.push_back(numCols);
 
-  SmallVector<int64_t, 8U> tileSizes = {-1, -1};
+  SmallVector<int64_t, 8U> tileSizes;
+  for (int i = 0; i < numDims; ++i) {
+    tileSizes.push_back(-1);
+  }
+
   MemRefType tileType = MemRefType::Builder(
       tileSizes, mat.getType().cast<MemRefType>().getElementType());
-  SmallVector<Value, 8U> allocOperands = {numRows, numCols};
   Value tile = rewriter.create<AllocOp>(op->getLoc(), tileType, allocOperands)
                    .getResult();
 
@@ -530,7 +549,7 @@ Value mlir::cim::allocateTile(Operation *op, PatternRewriter &rewriter,
     // Copy data from the matrix to the tile
     Value lowerBound = createIndexConst(op, rewriter, 0);
     Value step = createIndexConst(op, rewriter, 1);
-    SmallVector<Value, 8U> upperBounds = {numRows, numCols};
+    SmallVector<Value, 8U> upperBounds = allocOperands;
 
     SmallVector<loop::ForOp, 8U> loops;
     SmallVector<Value, 8U> loopIterators;
@@ -544,12 +563,20 @@ Value mlir::cim::allocateTile(Operation *op, PatternRewriter &rewriter,
       rewriter.setInsertionPointToStart(loop.getBody());
     }
 
-    Value matRowPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startRow,
-                                              loopIterators[0]);
+    SmallVector<Value, 8U> matPos;
+
+    if (isMatrix) {
+      Value matRowPos = rewriter.create<AddIOp>(op->getLoc(), indexType,
+                                                startRow, loopIterators[0]);
+      matPos.push_back(matRowPos);
+    }
+
     Value matColPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startCol,
-                                              loopIterators[1]);
-    Value matElement = rewriter.create<LoadOp>(
-        op->getLoc(), mat, ValueRange({matRowPos, matColPos}));
+                                              loopIterators[numDims - 1]);
+    matPos.push_back(matColPos);
+
+    Value matElement =
+        rewriter.create<LoadOp>(op->getLoc(), mat, ValueRange(matPos));
     rewriter.create<StoreOp>(op->getLoc(), matElement, tile,
                              ValueRange(loopIterators));
 
@@ -565,21 +592,29 @@ Value mlir::cim::allocateTile(Operation *op, PatternRewriter &rewriter,
   return tile;
 }
 
+// Supports both vectors and matrices
 void mlir::cim::storeTile(Operation *op, PatternRewriter &rewriter,
                           const Value &tile, const Value &mat, const Value &row,
                           const Value &col, const Value &tileSize) {
-  Value tileRows = rewriter.create<DimOp>(op->getLoc(), tile, 0);
-  Value tileCols = rewriter.create<DimOp>(op->getLoc(), tile, 1);
-
   auto indexType = rewriter.getIndexType();
-  Value startRow =
-      rewriter.create<MulIOp>(op->getLoc(), indexType, row, tileSize);
-  Value startCol =
-      rewriter.create<MulIOp>(op->getLoc(), indexType, col, tileSize);
+  int numDims = mat.getType().cast<MemRefType>().getShape().size();
+  bool isMatrix = numDims == 2;
 
   Value lowerBound = createIndexConst(op, rewriter, 0);
   Value step = createIndexConst(op, rewriter, 1);
-  SmallVector<Value, 8U> upperBounds = {tileRows, tileCols};
+  SmallVector<Value, 8U> upperBounds;
+
+  Value startRow;
+  if (isMatrix) {
+    Value tileRows = rewriter.create<DimOp>(op->getLoc(), tile, 0);
+    startRow = rewriter.create<MulIOp>(op->getLoc(), indexType, row, tileSize);
+    upperBounds.push_back(tileRows);
+  }
+
+  Value tileCols = rewriter.create<DimOp>(op->getLoc(), tile, numDims - 1);
+  Value startCol =
+      rewriter.create<MulIOp>(op->getLoc(), indexType, col, tileSize);
+  upperBounds.push_back(tileCols);
 
   SmallVector<loop::ForOp, 8U> loops;
   SmallVector<Value, 8U> loopIterators;
@@ -593,14 +628,21 @@ void mlir::cim::storeTile(Operation *op, PatternRewriter &rewriter,
     rewriter.setInsertionPointToStart(loop.getBody());
   }
 
-  Value matRowPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startRow,
-                                            loopIterators[0]);
+  SmallVector<Value, 8U> matPos;
+
+  if (isMatrix) {
+    Value matRowPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startRow,
+                                              loopIterators[0]);
+    matPos.push_back(matRowPos);
+  }
+
   Value matColPos = rewriter.create<AddIOp>(op->getLoc(), indexType, startCol,
-                                            loopIterators[1]);
+                                            loopIterators[numDims - 1]);
+  matPos.push_back(matColPos);
+
   Value tileElement =
       rewriter.create<LoadOp>(op->getLoc(), tile, ValueRange(loopIterators));
-  rewriter.create<StoreOp>(op->getLoc(), tileElement, mat,
-                           ValueRange({matRowPos, matColPos}));
+  rewriter.create<StoreOp>(op->getLoc(), tileElement, mat, ValueRange(matPos));
 
   // Set insertion point back at main body outside of the loops
   rewriter.setInsertionPointAfter(loops.front());

@@ -14,9 +14,9 @@ Value transposeMemRef(Operation *op, PatternRewriter &rewriter,
                       const Value &memRef, const AffineMap &memRefMap,
                       const AffineMap &targetMap);
 
-SmallVector<Value, 8U> getMemRefSizes(Operation *op, PatternRewriter &rewriter,
-                                      const Value &memRef,
-                                      const ArrayRef<unsigned> &dimsPositions);
+SmallVector<Value, 8U>
+getMemRefSizes(Operation *op, PatternRewriter &rewriter, const Value &memRef,
+               const ArrayRef<unsigned> &dimsPositions = {});
 
 Value calculateDimsSize(Operation *op, PatternRewriter &rewriter,
                         const ArrayRef<Value> &dimOperands);
