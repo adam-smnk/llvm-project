@@ -164,8 +164,16 @@ static void createCIMTiledGEMM(Operation *op, PatternRewriter &rewriter,
 
   Value lowerBound = createIndexConst(op, rewriter, 0);
   Value step = createIndexConst(op, rewriter, 1);
-  // Iterators: m, n, k
-  SmallVector<Value, 8U> upperBounds = {tiledRows, tiledCols, numTiles};
+
+  // C[M][N] = A[M][K] * B[K][N]
+  SmallVector<Value, 8U> upperBounds;
+  if (minWrites) {
+    // Iterators: k, n, m
+    upperBounds = {numTiles, tiledCols, tiledRows};
+  } else {
+    // Iterators: m, n, k
+    upperBounds = {tiledRows, tiledCols, numTiles};
+  }
 
   SmallVector<loop::ForOp, 8U> loops;
   SmallVector<Value, 8U> loopIterators;
@@ -179,39 +187,83 @@ static void createCIMTiledGEMM(Operation *op, PatternRewriter &rewriter,
     rewriter.setInsertionPointToStart(loop.getBody());
   }
 
-  Value &iterM = loopIterators[0];
-  Value &iterN = loopIterators[1];
-  Value &iterK = loopIterators[2];
-
-  rewriter.setInsertionPointToStart(loops[1].getBody());
-  Value tileC = allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, true);
-  Value partRes =
-      allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, false);
-
-  rewriter.setInsertionPointToStart(loops[2].getBody());
-  Value tileA = allocateTile(op, rewriter, matA, iterM, iterK, sizeTile, true);
-  Value tileB = allocateTile(op, rewriter, matB, iterK, iterN, sizeTile, true);
-
-  rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, tileB);
-
-  if (isMatrix) {
-    rewriter.create<cim::GemmOp>(op->getLoc(), tileId, tileA, partRes);
+  Value iterM;
+  Value iterN;
+  Value iterK;
+  if (minWrites) {
+    iterM = loopIterators[2];
+    iterN = loopIterators[1];
+    iterK = loopIterators[0];
   } else {
-    rewriter.create<cim::GevmOp>(op->getLoc(), tileId, tileA, partRes);
+    iterM = loopIterators[0];
+    iterN = loopIterators[1];
+    iterK = loopIterators[2];
   }
 
-  rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+  // Populate the middle loop
+  Value tileB;
+  Value tileC;
+  Value partRes;
 
-  elementwiseAddition(op, rewriter, partRes, tileC);
+  rewriter.setInsertionPointToStart(loops[1].getBody());
+  if (minWrites) {
+    tileB = allocateTile(op, rewriter, matB, iterK, iterN, sizeTile, true);
+    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, tileB);
+
+    // Move after the innermost loop
+    rewriter.setInsertionPoint(loops[1].getBody(),
+                               --(loops[1].getBody()->end()));
+    rewriter.create<DeallocOp>(op->getLoc(), tileB);
+  } else {
+    tileC = allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, true);
+    partRes = allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, false);
+
+    // Move after innermost loop
+    rewriter.setInsertionPoint(loops[1].getBody(),
+                               --(loops[1].getBody()->end()));
+    storeTile(op, rewriter, tileC, matC, iterM, iterN, sizeTile);
+
+    rewriter.create<DeallocOp>(op->getLoc(), tileC);
+    rewriter.create<DeallocOp>(op->getLoc(), partRes);
+  }
+
+  // Populate the innermost loop
+  rewriter.setInsertionPointToStart(loops[2].getBody());
+  Value tileA = allocateTile(op, rewriter, matA, iterM, iterK, sizeTile, true);
+
+  if (minWrites) {
+    tileC = allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, true);
+    partRes = allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, false);
+
+    if (isMatrix) {
+      rewriter.create<cim::GemmOp>(op->getLoc(), tileId, tileA, partRes);
+    } else {
+      rewriter.create<cim::GevmOp>(op->getLoc(), tileId, tileA, partRes);
+    }
+    rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+
+    elementwiseAddition(op, rewriter, partRes, tileC);
+    storeTile(op, rewriter, tileC, matC, iterM, iterN, sizeTile);
+
+    rewriter.create<DeallocOp>(op->getLoc(), tileC);
+    rewriter.create<DeallocOp>(op->getLoc(), partRes);
+  } else {
+    tileB = allocateTile(op, rewriter, matB, iterK, iterN, sizeTile, true);
+
+    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, tileB);
+    if (isMatrix) {
+      rewriter.create<cim::GemmOp>(op->getLoc(), tileId, tileA, partRes);
+    } else {
+      rewriter.create<cim::GevmOp>(op->getLoc(), tileId, tileA, partRes);
+    }
+    rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+
+    elementwiseAddition(op, rewriter, partRes, tileC);
+
+    rewriter.create<DeallocOp>(op->getLoc(), tileB);
+  }
 
   rewriter.create<DeallocOp>(op->getLoc(), tileA);
-  rewriter.create<DeallocOp>(op->getLoc(), tileB);
-
-  rewriter.setInsertionPoint(loops[1].getBody(), --(loops[1].getBody()->end()));
-  storeTile(op, rewriter, tileC, matC, iterM, iterN, sizeTile);
-
-  rewriter.create<DeallocOp>(op->getLoc(), tileC);
-  rewriter.create<DeallocOp>(op->getLoc(), partRes);
 
   // Set insertion point back at main body outside of the loops
   rewriter.setInsertionPointAfter(loops.front());
