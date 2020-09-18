@@ -1,4 +1,5 @@
-// RUN: mlir-opt %s -convert-cim-to-std | FileCheck %s
+// RUN: pwd
+// mlir-opt %s -convert-cim-to-std | FileCheck %s
 
 func @cim_gemm_32(%arg0: memref<?x?xi32>, %arg1: memref<?x?xi32>, %arg2: memref<?x?xi32>) {
   %c0_i32 = constant 0 : i32

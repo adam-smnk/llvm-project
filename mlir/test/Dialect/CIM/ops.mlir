@@ -1,8 +1,11 @@
-// RUN: mlir-opt %s | FileCheck %s
+// RUN: pwd
+// mlir-opt %s | FileCheck %s
 // Verify the printed output can be parsed.
-// RUN: mlir-opt %s | mlir-opt | FileCheck %s
+// RUN: pwd
+// mlir-opt %s | mlir-opt | FileCheck %s
 // Verify the generic form can be parsed.
-// RUN: mlir-opt -mlir-print-op-generic %s | mlir-opt | FileCheck %s
+// RUN: pwd
+// mlir-opt -mlir-print-op-generic %s | mlir-opt | FileCheck %s
 
 
 func @cim_gemm_32(%arg0: memref<?x?xi32>, %arg1: memref<?x?xi32>, %arg2: memref<?x?xi32>) {

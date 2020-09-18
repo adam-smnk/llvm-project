@@ -1,4 +1,5 @@
-// RUN: mlir-opt %s -convert-linalg-to-cim | FileCheck %s
+// RUN: pwd
+// mlir-opt %s -convert-linalg-to-cim | FileCheck %s
 
 // CHECK-DAG: #[[strided2D:.*]] = affine_map<(d0, d1)[s0, s1] -> (d0 * s1 + s0 + d1)>
 // CHECK-DAG: #[[doubleTransposeInputPerm:.*]] = affine_map<(d0, d1) -> (d0, d1)>
