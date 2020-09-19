@@ -491,6 +491,17 @@ Value mlir::cim::calculateNumTiles(Operation *op, PatternRewriter &rewriter,
                                    numFullTilesPlusOne);
 }
 
+static Value calculateTileStartIndex(Operation *op, PatternRewriter &rewriter,
+                                     const Value &tilePos,
+                                     const Value &tileSize,
+                                     const Value &dimMaxSize) {
+  const auto resType = rewriter.getIndexType();
+  Value tileStartPos =
+      rewriter.create<MulIOp>(op->getLoc(), resType, tilePos, tileSize);
+
+  return minUnsigned(op, rewriter, tileStartPos, dimMaxSize);
+}
+
 static Value calculateTileEndIndex(Operation *op, PatternRewriter &rewriter,
                                    const Value &tilePos, const Value &tileSize,
                                    const Value &dimMaxSize) {
@@ -520,7 +531,7 @@ Value mlir::cim::allocateTile(Operation *op, PatternRewriter &rewriter,
   Value startRow;
   if (isMatrix) {
     Value matRows = rewriter.create<DimOp>(op->getLoc(), mat, 0);
-    startRow = rewriter.create<MulIOp>(op->getLoc(), indexType, row, tileSize);
+    startRow = calculateTileStartIndex(op, rewriter, row, tileSize, matRows);
     Value endRow = calculateTileEndIndex(op, rewriter, row, tileSize, matRows);
     Value numRows =
         rewriter.create<SubIOp>(op->getLoc(), indexType, endRow, startRow);
@@ -529,7 +540,7 @@ Value mlir::cim::allocateTile(Operation *op, PatternRewriter &rewriter,
 
   Value matCols = rewriter.create<DimOp>(op->getLoc(), mat, numDims - 1);
   Value startCol =
-      rewriter.create<MulIOp>(op->getLoc(), indexType, col, tileSize);
+      calculateTileStartIndex(op, rewriter, col, tileSize, matCols);
   Value endCol = calculateTileEndIndex(op, rewriter, col, tileSize, matCols);
   Value numCols =
       rewriter.create<SubIOp>(op->getLoc(), indexType, endCol, startCol);
