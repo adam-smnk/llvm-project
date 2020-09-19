@@ -37,6 +37,13 @@ namespace {
 
 static llvm::cl::OptionCategory clOptionsCategory(DEBUG_TYPE " options");
 
+static llvm::cl::opt<unsigned> clNumTiles(
+    "cim-num-tiles",
+    llvm::cl::desc(
+        "Number of CIM device tiles which can be used for parallelization"),
+    llvm::cl::Optional, llvm::cl::MiscFlags::DefaultOption,
+    llvm::cl::cat(clOptionsCategory));
+
 static llvm::cl::opt<unsigned> clTileSize(
     "cim-tile-size",
     llvm::cl::desc("CIM device tile sizes by which to tile cim operations"),
