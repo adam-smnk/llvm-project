@@ -427,7 +427,9 @@ static void createCIMGemmOp(Operation *op, PatternRewriter &rewriter,
 
   if (tileSize > 0) {
     Value zero = rewriter.create<ConstantOp>(
-        op->getLoc(), rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
+        op->getLoc(),
+        rewriter.getIntegerAttr(
+            outputC.getType().cast<MemRefType>().getElementType(), 0));
     rewriter.create<FillOp>(op->getLoc(), outputC, zero);
 
     createCIMTiledGEMM(op, rewriter, tileId, inputA, inputB, outputC, tileSize,

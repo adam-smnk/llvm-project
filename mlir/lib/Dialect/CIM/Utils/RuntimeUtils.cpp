@@ -585,7 +585,9 @@ Value mlir::cim::allocateTile(Operation *op, PatternRewriter &rewriter,
   } else {
     // Zero-initialize the tile
     Value zero = rewriter.create<ConstantOp>(
-        op->getLoc(), rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
+        op->getLoc(),
+        rewriter.getIntegerAttr(
+            tile.getType().cast<MemRefType>().getElementType(), 0));
     rewriter.create<FillOp>(op->getLoc(), tile, zero);
   }
 
