@@ -469,19 +469,56 @@ static void createCIMTiledGEMM(Operation *op, PatternRewriter &rewriter,
     rewriter.setInsertionPointToStart(loop.getBody());
   }
 
+  // Set insertion point before the loops
+  rewriter.setInsertionPoint(loops.front());
+
+  Value kDimIter;
+  if (numCimTiles > 1) {
+    Value zero = createIndexConst(op, rewriter, 0);
+    MemRefType memType = MemRefType::Builder({1}, rewriter.getIntegerType(32));
+    kDimIter = rewriter.create<AllocOp>(op->getLoc(), memType).getResult();
+    Value initVal = rewriter.create<ConstantOp>(
+        op->getLoc(), rewriter.getIntegerType(32),
+        rewriter.getIntegerAttr(rewriter.getIntegerType(32), -1 * numCimTiles));
+    rewriter.create<StoreOp>(op->getLoc(), initVal, kDimIter, ValueRange(zero));
+
+    if (minWrites) {
+      rewriter.setInsertionPointToStart(loops[0].getBody());
+      Value intIter = rewriter.create<IndexCastOp>(
+          op->getLoc(), loopIterators[0],
+          kDimIter.getType().cast<MemRefType>().getElementType());
+      rewriter.create<StoreOp>(op->getLoc(), intIter, kDimIter,
+                               ValueRange(zero));
+    } else {
+      rewriter.setInsertionPointToStart(loops[2].getBody());
+      Value intIter = rewriter.create<IndexCastOp>(
+          op->getLoc(), loopIterators[2],
+          kDimIter.getType().cast<MemRefType>().getElementType());
+      rewriter.create<StoreOp>(op->getLoc(), intIter, kDimIter,
+                               ValueRange(zero));
+    }
+  }
+
   populateTiledGEMMLoops(op, rewriter, tileId, matA, matB, matC, sizeTile,
                          minWrites, loops, loopIterators, false, upperBounds);
 
   if (numCimTiles > 1) {
     Value zero = createIndexConst(op, rewriter, 0);
     // Value prevUpperBoundDimK = maxSigned(op, rewriter, upperBoundDimK, zero);
+    Value kDimIterVal =
+        rewriter.create<LoadOp>(op->getLoc(), kDimIter, ValueRange(zero));
+    Value kDimIterIndex = rewriter.create<IndexCastOp>(
+        op->getLoc(), kDimIterVal, rewriter.getIndexType());
+
     SmallVector<Value, 8U> lowerBounds;
+    Value kDimLowerBound = rewriter.create<AddIOp>(
+        op->getLoc(), rewriter.getIndexType(), kDimIterIndex, cimTilesCount);
     if (minWrites) {
       // Iterators: k, n, m
-      lowerBounds = {loopIterators[0], zero, zero};
+      lowerBounds = {kDimLowerBound, zero, zero};
     } else {
       // Iterators: m, n, k
-      lowerBounds = {zero, zero, loopIterators[2]};
+      lowerBounds = {zero, zero, kDimLowerBound};
     }
 
     SmallVector<Value, 8U> upperBounds;
@@ -507,6 +544,8 @@ static void createCIMTiledGEMM(Operation *op, PatternRewriter &rewriter,
 
     populateTiledGEMMLoops(op, rewriter, tileId, matA, matB, matC, sizeTile,
                            minWrites, loops, loopIterators, true, upperBounds);
+
+    rewriter.create<DeallocOp>(op->getLoc(), kDimIter);
   }
 }
 
