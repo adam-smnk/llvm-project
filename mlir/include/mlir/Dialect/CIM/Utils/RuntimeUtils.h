@@ -47,6 +47,9 @@ void reshapeCopy(Operation *op, PatternRewriter &rewriter,
 
 Value createIndexConst(Operation *op, PatternRewriter &rewriter, int64_t value);
 
+Value createIntConst(Operation *op, PatternRewriter &rewriter, int64_t value,
+                     unsigned width);
+
 Value minSigned(Operation *op, PatternRewriter &rewriter, const Value &lhs,
                 const Value &rhs);
 

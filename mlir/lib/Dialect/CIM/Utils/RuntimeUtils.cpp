@@ -441,6 +441,13 @@ Value mlir::cim::createIndexConst(Operation *op, PatternRewriter &rewriter,
       rewriter.getIntegerAttr(rewriter.getIndexType(), value));
 }
 
+Value mlir::cim::createIntConst(Operation *op, PatternRewriter &rewriter,
+                                int64_t value, unsigned width) {
+  return rewriter.create<ConstantOp>(
+      op->getLoc(),
+      rewriter.getIntegerAttr(rewriter.getIntegerType(width), value));
+}
+
 Value mlir::cim::minSigned(Operation *op, PatternRewriter &rewriter,
                            const Value &lhs, const Value &rhs) {
   Value cond =

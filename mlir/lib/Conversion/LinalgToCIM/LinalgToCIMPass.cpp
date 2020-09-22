@@ -185,7 +185,7 @@ static void populateTiledGEMMLoops(Operation *op, PatternRewriter &rewriter,
 
   SmallVector<Value, 8U> cimTileIds;
   for (unsigned i = 0; i < numCimTiles; ++i) {
-    cimTileIds.push_back(createIndexConst(op, rewriter, i));
+    cimTileIds.push_back(createIntConst(op, rewriter, i, 32));
   }
 
   Value iterM;
@@ -399,7 +399,7 @@ static void createCIMTiledGEMM(Operation *op, PatternRewriter &rewriter,
 
   SmallVector<Value, 8U> cimTileIds;
   for (unsigned i = 0; i < numCimTiles; ++i) {
-    cimTileIds.push_back(createIndexConst(op, rewriter, i));
+    cimTileIds.push_back(createIntConst(op, rewriter, i, 32));
   }
 
   Value dimM;
