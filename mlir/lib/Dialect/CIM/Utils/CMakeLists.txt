@@ -13,6 +13,7 @@ set(LIBS
 add_llvm_library(MLIRCIMUtils
   RuntimeUtils.cpp
   StaticUtils.cpp
+  Tiling.cpp
 )
 
 add_dependencies(MLIRCIMUtils ${LIBS})
