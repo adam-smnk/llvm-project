@@ -142,6 +142,79 @@ static bool isContraction(linalg::GenericOp genericOp) {
   return contrDims.size() > 0 && outputDims == dimsC;
 }
 
+// Spatial convolution defined as:
+// A(N, C, H, W, ...)
+// B(K, C, KH, KW, ...)
+// C(N, K, H, W, ...)
+static bool isConvolution(linalg::GenericOp genericOp) {
+  if (!(genericOp.getNumInputs() == 2 && genericOp.getNumOutputs() == 1 &&
+        hasMultiplyAddBody(genericOp))) {
+    return false;
+  }
+
+  auto resultDims = getResultDims(genericOp);
+
+  auto dimsA = resultDims[0];
+  auto dimsB = resultDims[1];
+  auto dimsC = resultDims[2];
+
+  // All operands must have the same number of dimensions and no fewer than 3
+  const unsigned int minDimNum = 3;
+  const unsigned int dimsASize = dimsA.size();
+  if (!std::all_of(
+          resultDims.begin(), resultDims.end(), [&](ArrayRef<AffineExpr> dims) {
+            return (dims.size() == dimsASize) && (dims.size() >= minDimNum);
+          })) {
+    llvm::errs() << "Dim sizes wrong\n";
+    return false;
+  }
+
+  // B and C maps must contain only dimension expressions
+  if (!isAffineDimOnly(dimsB) || !isAffineDimOnly(dimsC)) {
+    llvm::errs() << "B C not only dims\n";
+    return false;
+  }
+
+  // Map of A must have the following convolution layout:
+  // DimId (N), DimId (C), AffineAdd (dim0/H), AffineAdd (dim1/W)...
+  if ((dimsA[0].getKind() != AffineExprKind::DimId) ||
+      (dimsA[1].getKind() != AffineExprKind::DimId)) {
+    return false;
+  }
+  if (!(std::all_of(dimsA.begin() + 2, dimsA.end(), [](AffineExpr expr) {
+        return expr.getKind() == AffineExprKind::Add;
+      }))) {
+    llvm::errs() << "Affine add A false\n";
+    return false;
+  }
+
+  // Check if number of outputs is correct as per:
+  // A(N,C,...) B(K,C,...) C(N,K,...)
+  if ((dimsC[0] != dimsA[0]) || (dimsC[1] != dimsB[0])) {
+    llvm::errs() << "Output 0 1 false\n";
+    return false;
+  }
+
+  // Check if kernels slide correctly over the input feature maps
+  // input sizes (C dims): H, W, ...
+  // kernels sizes (B dims): KH, KW, ...
+  // convolution slide (A mapping): H + KH, W + KW, ...
+  for (unsigned int i = 2; i < dimsASize; ++i) {
+    AffineExpr aAddExpr = dimsA[i];
+    AffineExpr bcAddExpr =
+        getAffineBinaryOpExpr(AffineExprKind::Add, dimsB[i], dimsC[i]);
+    AffineExpr cbAddExpr =
+        getAffineBinaryOpExpr(AffineExprKind::Add, dimsC[i], dimsB[i]);
+
+    if ((aAddExpr != bcAddExpr) && (aAddExpr != cbAddExpr)) {
+      llvm::errs() << "Affine add input output false\n";
+      return false;
+    }
+  }
+
+  return true;
+}
+
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
                                    ConstantOp &tileId, uint32_t tileSize,
                                    bool minWrites) {
@@ -446,6 +519,8 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter,
     rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), cimTileID, matB);
     rewriter.create<cim::GemmOp>(op->getLoc(), cimTileID, matA, matC);
     rewriter.create<cim::BarrierOp>(op->getLoc(), cimTileID);
+  } else if (isConvolution(cast<linalg::GenericOp>(op))) {
+    rewriter.create<cim::ConvOp>(op->getLoc(), matA, matB, matC);
   } else if (isGevm(cast<linalg::GenericOp>(op))) {
     createCIMGevmOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else if (isGemm(cast<linalg::GenericOp>(op))) {
@@ -516,8 +591,9 @@ public:
     target.addLegalDialect<StandardOpsDialect>();
     target.addLegalDialect<loop::LoopOpsDialect>();
     target.addIllegalOp<linalg::MatmulOp>();
-    target.addDynamicallyLegalOp<linalg::GenericOp>(
-        [&](linalg::GenericOp op) { return !isContraction(op); });
+    target.addDynamicallyLegalOp<linalg::GenericOp>([&](linalg::GenericOp op) {
+      return !(isContraction(op) || isConvolution(op));
+    });
 
     if (failed(applyPartialConversion(m, target, patterns)))
       signalPassFailure();

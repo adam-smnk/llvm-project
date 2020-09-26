@@ -86,6 +86,29 @@ def CIM_WriteToCrossbarOp : CIM_Op<"write_to_crossbar"> {
   let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
 }
 
+def CIM_ConvOp : CIM_Op<"conv"> {
+  let summary = "Perform general matrix-matrix multiplication on CIM";
+  let description = [{
+    Convolution example
+  }];
+
+  code libraryCallName = [{
+    std::string getLibraryCallName() {
+      std::string name = "cim_conv";
+
+      llvm::raw_string_ostream ss(name);
+      appendOperandPrecision(ss, C().getType());
+
+      return ss.str();
+    }
+  }];
+  let arguments = (ins AnyMemRef:$A,
+                       AnyMemRef:$B,
+                       AnyMemRef:$C);
+
+  let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
+}
+
 def CIM_GemmOp : CIM_Op<"gemm"> {
   let summary = "Perform general matrix-matrix multiplication on CIM";
   let description = [{

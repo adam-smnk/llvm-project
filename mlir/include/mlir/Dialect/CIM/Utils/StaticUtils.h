@@ -24,6 +24,8 @@ struct TransposeAnalysisResults {
         transposeResult(transposeResult_){};
 };
 
+bool isAffineDimOnly(const ArrayRef<AffineExpr> &affineDims);
+
 SmallVector<AffineMap, 8U> getResultMaps(ArrayAttr affineMaps);
 
 SmallVector<AffineMap, 8U> getResultMaps(linalg::GenericOp genericOp);
