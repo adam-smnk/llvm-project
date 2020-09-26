@@ -142,6 +142,401 @@ static bool isContraction(linalg::GenericOp genericOp) {
   return contrDims.size() > 0 && outputDims == dimsC;
 }
 
+// Spatial convolution defined as:
+// A(N, C, H, W, ...)
+// B(K, C, KH, KW, ...)
+// C(N, K, H, W, ...)
+static bool isConvolution(linalg::GenericOp genericOp) {
+  if (!(genericOp.getNumInputs() == 2 && genericOp.getNumOutputs() == 1 &&
+        hasMultiplyAddBody(genericOp))) {
+    return false;
+  }
+
+  auto resultDims = getResultDims(genericOp);
+
+  auto dimsA = resultDims[0];
+  auto dimsB = resultDims[1];
+  auto dimsC = resultDims[2];
+
+  // All operands must have the same number of dimensions and no fewer than 3
+  const unsigned int minDimNum = 3;
+  const unsigned int dimsASize = dimsA.size();
+  if (!std::all_of(
+          resultDims.begin(), resultDims.end(), [&](ArrayRef<AffineExpr> dims) {
+            return (dims.size() == dimsASize) && (dims.size() >= minDimNum);
+          })) {
+    return false;
+  }
+
+  // B and C maps must contain only dimension expressions
+  if (!isAffineDimOnly(dimsB) || !isAffineDimOnly(dimsC)) {
+    return false;
+  }
+
+  // Map of A must have the following convolution layout:
+  // DimId (N), DimId (C), AffineAdd (dim0/H), AffineAdd (dim1/W)...
+  if ((dimsA[0].getKind() != AffineExprKind::DimId) ||
+      (dimsA[1].getKind() != AffineExprKind::DimId)) {
+    return false;
+  }
+  if (!(std::all_of(dimsA.begin() + 2, dimsA.end(), [](AffineExpr expr) {
+        return expr.getKind() == AffineExprKind::Add;
+      }))) {
+    return false;
+  }
+
+  // Check if number of outputs is correct as per:
+  // A(N,C,...) B(K,C,...) C(N,K,...)
+  if ((dimsC[0] != dimsA[0]) || (dimsC[1] != dimsB[0])) {
+    return false;
+  }
+
+  // Check if kernels slide correctly over the input feature maps
+  // input sizes (C dims): H, W, ...
+  // kernels sizes (B dims): KH, KW, ...
+  // convolution slide (A mapping): H + KH, W + KW, ...
+  for (unsigned int i = 2; i < dimsASize; ++i) {
+    AffineExpr aAddExpr = dimsA[i];
+    AffineExpr bcAddExpr =
+        getAffineBinaryOpExpr(AffineExprKind::Add, dimsB[i], dimsC[i]);
+    AffineExpr cbAddExpr =
+        getAffineBinaryOpExpr(AffineExprKind::Add, dimsC[i], dimsB[i]);
+
+    if ((aAddExpr != bcAddExpr) && (aAddExpr != cbAddExpr)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static Value zeroPadConvInput(Operation *op, PatternRewriter &rewriter,
+                              const Value &memRef,
+                              const ArrayRef<Value> &paddingSizes) {
+  auto indexType = rewriter.getIndexType();
+
+  SmallVector<Value, 8U> memSizes = getMemRefSizes(op, rewriter, memRef);
+
+  assert(memSizes.size() == (paddingSizes.size() + 2) &&
+         "Number of padding dimension does not match the convolution input "
+         "dimensions");
+
+  SmallVector<int64_t, 8U> targetMemRefSizes;
+  for (unsigned i = 0; i < memSizes.size(); ++i) {
+    targetMemRefSizes.push_back(-1);
+  }
+  SmallVector<Value, 8U> targetDimSizes = {memSizes[0], memSizes[1]};
+  for (unsigned i = 2; i < memSizes.size(); ++i) {
+    Value paddedSize = rewriter.create<AddIOp>(
+        op->getLoc(), indexType, memSizes[i], paddingSizes[i - 2]);
+    targetDimSizes.push_back(paddedSize);
+  }
+  MemRefType paddedMemRefType = MemRefType::Builder(
+      targetMemRefSizes, memRef.getType().cast<MemRefType>().getElementType());
+
+  Value paddedMemRef =
+      rewriter.create<AllocOp>(op->getLoc(), paddedMemRefType, targetDimSizes)
+          .getResult();
+  Value zeroVal = rewriter.create<ConstantOp>(
+      op->getLoc(),
+      rewriter.getIntegerAttr(
+          paddedMemRef.getType().cast<MemRefType>().getElementType(), 0));
+  rewriter.create<FillOp>(op->getLoc(), paddedMemRef, zeroVal);
+
+  Value zero = createIndexConst(op, rewriter, 0);
+  Value two = createIndexConst(op, rewriter, 2);
+
+  SmallVector<Value, 8U> paddingOffsets;
+  for (const auto &ps : paddingSizes) {
+    Value sidePaddingSize =
+        rewriter.create<UnsignedDivIOp>(op->getLoc(), indexType, ps, two);
+    // For even-sized dimensions (with odd-sized padding), the extra padding is
+    // added to the beginning of each dimension
+    Value paddingRem =
+        rewriter.create<UnsignedRemIOp>(op->getLoc(), indexType, ps, two);
+    Value offset = rewriter.create<AddIOp>(op->getLoc(), indexType,
+                                           sidePaddingSize, paddingRem);
+    paddingOffsets.push_back(offset);
+  }
+
+  SmallVector<Value, 8U> upperBounds = memSizes;
+  Value lowerBound = zero;
+  Value step = createIndexConst(op, rewriter, 1);
+
+  SmallVector<loop::ForOp, 8U> loops;
+  SmallVector<Value, 8U> loopIterators;
+  for (unsigned i = 0; i < upperBounds.size(); ++i) {
+    auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
+                                             upperBounds[i], step);
+    loops.push_back(loop);
+    loopIterators.push_back(loop.getInductionVar());
+
+    // Set insertion point inside the loop
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  Value element =
+      rewriter.create<LoadOp>(op->getLoc(), memRef, ValueRange(loopIterators));
+
+  SmallVector<Value, 8U> paddedPos = {loopIterators[0], loopIterators[1]};
+  for (unsigned i = 2; i < loopIterators.size(); ++i) {
+    Value offsetPos = rewriter.create<AddIOp>(
+        op->getLoc(), indexType, loopIterators[i], paddingOffsets[i - 2]);
+    paddedPos.push_back(offsetPos);
+  }
+
+  rewriter.create<StoreOp>(op->getLoc(), element, paddedMemRef,
+                           ValueRange(paddedPos));
+
+  // Set insertion point back at main body outside of the loops
+  rewriter.setInsertionPointAfter(loops.front());
+
+  return paddedMemRef;
+}
+
+// Input feature maps: A(N, C, H, W, ...)
+// Matrix form: A_col(N*H*W*..., C*KH*KW*...)
+static Value im2ColInputMaps(Operation *op, PatternRewriter &rewriter,
+                             const Value &matA,
+                             const ArrayRef<Value> &kernelSizes) {
+  Value zero = createIndexConst(op, rewriter, 0);
+  Value one = createIndexConst(op, rewriter, 1);
+  auto indexType = rewriter.getIndexType();
+
+  SmallVector<Value, 8U> sizesA = getMemRefSizes(op, rewriter, matA);
+
+  // Calculate size of the output im2col matrix
+  SmallVector<Value, 8U> outputRowDims = {sizesA[0]};
+  for (unsigned i = 2; i < sizesA.size(); ++i) {
+    // outputDimSize = (dimSize - kernelSize) + 1
+    Value sizeDimMinusKernel = rewriter.create<SubIOp>(
+        op->getLoc(), indexType, sizesA[i], kernelSizes[i - 2]);
+    Value outputDimSize = rewriter.create<AddIOp>(op->getLoc(), indexType,
+                                                  sizeDimMinusKernel, one);
+    outputRowDims.push_back(outputDimSize);
+  }
+  SmallVector<Value, 8U> outputColDims = {sizesA[1]};
+  for (const auto &kSize : kernelSizes) {
+    outputColDims.push_back(kSize);
+  }
+
+  Value aFlatRowSize = calculateDimsSize(op, rewriter, outputRowDims);
+  Value aFlatColSize = calculateDimsSize(op, rewriter, outputColDims);
+
+  // Allocate the output matrix
+  SmallVector<int64_t, 8U> targetMemRefSizes = {-1, -1};
+  SmallVector<Value, 8U> targetDimSizes = {aFlatRowSize, aFlatColSize};
+  MemRefType targetMemRefType = MemRefType::Builder(
+      targetMemRefSizes, matA.getType().cast<MemRefType>().getElementType());
+
+  Value flatA =
+      rewriter.create<AllocOp>(op->getLoc(), targetMemRefType, targetDimSizes)
+          .getResult();
+
+  // Deallocate the data at the end of block after CIM computations are
+  // finished
+  auto deallocOp =
+      rewriter.create<DeallocOp>(op->getLoc(), flatA).getOperation();
+  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+
+  // Create loops
+  Value lowerBound = zero;
+  Value step = one;
+  SmallVector<Value, 8U> upperBounds(outputRowDims);
+  upperBounds.insert(upperBounds.end(), outputColDims.begin(),
+                     outputColDims.end());
+
+  SmallVector<loop::ForOp, 8U> loops;
+  SmallVector<Value, 8U> loopIterators;
+  for (unsigned i = 0; i < upperBounds.size(); ++i) {
+    auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
+                                             upperBounds[i], step);
+    loops.push_back(loop);
+    loopIterators.push_back(loop.getInductionVar());
+
+    // Set insertion point inside the loop
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  // Copy input map patches
+  SmallVector<Value, 8U> kernelIters(loopIterators.end() - kernelSizes.size(),
+                                     loopIterators.end());
+  SmallVector<Value, 8U> inputMapIters(
+      loopIterators.begin() + 1, loopIterators.begin() + outputRowDims.size());
+
+  SmallVector<Value, 8U> inputIters = {loopIterators[0],
+                                       loopIterators[outputRowDims.size()]};
+  for (unsigned i = 0; i < inputMapIters.size(); ++i) {
+    Value elementPos = rewriter.create<AddIOp>(
+        op->getLoc(), indexType, inputMapIters[i], kernelIters[i]);
+    inputIters.push_back(elementPos);
+  }
+
+  Value element =
+      rewriter.create<LoadOp>(op->getLoc(), matA, ValueRange(inputIters));
+
+  SmallVector<Value, 8U> outputRowIters(
+      loopIterators.begin(), loopIterators.begin() + outputRowDims.size());
+  SmallVector<Value, 8U> outputColIters(
+      loopIterators.begin() + outputRowDims.size(), loopIterators.end());
+
+  SmallVector<Value, 8U> outputRowStrides =
+      calculateDimsStrides(op, rewriter, outputRowDims);
+  SmallVector<Value, 8U> outputColStrides =
+      calculateDimsStrides(op, rewriter, outputColDims);
+
+  Value outputRowPos =
+      calculateLinearIndex(op, rewriter, outputRowIters, outputRowStrides);
+  Value outputColPos =
+      calculateLinearIndex(op, rewriter, outputColIters, outputColStrides);
+
+  rewriter.create<StoreOp>(op->getLoc(), element, flatA,
+                           ValueRange({outputRowPos, outputColPos}));
+
+  // Set insertion point back at main body outside of the loops
+  rewriter.setInsertionPointAfter(loops.front());
+
+  return flatA;
+}
+
+// Kernels: B(K, C, KH, KW, ...)
+// Matrix form: B_col(C*KH*KW*..., K)
+static Value im2ColKernels(Operation *op, PatternRewriter &rewriter,
+                           const Value &matB) {
+  auto genOp = cast<GenericOp>(op);
+  auto *ctx = genOp.getContext();
+
+  AffineMap mapB = getResultMaps(genOp)[1];
+  SmallVector<AffineExpr, 8U> reqLeftDims;
+  for (unsigned i = 1; i < mapB.getNumResults(); ++i) {
+    reqLeftDims.push_back(mapB.getResult(i));
+  }
+  SmallVector<AffineExpr, 8U> reqRightDims = {mapB.getResult(0)};
+
+  auto leftDimsFlatB =
+      AffineMapAttr::get(AffineMap::get(mapB.getNumInputs(), 0, reqLeftDims));
+  auto rightDimsFlatB =
+      AffineMapAttr::get(AffineMap::get(mapB.getNumInputs(), 0, reqRightDims));
+
+  return groupDimensions(op, rewriter, matB, mapB,
+                         ArrayAttr::get({leftDimsFlatB, rightDimsFlatB}, ctx));
+}
+
+// Output feature maps: C(N, K, H, W, ...)
+// Matrix form: C(N*H*W*..., K)
+static Value im2ColAllocateOutput(Operation *op, PatternRewriter &rewriter,
+                                  const Value &matC) {
+  SmallVector<Value, 8U> sizesC = getMemRefSizes(op, rewriter, matC);
+
+  // Calculate size of the output im2col matrix
+  SmallVector<Value, 8U> outputRowDims = {sizesC[0]};
+  for (unsigned i = 2; i < sizesC.size(); ++i) {
+    outputRowDims.push_back(sizesC[i]);
+  }
+  SmallVector<Value, 8U> outputColDims = {sizesC[1]};
+
+  Value cFlatRowSize = calculateDimsSize(op, rewriter, outputRowDims);
+  Value cFlatColSize = calculateDimsSize(op, rewriter, outputColDims);
+
+  // Allocate the output matrix
+  SmallVector<int64_t, 8U> targetMemRefSizes = {-1, -1};
+  SmallVector<Value, 8U> targetDimSizes = {cFlatRowSize, cFlatColSize};
+  MemRefType targetMemRefType = MemRefType::Builder(
+      targetMemRefSizes, matC.getType().cast<MemRefType>().getElementType());
+
+  Value flatC =
+      rewriter.create<AllocOp>(op->getLoc(), targetMemRefType, targetDimSizes)
+          .getResult();
+
+  // Deallocate the data at the end of block after CIM computations are
+  // finished
+  auto deallocOp =
+      rewriter.create<DeallocOp>(op->getLoc(), flatC).getOperation();
+  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+
+  return flatC;
+}
+
+// Matrix form: C(N*H*W*..., K)
+// Output feature maps: C(N, K, H, W, ...)
+static void col2ImOutput(Operation *op, PatternRewriter &rewriter,
+                         const Value &flatC, const Value &matC) {
+  auto genOp = cast<GenericOp>(op);
+  auto *ctx = genOp.getContext();
+
+  AffineMap mapC = getResultMaps(genOp)[2];
+  std::vector<unsigned> dimsPosC = getDimsPositions(mapC.getResults());
+
+  SmallVector<AffineExpr, 8U> flatLeftDims = {
+      getAffineDimExpr(dimsPosC[0], ctx)};
+  for (unsigned i = 2; i < mapC.getNumResults(); ++i) {
+    flatLeftDims.push_back(getAffineDimExpr(dimsPosC[i], ctx));
+  }
+  SmallVector<AffineExpr, 8U> flatRightDims = {
+      getAffineDimExpr(dimsPosC[1], ctx)};
+
+  auto leftDimsFlatC =
+      AffineMapAttr::get(AffineMap::get(mapC.getNumInputs(), 0, flatLeftDims));
+  auto rightDimsFlatC =
+      AffineMapAttr::get(AffineMap::get(mapC.getNumInputs(), 0, flatRightDims));
+  ArrayAttr dimsFlatC = ArrayAttr::get({leftDimsFlatC, rightDimsFlatC}, ctx);
+
+  AffineMap mapFlatC = combineMaps(dimsFlatC);
+  SmallVector<AffineExpr, 8U> outputPermutation =
+      getPermutation(mapC, mapFlatC, ctx);
+  auto outputPermutationPos = getDimsPositions(outputPermutation);
+
+  reshapeCopy(op, rewriter, flatC, matC, dimsFlatC, outputPermutationPos, true);
+}
+
+// Spatial convolution defined as:
+// A(N, C, H, W, ...)
+// B(K, C, KH, KW, ...)
+// C(N, K, H, W, ...)
+static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
+                                   ConstantOp &tileId, uint32_t tileSize,
+                                   bool minWrites) {
+  auto indexType = rewriter.getIndexType();
+  Value one = createIndexConst(op, rewriter, 1);
+
+  auto matA = op->getOperand(0);
+  auto matB = op->getOperand(1);
+  auto matC = op->getOperand(2);
+
+  SmallVector<Value, 8U> sizesB = getMemRefSizes(op, rewriter, matB);
+  SmallVector<Value, 8U> sizesC = getMemRefSizes(op, rewriter, matC);
+
+  SmallVector<Value, 8U> kernelSizes;
+  for (unsigned i = 2; i < sizesB.size(); ++i) {
+    kernelSizes.push_back(sizesB[i]);
+  }
+
+  SmallVector<Value, 8U> paddingSizes;
+  for (const auto &kernelSize : kernelSizes) {
+    Value paddingSize =
+        rewriter.create<SubIOp>(op->getLoc(), indexType, kernelSize, one);
+    paddingSizes.push_back(paddingSize);
+  }
+
+  Value paddedA = zeroPadConvInput(op, rewriter, matA, paddingSizes);
+  Value flatA = im2ColInputMaps(op, rewriter, paddedA, kernelSizes);
+  rewriter.create<DeallocOp>(op->getLoc(), paddedA).getOperation();
+
+  Value flatB = im2ColKernels(op, rewriter, matB);
+  Value flatC = im2ColAllocateOutput(op, rewriter, matC);
+
+  if (tileSize > 0) {
+    createCIMTiledGEMM(op, rewriter, tileId, flatA, flatB, flatC, tileSize,
+                       minWrites, clNumTiles);
+  } else {
+    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, flatB);
+    rewriter.create<cim::GemmOp>(op->getLoc(), tileId, flatA, flatC);
+    rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+  }
+
+  col2ImOutput(op, rewriter, flatC, matC);
+}
+
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
                                    ConstantOp &tileId, uint32_t tileSize,
                                    bool minWrites) {
@@ -446,6 +841,9 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter,
     rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), cimTileID, matB);
     rewriter.create<cim::GemmOp>(op->getLoc(), cimTileID, matA, matC);
     rewriter.create<cim::BarrierOp>(op->getLoc(), cimTileID);
+  } else if (isConvolution(cast<linalg::GenericOp>(op))) {
+    // rewriter.create<cim::ConvOp>(op->getLoc(), matA, matB, matC);
+    createCIMConvolutionOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else if (isGevm(cast<linalg::GenericOp>(op))) {
     createCIMGevmOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else if (isGemm(cast<linalg::GenericOp>(op))) {
@@ -516,8 +914,9 @@ public:
     target.addLegalDialect<StandardOpsDialect>();
     target.addLegalDialect<loop::LoopOpsDialect>();
     target.addIllegalOp<linalg::MatmulOp>();
-    target.addDynamicallyLegalOp<linalg::GenericOp>(
-        [&](linalg::GenericOp op) { return !isContraction(op); });
+    target.addDynamicallyLegalOp<linalg::GenericOp>([&](linalg::GenericOp op) {
+      return !(isContraction(op) || isConvolution(op));
+    });
 
     if (failed(applyPartialConversion(m, target, patterns)))
       signalPassFailure();

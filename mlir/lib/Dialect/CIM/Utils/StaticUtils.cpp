@@ -1,10 +1,17 @@
 #include "mlir/Dialect/CIM/Utils/StaticUtils.h"
-
 #include "mlir/Support/Functional.h"
+
+#include <algorithm>
 
 using namespace mlir;
 using namespace mlir::linalg;
 using namespace mlir::cim;
+
+bool mlir::cim::isAffineDimOnly(const ArrayRef<AffineExpr> &affineDims) {
+  return std::all_of(affineDims.begin(), affineDims.end(), [](AffineExpr expr) {
+    return expr.getKind() == AffineExprKind::DimId;
+  });
+}
 
 SmallVector<AffineMap, 8U> mlir::cim::getResultMaps(ArrayAttr affineMaps) {
   return functional::map([](AffineMapAttr a) { return a.getValue(); },
