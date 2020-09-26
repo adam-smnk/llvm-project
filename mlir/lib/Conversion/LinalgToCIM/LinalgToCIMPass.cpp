@@ -215,6 +215,118 @@ static bool isConvolution(linalg::GenericOp genericOp) {
   return true;
 }
 
+static Value zeroPadConvInput(Operation *op, PatternRewriter &rewriter,
+                              const Value &memRef,
+                              const ArrayRef<Value> &paddingSizes) {
+  auto indexType = rewriter.getIndexType();
+
+  SmallVector<Value, 8U> memSizes = getMemRefSizes(op, rewriter, memRef);
+
+  assert(memSizes.size() == (paddingSizes.size() + 2) &&
+         "Number of padding dimension does not match the convolution input "
+         "dimensions");
+
+  SmallVector<int64_t, 8U> targetMemRefSizes;
+  for (unsigned i = 0; i < memSizes.size(); ++i) {
+    targetMemRefSizes.push_back(-1);
+  }
+  SmallVector<Value, 8U> targetDimSizes = {memSizes[0], memSizes[1]};
+  for (unsigned i = 2; i < memSizes.size(); ++i) {
+    Value paddedSize = rewriter.create<AddIOp>(
+        op->getLoc(), indexType, memSizes[i], paddingSizes[i - 2]);
+    targetDimSizes.push_back(paddedSize);
+  }
+  MemRefType paddedMemRefType = MemRefType::Builder(
+      targetMemRefSizes, memRef.getType().cast<MemRefType>().getElementType());
+
+  Value paddedMemRef =
+      rewriter.create<AllocOp>(op->getLoc(), paddedMemRefType, targetDimSizes)
+          .getResult();
+  Value zero = createIndexConst(op, rewriter, 0);
+  rewriter.create<FillOp>(op->getLoc(), paddedMemRef, zero);
+
+  Value two = createIndexConst(op, rewriter, 2);
+
+  SmallVector<Value, 8U> paddingOffsets;
+  for (const auto &ps : paddingSizes) {
+    Value sidePaddingSize =
+        rewriter.create<UnsignedDivIOp>(op->getLoc(), indexType, ps, two);
+    // For even-sized dimensions (with odd-sized padding), the extra padding is
+    // added to the beginning of each dimension
+    Value paddingRem =
+        rewriter.create<UnsignedRemIOp>(op->getLoc(), indexType, ps, two);
+    Value offset = rewriter.create<AddIOp>(op->getLoc(), indexType,
+                                           sidePaddingSize, paddingRem);
+    paddingOffsets.push_back(offset);
+  }
+
+  SmallVector<Value, 8U> upperBounds = memSizes;
+  Value lowerBound = zero;
+  Value step = createIndexConst(op, rewriter, 1);
+
+  SmallVector<loop::ForOp, 8U> loops;
+  SmallVector<Value, 8U> loopIterators;
+  for (unsigned i = 0; i < upperBounds.size(); ++i) {
+    auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
+                                             upperBounds[i], step);
+    loops.push_back(loop);
+    loopIterators.push_back(loop.getInductionVar());
+
+    // Set insertion point inside the loop
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  Value element =
+      rewriter.create<LoadOp>(op->getLoc(), memRef, ValueRange(loopIterators));
+
+  SmallVector<Value, 8U> paddedPos = {loopIterators[0], loopIterators[1]};
+  for (unsigned i = 2; i < loopIterators.size(); ++i) {
+    Value offsetPos = rewriter.create<AddIOp>(
+        op->getLoc(), indexType, loopIterators[i], paddingOffsets[i - 2]);
+    paddedPos.push_back(offsetPos);
+  }
+
+  rewriter.create<StoreOp>(op->getLoc(), element, paddedMemRef,
+                           ValueRange(paddedPos));
+
+  // Set insertion point back at main body outside of the loops
+  rewriter.setInsertionPointAfter(loops.front());
+
+  return paddedMemRef;
+}
+
+static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
+                                   ConstantOp &tileId, uint32_t tileSize,
+                                   bool minWrites) {
+  auto genOp = cast<GenericOp>(op);
+  auto *ctx = genOp.getContext();
+
+  auto indexType = rewriter.getIndexType();
+  Value one = createIndexConst(op, rewriter, 1);
+
+  auto matA = op->getOperand(0);
+  auto matB = op->getOperand(1);
+  auto matC = op->getOperand(2);
+
+  auto resultDims = getResultDims(genOp);
+
+  auto dimsA = resultDims[0];
+  auto dimsB = resultDims[1];
+  auto dimsC = resultDims[2];
+
+  SmallVector<Value, 8U> sizesB = getMemRefSizes(op, rewriter, matB);
+  SmallVector<Value, 8U> sizesC = getMemRefSizes(op, rewriter, matC);
+
+  SmallVector<Value, 8U> paddingSizes;
+  for (unsigned i = 2; i < dimsB.size(); ++i) {
+    Value paddingSize =
+        rewriter.create<SubIOp>(op->getLoc(), indexType, sizesB[i], one);
+    paddingSizes.push_back(paddingSize);
+  }
+
+  Value paddedA = zeroPadConvInput(op, rewriter, matA, paddingSizes);
+}
+
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
                                    ConstantOp &tileId, uint32_t tileSize,
                                    bool minWrites) {
