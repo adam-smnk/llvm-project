@@ -334,6 +334,12 @@ static Value im2ColInputMaps(Operation *op, PatternRewriter &rewriter,
       rewriter.create<AllocOp>(op->getLoc(), targetMemRefType, targetDimSizes)
           .getResult();
 
+  // Deallocate the data at the end of block after CIM computations are
+  // finished
+  auto deallocOp =
+      rewriter.create<DeallocOp>(op->getLoc(), flatA).getOperation();
+  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+
   // Create loops
   Value lowerBound = zero;
   Value step = one;
@@ -354,6 +360,39 @@ static Value im2ColInputMaps(Operation *op, PatternRewriter &rewriter,
   }
 
   // Copy input map patches
+  SmallVector<Value, 8U> kernelIters(loopIterators.end() - kernelSizes.size(),
+                                     loopIterators.end());
+  SmallVector<Value, 8U> inputMapIters(
+      loopIterators.begin() + 1, loopIterators.begin() + outputRowDims.size());
+
+  SmallVector<Value, 8U> inputIters = {loopIterators[0],
+                                       loopIterators[outputRowDims.size()]};
+  for (unsigned i = 0; i < inputMapIters.size(); ++i) {
+    Value elementPos = rewriter.create<AddIOp>(
+        op->getLoc(), indexType, inputMapIters[i], kernelIters[i]);
+    inputIters.push_back(elementPos);
+  }
+
+  Value element =
+      rewriter.create<LoadOp>(op->getLoc(), matA, ValueRange(inputIters));
+
+  SmallVector<Value, 8U> outputRowIters(
+      loopIterators.begin(), loopIterators.begin() + outputRowDims.size());
+  SmallVector<Value, 8U> outputColIters(
+      loopIterators.begin() + outputRowDims.size(), loopIterators.end());
+
+  SmallVector<Value, 8U> outputRowStrides =
+      calculateDimsStrides(op, rewriter, outputRowIters);
+  SmallVector<Value, 8U> outputColStrides =
+      calculateDimsStrides(op, rewriter, outputColIters);
+
+  Value outputRowPos =
+      calculateLinearIndex(op, rewriter, outputRowIters, outputRowStrides);
+  Value outputColPos =
+      calculateLinearIndex(op, rewriter, outputColIters, outputColStrides);
+
+  rewriter.create<StoreOp>(op->getLoc(), element, flatA,
+                           ValueRange({outputRowPos, outputColPos}));
 
   // Set insertion point back at main body outside of the loops
   rewriter.setInsertionPointAfter(loops.front());
@@ -365,6 +404,27 @@ static Value im2ColInputMaps(Operation *op, PatternRewriter &rewriter,
 // Matrix form: B_col(C*KH*KW*..., K)
 static Value im2ColKernels(Operation *op, PatternRewriter &rewriter,
                            const Value &matB) {
+  auto genOp = cast<GenericOp>(op);
+  auto *ctx = genOp.getContext();
+
+  AffineMap mapB = getResultMaps(genOp)[1];
+  SmallVector<AffineExpr, 8U> reqLeftDims;
+  for (unsigned i = 1; i < mapB.getNumResults(); ++i) {
+    reqLeftDims.push_back(mapB.getResult(i));
+  }
+  SmallVector<AffineExpr, 8U> reqRightDims = {mapB.getResult(0)};
+
+  auto leftDimsFlatB =
+      AffineMapAttr::get(AffineMap::get(mapB.getNumInputs(), 0, reqLeftDims));
+  auto rightDimsFlatB =
+      AffineMapAttr::get(AffineMap::get(mapB.getNumInputs(), 0, reqRightDims));
+
+  return groupDimensions(op, rewriter, matB, mapB,
+                         ArrayAttr::get({leftDimsFlatB, rightDimsFlatB}, ctx));
+}
+
+static Value col2ImOutput(Operation *op, PatternRewriter &rewriter,
+                          const Value &flatC, const Value &matC) {
   void;
 }
 
