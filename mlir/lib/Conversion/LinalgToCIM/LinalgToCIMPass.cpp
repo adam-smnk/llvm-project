@@ -242,9 +242,13 @@ static Value zeroPadConvInput(Operation *op, PatternRewriter &rewriter,
   Value paddedMemRef =
       rewriter.create<AllocOp>(op->getLoc(), paddedMemRefType, targetDimSizes)
           .getResult();
-  Value zero = createIndexConst(op, rewriter, 0);
-  rewriter.create<FillOp>(op->getLoc(), paddedMemRef, zero);
+  Value zeroVal = rewriter.create<ConstantOp>(
+      op->getLoc(),
+      rewriter.getIntegerAttr(
+          paddedMemRef.getType().cast<MemRefType>().getElementType(), 0));
+  rewriter.create<FillOp>(op->getLoc(), paddedMemRef, zeroVal);
 
+  Value zero = createIndexConst(op, rewriter, 0);
   Value two = createIndexConst(op, rewriter, 2);
 
   SmallVector<Value, 8U> paddingOffsets;
@@ -311,7 +315,7 @@ static Value im2ColInputMaps(Operation *op, PatternRewriter &rewriter,
   for (unsigned i = 2; i < sizesA.size(); ++i) {
     // outputDimSize = (dimSize - kernelSize) + 1
     Value sizeDimMinusKernel = rewriter.create<SubIOp>(
-        op->getLoc(), indexType, sizesA[i], kernelSizes[i - 1]);
+        op->getLoc(), indexType, sizesA[i], kernelSizes[i - 2]);
     Value outputDimSize = rewriter.create<AddIOp>(op->getLoc(), indexType,
                                                   sizeDimMinusKernel, one);
     outputRowDims.push_back(outputDimSize);
@@ -512,10 +516,14 @@ static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
   SmallVector<Value, 8U> sizesB = getMemRefSizes(op, rewriter, matB);
   SmallVector<Value, 8U> sizesC = getMemRefSizes(op, rewriter, matC);
 
+  llvm::errs() << "sizesB " << sizesB.size() << "\n";
+
   SmallVector<Value, 8U> kernelSizes;
-  for (unsigned i = 2; i < dimsB.size(); ++i) {
+  for (unsigned i = 2; i < sizesB.size(); ++i) {
     kernelSizes.push_back(sizesB[i]);
   }
+
+  llvm::errs() << "after loop \n";
 
   SmallVector<Value, 8U> paddingSizes;
   for (const auto &kernelSize : kernelSizes) {
@@ -524,11 +532,23 @@ static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
     paddingSizes.push_back(paddingSize);
   }
 
+  llvm::errs() << "after pad \n";
+
   Value paddedA = zeroPadConvInput(op, rewriter, matA, paddingSizes);
 
-  Value flatA = im2ColInputMaps(op, rewriter, matA, kernelSizes);
+  llvm::errs() << "after zero pad \n";
+
+  Value flatA = im2ColInputMaps(op, rewriter, paddedA, kernelSizes);
+
+  llvm::errs() << "after im2col input \n";
+
   Value flatB = im2ColKernels(op, rewriter, matB);
+
+  llvm::errs() << "after im2col kernel \n";
+
   Value flatC = im2ColAllocateOutput(op, rewriter, matC);
+
+  llvm::errs() << "after im2col alloc \n";
 
   if (tileSize > 0) {
     createCIMTiledGEMM(op, rewriter, tileId, flatA, flatB, flatC, tileSize,
@@ -847,7 +867,8 @@ static void replaceOpWithCIMMatmul(Operation *op, PatternRewriter &rewriter,
     rewriter.create<cim::GemmOp>(op->getLoc(), cimTileID, matA, matC);
     rewriter.create<cim::BarrierOp>(op->getLoc(), cimTileID);
   } else if (isConvolution(cast<linalg::GenericOp>(op))) {
-    rewriter.create<cim::ConvOp>(op->getLoc(), matA, matB, matC);
+    // rewriter.create<cim::ConvOp>(op->getLoc(), matA, matB, matC);
+    createCIMConvolutionOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else if (isGevm(cast<linalg::GenericOp>(op))) {
     createCIMGevmOp(op, rewriter, cimTileID, tileSize, minWrites);
   } else if (isGemm(cast<linalg::GenericOp>(op))) {
