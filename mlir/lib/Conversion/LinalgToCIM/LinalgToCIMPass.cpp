@@ -423,20 +423,73 @@ static Value im2ColKernels(Operation *op, PatternRewriter &rewriter,
                          ArrayAttr::get({leftDimsFlatB, rightDimsFlatB}, ctx));
 }
 
-static Value col2ImOutput(Operation *op, PatternRewriter &rewriter,
-                          const Value &flatC, const Value &matC) {
-  void;
+// Output feature maps: C(N, K, H, W, ...)
+// Matrix form: C(N*H*W*..., K)
+static Value im2ColAllocateOutput(Operation *op, PatternRewriter &rewriter,
+                                  const Value &matC) {
+  SmallVector<Value, 8U> sizesC = getMemRefSizes(op, rewriter, matC);
+
+  // Calculate size of the output im2col matrix
+  SmallVector<Value, 8U> outputRowDims = {sizesC[0]};
+  for (unsigned i = 2; i < sizesC.size(); ++i) {
+    outputRowDims.push_back(sizesC[i]);
+  }
+  SmallVector<Value, 8U> outputColDims = {sizesC[1]};
+
+  Value cFlatRowSize = calculateDimsSize(op, rewriter, outputRowDims);
+  Value cFlatColSize = calculateDimsSize(op, rewriter, outputColDims);
+
+  // Allocate the output matrix
+  SmallVector<int64_t, 8U> targetMemRefSizes = {-1, -1};
+  SmallVector<Value, 8U> targetDimSizes = {cFlatRowSize, cFlatColSize};
+  MemRefType targetMemRefType = MemRefType::Builder(
+      targetMemRefSizes, matC.getType().cast<MemRefType>().getElementType());
+
+  Value flatC =
+      rewriter.create<AllocOp>(op->getLoc(), targetMemRefType, targetDimSizes)
+          .getResult();
+
+  // Deallocate the data at the end of block after CIM computations are
+  // finished
+  auto deallocOp =
+      rewriter.create<DeallocOp>(op->getLoc(), flatC).getOperation();
+  deallocOp->moveBefore(&(deallocOp->getBlock()->back()));
+
+  return flatC;
 }
 
-static Value convolutionIm2Col(Operation *op, PatternRewriter &rewriter,
-                               ConstantOp &tileId, const Value &matA,
-                               const Value &matB, const Value &matC,
-                               uint32_t tileSize, bool minWrites,
-                               unsigned numTilesOption) {
+// Matrix form: C(N*H*W*..., K)
+// Output feature maps: C(N, K, H, W, ...)
+static void col2ImOutput(Operation *op, PatternRewriter &rewriter,
+                         const Value &flatC, const Value &matC) {
   auto genOp = cast<GenericOp>(op);
   auto *ctx = genOp.getContext();
+
+  AffineMap mapC = getResultMaps(genOp)[2];
+  SmallVector<AffineExpr, 8U> flatLeftDims = {mapC.getResult(0)};
+  for (unsigned i = 2; i < mapC.getNumResults(); ++i) {
+    flatLeftDims.push_back(mapC.getResult(i));
+  }
+  SmallVector<AffineExpr, 8U> flatRightDims = {mapC.getResult(1)};
+
+  auto leftDimsFlatC =
+      AffineMapAttr::get(AffineMap::get(mapC.getNumInputs(), 0, flatLeftDims));
+  auto rightDimsFlatC =
+      AffineMapAttr::get(AffineMap::get(mapC.getNumInputs(), 0, flatRightDims));
+  ArrayAttr dimsFlatC = ArrayAttr::get({leftDimsFlatC, rightDimsFlatC}, ctx);
+
+  AffineMap mapFlatC = combineMaps(dimsFlatC);
+  SmallVector<AffineExpr, 8U> outputPermutation =
+      getPermutation(mapFlatC, mapC, ctx);
+  auto outputPermutationPos = getDimsPositions(outputPermutation);
+
+  reshapeCopy(op, rewriter, flatC, matC, dimsFlatC, outputPermutationPos, true);
 }
 
+// Spatial convolution defined as:
+// A(N, C, H, W, ...)
+// B(K, C, KH, KW, ...)
+// C(N, K, H, W, ...)
 static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
                                    ConstantOp &tileId, uint32_t tileSize,
                                    bool minWrites) {
@@ -459,14 +512,34 @@ static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
   SmallVector<Value, 8U> sizesB = getMemRefSizes(op, rewriter, matB);
   SmallVector<Value, 8U> sizesC = getMemRefSizes(op, rewriter, matC);
 
-  SmallVector<Value, 8U> paddingSizes;
+  SmallVector<Value, 8U> kernelSizes;
   for (unsigned i = 2; i < dimsB.size(); ++i) {
+    kernelSizes.push_back(sizesB[i]);
+  }
+
+  SmallVector<Value, 8U> paddingSizes;
+  for (const auto &kernelSize : kernelSizes) {
     Value paddingSize =
-        rewriter.create<SubIOp>(op->getLoc(), indexType, sizesB[i], one);
+        rewriter.create<SubIOp>(op->getLoc(), indexType, kernelSize, one);
     paddingSizes.push_back(paddingSize);
   }
 
   Value paddedA = zeroPadConvInput(op, rewriter, matA, paddingSizes);
+
+  Value flatA = im2ColInputMaps(op, rewriter, matA, kernelSizes);
+  Value flatB = im2ColKernels(op, rewriter, matB);
+  Value flatC = im2ColAllocateOutput(op, rewriter, matC);
+
+  if (tileSize > 0) {
+    createCIMTiledGEMM(op, rewriter, tileId, flatA, flatB, flatC, tileSize,
+                       minWrites, clNumTiles);
+  } else {
+    rewriter.create<cim::WriteToCrossbarOp>(op->getLoc(), tileId, flatB);
+    rewriter.create<cim::GemmOp>(op->getLoc(), tileId, flatA, flatC);
+    rewriter.create<cim::BarrierOp>(op->getLoc(), tileId);
+  }
+
+  col2ImOutput(op, rewriter, flatC, matC);
 }
 
 static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
