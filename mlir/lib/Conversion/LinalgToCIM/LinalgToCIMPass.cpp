@@ -540,6 +540,8 @@ static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
 
   Value flatA = im2ColInputMaps(op, rewriter, paddedA, kernelSizes);
 
+  rewriter.create<DeallocOp>(op->getLoc(), paddedA).getOperation();
+
   llvm::errs() << "after im2col input \n";
 
   Value flatB = im2ColKernels(op, rewriter, matB);
