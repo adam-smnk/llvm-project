@@ -295,6 +295,88 @@ static Value zeroPadConvInput(Operation *op, PatternRewriter &rewriter,
   return paddedMemRef;
 }
 
+// Input feature maps: A(N, C, H, W, ...)
+// Matrix form: A_col(N*H*W*..., C*KH*KW*...)
+static Value im2ColInputMaps(Operation *op, PatternRewriter &rewriter,
+                             const Value &matA,
+                             const ArrayRef<Value> &kernelSizes) {
+  Value zero = createIndexConst(op, rewriter, 0);
+  Value one = createIndexConst(op, rewriter, 1);
+  auto indexType = rewriter.getIndexType();
+
+  SmallVector<Value, 8U> sizesA = getMemRefSizes(op, rewriter, matA);
+
+  // Calculate size of the output im2col matrix
+  SmallVector<Value, 8U> outputRowDims = {sizesA[0]};
+  for (unsigned i = 2; i < sizesA.size(); ++i) {
+    // outputDimSize = (dimSize - kernelSize) + 1
+    Value sizeDimMinusKernel = rewriter.create<SubIOp>(
+        op->getLoc(), indexType, sizesA[i], kernelSizes[i - 1]);
+    Value outputDimSize = rewriter.create<AddIOp>(op->getLoc(), indexType,
+                                                  sizeDimMinusKernel, one);
+    outputRowDims.push_back(outputDimSize);
+  }
+  SmallVector<Value, 8U> outputColDims = {sizesA[1]};
+  for (const auto &kSize : kernelSizes) {
+    outputColDims.push_back(kSize);
+  }
+
+  Value aFlatRowSize = calculateDimsSize(op, rewriter, outputRowDims);
+  Value aFlatColSize = calculateDimsSize(op, rewriter, outputColDims);
+
+  // Allocate the output matrix
+  SmallVector<int64_t, 8U> targetMemRefSizes = {-1, -1};
+  SmallVector<Value, 8U> targetDimSizes = {aFlatRowSize, aFlatColSize};
+  MemRefType targetMemRefType = MemRefType::Builder(
+      targetMemRefSizes, matA.getType().cast<MemRefType>().getElementType());
+
+  Value flatA =
+      rewriter.create<AllocOp>(op->getLoc(), targetMemRefType, targetDimSizes)
+          .getResult();
+
+  // Create loops
+  Value lowerBound = zero;
+  Value step = one;
+  SmallVector<Value, 8U> upperBounds(outputRowDims);
+  upperBounds.insert(upperBounds.end(), outputColDims.begin(),
+                     outputColDims.end());
+
+  SmallVector<loop::ForOp, 8U> loops;
+  SmallVector<Value, 8U> loopIterators;
+  for (unsigned i = 0; i < upperBounds.size(); ++i) {
+    auto loop = rewriter.create<loop::ForOp>(op->getLoc(), lowerBound,
+                                             upperBounds[i], step);
+    loops.push_back(loop);
+    loopIterators.push_back(loop.getInductionVar());
+
+    // Set insertion point inside the loop
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  // Copy input map patches
+
+  // Set insertion point back at main body outside of the loops
+  rewriter.setInsertionPointAfter(loops.front());
+
+  return flatA;
+}
+
+// Kernels: B(K, C, KH, KW, ...)
+// Matrix form: B_col(C*KH*KW*..., K)
+static Value im2ColKernels(Operation *op, PatternRewriter &rewriter,
+                           const Value &matB) {
+  void;
+}
+
+static Value convolutionIm2Col(Operation *op, PatternRewriter &rewriter,
+                               ConstantOp &tileId, const Value &matA,
+                               const Value &matB, const Value &matC,
+                               uint32_t tileSize, bool minWrites,
+                               unsigned numTilesOption) {
+  auto genOp = cast<GenericOp>(op);
+  auto *ctx = genOp.getContext();
+}
+
 static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
                                    ConstantOp &tileId, uint32_t tileSize,
                                    bool minWrites) {
