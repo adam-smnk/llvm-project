@@ -470,11 +470,15 @@ static void col2ImOutput(Operation *op, PatternRewriter &rewriter,
   auto *ctx = genOp.getContext();
 
   AffineMap mapC = getResultMaps(genOp)[2];
-  SmallVector<AffineExpr, 8U> flatLeftDims = {mapC.getResult(0)};
+  std::vector<unsigned> dimsPosC = getDimsPositions(mapC.getResults());
+
+  SmallVector<AffineExpr, 8U> flatLeftDims = {
+      getAffineDimExpr(dimsPosC[0], ctx)};
   for (unsigned i = 2; i < mapC.getNumResults(); ++i) {
-    flatLeftDims.push_back(mapC.getResult(i));
+    flatLeftDims.push_back(getAffineDimExpr(dimsPosC[i], ctx));
   }
-  SmallVector<AffineExpr, 8U> flatRightDims = {mapC.getResult(1)};
+  SmallVector<AffineExpr, 8U> flatRightDims = {
+      getAffineDimExpr(dimsPosC[1], ctx)};
 
   auto leftDimsFlatC =
       AffineMapAttr::get(AffineMap::get(mapC.getNumInputs(), 0, flatLeftDims));
@@ -484,7 +488,7 @@ static void col2ImOutput(Operation *op, PatternRewriter &rewriter,
 
   AffineMap mapFlatC = combineMaps(dimsFlatC);
   SmallVector<AffineExpr, 8U> outputPermutation =
-      getPermutation(mapFlatC, mapC, ctx);
+      getPermutation(mapC, mapFlatC, ctx);
   auto outputPermutationPos = getDimsPositions(outputPermutation);
 
   reshapeCopy(op, rewriter, flatC, matC, dimsFlatC, outputPermutationPos, true);
