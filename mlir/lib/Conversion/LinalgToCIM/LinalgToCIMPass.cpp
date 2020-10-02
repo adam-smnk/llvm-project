@@ -165,13 +165,11 @@ static bool isConvolution(linalg::GenericOp genericOp) {
           resultDims.begin(), resultDims.end(), [&](ArrayRef<AffineExpr> dims) {
             return (dims.size() == dimsASize) && (dims.size() >= minDimNum);
           })) {
-    llvm::errs() << "Dim sizes wrong\n";
     return false;
   }
 
   // B and C maps must contain only dimension expressions
   if (!isAffineDimOnly(dimsB) || !isAffineDimOnly(dimsC)) {
-    llvm::errs() << "B C not only dims\n";
     return false;
   }
 
@@ -184,14 +182,12 @@ static bool isConvolution(linalg::GenericOp genericOp) {
   if (!(std::all_of(dimsA.begin() + 2, dimsA.end(), [](AffineExpr expr) {
         return expr.getKind() == AffineExprKind::Add;
       }))) {
-    llvm::errs() << "Affine add A false\n";
     return false;
   }
 
   // Check if number of outputs is correct as per:
   // A(N,C,...) B(K,C,...) C(N,K,...)
   if ((dimsC[0] != dimsA[0]) || (dimsC[1] != dimsB[0])) {
-    llvm::errs() << "Output 0 1 false\n";
     return false;
   }
 
@@ -207,7 +203,6 @@ static bool isConvolution(linalg::GenericOp genericOp) {
         getAffineBinaryOpExpr(AffineExprKind::Add, dimsC[i], dimsB[i]);
 
     if ((aAddExpr != bcAddExpr) && (aAddExpr != cbAddExpr)) {
-      llvm::errs() << "Affine add input output false\n";
       return false;
     }
   }
@@ -520,14 +515,10 @@ static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
   SmallVector<Value, 8U> sizesB = getMemRefSizes(op, rewriter, matB);
   SmallVector<Value, 8U> sizesC = getMemRefSizes(op, rewriter, matC);
 
-  llvm::errs() << "sizesB " << sizesB.size() << "\n";
-
   SmallVector<Value, 8U> kernelSizes;
   for (unsigned i = 2; i < sizesB.size(); ++i) {
     kernelSizes.push_back(sizesB[i]);
   }
-
-  llvm::errs() << "after loop \n";
 
   SmallVector<Value, 8U> paddingSizes;
   for (const auto &kernelSize : kernelSizes) {
@@ -536,25 +527,12 @@ static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
     paddingSizes.push_back(paddingSize);
   }
 
-  llvm::errs() << "after pad \n";
-
   Value paddedA = zeroPadConvInput(op, rewriter, matA, paddingSizes);
-
-  llvm::errs() << "after zero pad \n";
-
   Value flatA = im2ColInputMaps(op, rewriter, paddedA, kernelSizes);
-
   rewriter.create<DeallocOp>(op->getLoc(), paddedA).getOperation();
 
-  llvm::errs() << "after im2col input \n";
-
   Value flatB = im2ColKernels(op, rewriter, matB);
-
-  llvm::errs() << "after im2col kernel \n";
-
   Value flatC = im2ColAllocateOutput(op, rewriter, matC);
-
-  llvm::errs() << "after im2col alloc \n";
 
   if (tileSize > 0) {
     createCIMTiledGEMM(op, rewriter, tileId, flatA, flatB, flatC, tileSize,
