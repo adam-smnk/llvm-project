@@ -386,9 +386,9 @@ static Value im2ColInputMaps(Operation *op, PatternRewriter &rewriter,
       loopIterators.begin() + outputRowDims.size(), loopIterators.end());
 
   SmallVector<Value, 8U> outputRowStrides =
-      calculateDimsStrides(op, rewriter, outputRowIters);
+      calculateDimsStrides(op, rewriter, outputRowDims);
   SmallVector<Value, 8U> outputColStrides =
-      calculateDimsStrides(op, rewriter, outputColIters);
+      calculateDimsStrides(op, rewriter, outputColDims);
 
   Value outputRowPos =
       calculateLinearIndex(op, rewriter, outputRowIters, outputRowStrides);
