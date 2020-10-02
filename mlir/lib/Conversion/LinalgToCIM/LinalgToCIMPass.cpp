@@ -496,21 +496,12 @@ static void col2ImOutput(Operation *op, PatternRewriter &rewriter,
 static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
                                    ConstantOp &tileId, uint32_t tileSize,
                                    bool minWrites) {
-  auto genOp = cast<GenericOp>(op);
-  auto *ctx = genOp.getContext();
-
   auto indexType = rewriter.getIndexType();
   Value one = createIndexConst(op, rewriter, 1);
 
   auto matA = op->getOperand(0);
   auto matB = op->getOperand(1);
   auto matC = op->getOperand(2);
-
-  auto resultDims = getResultDims(genOp);
-
-  auto dimsA = resultDims[0];
-  auto dimsB = resultDims[1];
-  auto dimsC = resultDims[2];
 
   SmallVector<Value, 8U> sizesB = getMemRefSizes(op, rewriter, matB);
   SmallVector<Value, 8U> sizesC = getMemRefSizes(op, rewriter, matC);
