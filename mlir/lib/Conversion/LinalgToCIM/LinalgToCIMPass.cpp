@@ -619,7 +619,7 @@ static void createCIMContractionOp(Operation *op, PatternRewriter &rewriter,
 
   AffineMap mapFlatC = combineMaps(dimsFlatC);
   SmallVector<AffineExpr, 8U> outputPermutation =
-      getPermutation(mapFlatC, mapC, ctx);
+      getPermutation(mapC, mapFlatC, ctx);
   auto outputPermutationPos = getDimsPositions(outputPermutation);
 
   // Unflatten the contraction result and copy to the output tensor
