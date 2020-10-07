@@ -526,6 +526,12 @@ static void createCIMConvolutionOp(Operation *op, PatternRewriter &rewriter,
   Value flatC = im2ColAllocateOutput(op, rewriter, matC);
 
   if (tileSize > 0) {
+    Value zero = rewriter.create<ConstantOp>(
+        op->getLoc(),
+        rewriter.getIntegerAttr(
+            flatC.getType().cast<MemRefType>().getElementType(), 0));
+    rewriter.create<FillOp>(op->getLoc(), flatC, zero);
+
     createCIMTiledGEMM(op, rewriter, tileId, flatA, flatB, flatC, tileSize,
                        minWrites, clNumTiles);
   } else {
