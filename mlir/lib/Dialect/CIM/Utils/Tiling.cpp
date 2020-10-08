@@ -143,8 +143,9 @@ static void populateTiledGEMMLoops(
   }
 
   if (minWrites) {
+    tileC = allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, true);
+
     for (unsigned i = 0; i < numCimTiles; ++i) {
-      tileC = allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, true);
       partRes.push_back(
           allocateTile(op, rewriter, matC, iterM, iterN, sizeTile, false));
     }
