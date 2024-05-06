@@ -1162,7 +1162,7 @@ packMatmulGreedily(RewriterBase &rewriter, LinalgOp linalgOp,
                    ArrayRef<int64_t> mnkPaddedSizesNextMultipleOf,
                    ArrayRef<int64_t> mnkOrder);
 
-struct PackMatmulOptions {
+struct BlockPackMatmulOptions {
   /// Minor block factors (mb, nb, kb) for packing relayout where mb, mn are
   /// the parallel dimensions and kb is the reduction dimension.
   SmallVector<int64_t, 3> blockFactors;
@@ -1195,7 +1195,7 @@ struct PackMatmulOptions {
 /// Lack of packing options indicates that no valid configuration could be
 /// assigned and the operation will not be packed.
 using ControlPackMatmulFn =
-    std::function<std::optional<PackMatmulOptions>(linalg::LinalgOp)>;
+    std::function<std::optional<BlockPackMatmulOptions>(linalg::LinalgOp)>;
 
 /// Pack a matmul operation into blocked 4D layout.
 ///
@@ -1205,14 +1205,19 @@ using ControlPackMatmulFn =
 ///   - minor 2D blocks - inner dimensions, consist of scalar elements
 ///
 /// A 2D matmul MxNxK gets reshaped into blocked 4D representation
-/// as: [MB][NB][mb][nb] += [MB][KB][mb][kb] * [NB][KB][kb][nb]
+/// as: [MB][NB][mb][nb] += [MB][KB][mb][kb] * [NB][KB][nb][kb]
 /// where the (MB, NB, KB) dimensions represent the major blocks,
 /// and the (mb, nb, kb) are the minor blocks of their respective
 /// original 2D dimensions (M, N, K).
 ///
-/// The RHS operand gets 'block transposed' i.e., the major blocks [KB][NB]
-/// get transposed to [NB][KB] layout. The minor blocks remain unchanged.
-/// The final result is unpacked back to the original layout.
+/// Depending on the initial operands' data layout and the specified
+/// packing options, both the major blocks dimensions might get transposed
+/// e.g., [MB][KB] -> [KB][MB]. The minor blocks can also be transposed
+/// e.g., [mb][kb] -> [kb][mb].
+/// Any present batch dimensions remain unchanged.
+/// The final result is unpacked back to the original shape.
+///
+/// Return failure if no valid packing options are provided.
 FailureOr<PackResult>
 blockPackMatmul(RewriterBase &rewriter, linalg::LinalgOp matmulOp,
                 const ControlPackMatmulFn &controlPackMatmul);

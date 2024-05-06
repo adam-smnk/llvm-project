@@ -145,7 +145,7 @@ linalg::blockPackMatmul(RewriterBase &rewriter, linalg::LinalgOp matmulOp,
   if (matmulOp.hasPureBufferSemantics())
     return rewriter.notifyMatchFailure(matmulOp, "require tensor semantics");
 
-  std::optional<PackMatmulOptions> options = controlPackMatmul(matmulOp);
+  std::optional<BlockPackMatmulOptions> options = controlPackMatmul(matmulOp);
   if (!options)
     return rewriter.notifyMatchFailure(matmulOp, "invalid packing options");
 
@@ -248,8 +248,8 @@ struct LinalgBlockPackMatmul
     RewritePatternSet patterns(&getContext());
 
     ControlPackMatmulFn controlFn =
-        [&](linalg::LinalgOp op) -> PackMatmulOptions {
-      PackMatmulOptions options;
+        [&](linalg::LinalgOp op) -> BlockPackMatmulOptions {
+      BlockPackMatmulOptions options;
       options.blockFactors = SmallVector<int64_t>{*blockFactors};
       options.allowPadding = allowPadding;
       options.mnkPaddedSizesNextMultipleOf =
