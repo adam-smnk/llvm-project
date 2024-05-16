@@ -988,6 +988,66 @@ func.func @no_bubble_up_pack_through_non_divisible_collapse(%1: tensor<3072x64x4
 
 // -----
 
+func.func @bubble_up_pack_through_expand(%arg0: tensor<32x64xf32>) -> tensor<4x2x64x4xf32> {
+  %empty = tensor.empty() : tensor<4x2x64x4xf32>
+  %expanded = tensor.expand_shape %arg0 [[0, 1], [2]] output_shape [4, 8, 64] : tensor<32x64xf32> into tensor<4x8x64xf32>
+  %pack = tensor.pack %expanded inner_dims_pos = [1] inner_tiles = [4] into %empty : tensor<4x8x64xf32> -> tensor<4x2x64x4xf32>
+  return %pack : tensor<4x2x64x4xf32>
+}
+// CHECK-LABEL: func.func @bubble_up_pack_through_expand(
+// CHECK-SAME:      %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK:         %[[EMPTY:.+]] = tensor.empty() : tensor<8x64x4xf32>
+// CHECK:         %[[PACK:.+]] = tensor.pack %[[ARG0]] inner_dims_pos = [0] inner_tiles = [4] into %[[EMPTY]] : tensor<32x64xf32> -> tensor<8x64x4xf32>
+// CHECK:         %[[EXPANDED:.+]] = tensor.expand_shape %[[PACK]] {{\[}}[0, 1], [2], [3]] output_shape [4, 2, 64, 4] : tensor<8x64x4xf32> into tensor<4x2x64x4xf32>
+// CHECK:         return %[[EXPANDED]] : tensor<4x2x64x4xf32>
+
+// -----
+
+func.func @bubble_up_pack_through_expand_multi_dim(%arg0: tensor<32x64x16xf32>) -> tensor<2x2x4x16x8x2x4x2xf32> {
+  %empty = tensor.empty() : tensor<2x2x4x16x8x2x4x2xf32>
+  %expanded = tensor.expand_shape %arg0 [[0, 1, 2], [3], [4]] output_shape [2, 4, 4, 64, 16] : tensor<32x64x16xf32> into tensor<2x4x4x64x16xf32>
+  %pack = tensor.pack %expanded inner_dims_pos = [1, 3, 4] inner_tiles = [2, 4, 2] into %empty : tensor<2x4x4x64x16xf32> -> tensor<2x2x4x16x8x2x4x2xf32>
+  return %pack : tensor<2x2x4x16x8x2x4x2xf32>
+}
+// CHECK-LABEL: func.func @bubble_up_pack_through_expand_multi_dim(
+// CHECK-SAME:      %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK:         %[[EMPTY:.+]] = tensor.empty() : tensor<16x16x8x2x4x2xf32>
+// CHECK:         %[[PACK:.+]] = tensor.pack %[[ARG0]] inner_dims_pos = [0, 1, 2] inner_tiles = [2, 4, 2] into %[[EMPTY]] : tensor<32x64x16xf32> -> tensor<16x16x8x2x4x2xf32>
+// CHECK:         %[[EXPANDED:.+]] = tensor.expand_shape %[[PACK]] {{\[}}[0, 1, 2], [3], [4], [5], [6], [7]] output_shape [2, 2, 4, 16, 8, 2, 4, 2] : tensor<16x16x8x2x4x2xf32> into tensor<2x2x4x16x8x2x4x2xf32>
+// CHECK:         return %[[EXPANDED]] : tensor<2x2x4x16x8x2x4x2xf32>
+
+// -----
+
+func.func @no_bubble_up_pack_through_expand(%arg0: tensor<32x64xf32>) -> tensor<2x2x64x2x4xf32> {
+  %empty = tensor.empty() : tensor<2x2x64x2x4xf32>
+  %expanded = tensor.expand_shape %arg0 [[0, 1], [2]] output_shape [4, 8, 64] : tensor<32x64xf32> into tensor<4x8x64xf32>
+  %pack = tensor.pack %expanded inner_dims_pos = [0, 1] inner_tiles = [2, 4] into %empty : tensor<4x8x64xf32> -> tensor<2x2x64x2x4xf32>
+  return %pack : tensor<2x2x64x2x4xf32>
+}
+// CHECK-LABEL: func.func @no_bubble_up_pack_through_expand(
+// CHECK-SAME:      %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK:         %[[EMPTY:.+]] = tensor.empty() : tensor<2x2x64x2x4xf32>
+// CHECK:         %[[EXPANDED:.+]] = tensor.expand_shape %[[ARG0]] {{\[}}[0, 1], [2]] output_shape [4, 8, 64] : tensor<32x64xf32> into tensor<4x8x64xf32>
+// CHECK:         %[[PACK:.+]] = tensor.pack %[[EXPANDED]] inner_dims_pos = [0, 1] inner_tiles = [2, 4] into %[[EMPTY]] : tensor<4x8x64xf32> -> tensor<2x2x64x2x4xf32>
+// CHECK:         return %[[PACK]] : tensor<2x2x64x2x4xf32>
+
+// -----
+
+func.func @no_bubble_up_pack_through_expand_middle_dims(%arg0: tensor<32x64x16xf32>) -> tensor<8x2x32x16x4xf32> {
+  %empty = tensor.empty() : tensor<8x2x32x16x4xf32>
+  %expanded = tensor.expand_shape %arg0 [[0], [1, 2], [3]] output_shape [32, 2, 32, 16] : tensor<32x64x16xf32> into tensor<32x2x32x16xf32>
+  %pack = tensor.pack %expanded inner_dims_pos = [0] inner_tiles = [4] into %empty : tensor<32x2x32x16xf32> -> tensor<8x2x32x16x4xf32>
+  return %pack : tensor<8x2x32x16x4xf32>
+}
+// CHECK-LABEL: func.func @no_bubble_up_pack_through_expand_middle_dims(
+// CHECK-SAME:      %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK:         %[[EMPTY:.+]] = tensor.empty() : tensor<8x2x32x16x4xf32>
+// CHECK:         %[[EXPANDED:.+]] = tensor.expand_shape %[[ARG0]] {{\[}}[0], [1, 2], [3]] output_shape [32, 2, 32, 16] : tensor<32x64x16xf32> into tensor<32x2x32x16xf32>
+// CHECK:         %[[PACK:.+]] = tensor.pack %[[EXPANDED]] inner_dims_pos = [0] inner_tiles = [4] into %[[EMPTY]] : tensor<32x2x32x16xf32> -> tensor<8x2x32x16x4xf32>
+// CHECK:         return %[[PACK]] : tensor<8x2x32x16x4xf32>
+
+// -----
+
 func.func @push_down_unpack_through_expand(%5: tensor<?x32x8x8xf32>, %dim: index, %sz0: index) -> tensor<?x256x256xf32> {
   %6 = tensor.empty(%dim) : tensor<?x256xf32>
   %unpack = tensor.unpack %5 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [8, 8] into %6 : tensor<?x32x8x8xf32> -> tensor<?x256xf32>

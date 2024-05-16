@@ -694,6 +694,69 @@ bubbleUpPackOpThroughCollapseShape(tensor::CollapseShapeOp collapseOp,
   return success();
 }
 
+/// Bubble up pack op through expand shape op.
+static LogicalResult
+bubbleUpPackOpThroughExpandShape(tensor::ExpandShapeOp expandOp,
+                                 tensor::PackOp packOp,
+                                 PatternRewriter &rewriter) {
+  // Cannot propagate shape expansion if there is outer dimensions permutation.
+  auto outerDimsPerm = packOp.getOuterDimsPerm();
+  if (!outerDimsPerm.empty() && !isIdentityPermutation(outerDimsPerm)) {
+    return rewriter.notifyMatchFailure(
+        packOp, "expects outer_dims_perm is empty or an identity permutation");
+  }
+
+  // The operation must expand only the leading dimension.
+  SmallVector<ReassociationIndices, 4> reassoc =
+      expandOp.getReassociationIndices();
+  if (!llvm::all_of(llvm::seq<int64_t>(1, reassoc.size()),
+                    [&reassoc](int64_t i) { return reassoc[i].size() == 1; })) {
+    return rewriter.notifyMatchFailure(
+        packOp, "expects expansion of the leading dimension only");
+  }
+
+  // At most one expanded dimension can be packed.
+  int64_t numExpandedDims = reassoc[0].size();
+  if (llvm::count_if(packOp.getInnerDimsPos(),
+                     [&](int64_t pos) { return pos < numExpandedDims; }) > 1) {
+    return rewriter.notifyMatchFailure(
+        packOp, "only one expanded dimension can be present in inner_dims_pos");
+  }
+
+  // Adjust innerDimsPos - assign expanded dimensions to the leading dimension
+  // and shift the rest accordingly.
+  SmallVector<int64_t> innerDimsPos{packOp.getInnerDimsPos()};
+  int64_t posShift = numExpandedDims - 1;
+  for (size_t i = 0; i < innerDimsPos.size(); i++) {
+    if (innerDimsPos[i] < numExpandedDims)
+      innerDimsPos[i] = 0;
+    else
+      innerDimsPos[i] -= posShift;
+  }
+
+  auto newPackType = tensor::PackOp::inferPackedType(
+      expandOp.getSrcType(), packOp.getStaticInnerTiles(), innerDimsPos,
+      packOp.getOuterDimsPerm());
+  auto reassocExpand =
+      getReassociationIndicesForReshape(newPackType, packOp.getDestType());
+  if (!reassocExpand)
+    return failure();
+
+  Value destTensor = tensor::PackOp::createDestinationTensor(
+      rewriter, packOp.getLoc(), expandOp.getSrc(), packOp.getMixedTiles(),
+      innerDimsPos, packOp.getOuterDimsPerm());
+  Value packedVal = rewriter.create<tensor::PackOp>(
+      packOp.getLoc(), expandOp.getSrc(), destTensor, innerDimsPos,
+      packOp.getMixedTiles(), packOp.getPaddingValue(),
+      packOp.getOuterDimsPerm());
+
+  auto newExpandOp = rewriter.create<tensor::ExpandShapeOp>(
+      packOp.getLoc(), packOp.getDestType(), packedVal, *reassocExpand);
+  rewriter.replaceOp(packOp, newExpandOp);
+
+  return success();
+}
+
 class BubbleUpPackOpThroughReshapeOp final
     : public OpRewritePattern<tensor::PackOp> {
 public:
@@ -722,6 +785,9 @@ public:
     return TypeSwitch<Operation *, LogicalResult>(srcOp)
         .Case([&](tensor::CollapseShapeOp op) {
           return bubbleUpPackOpThroughCollapseShape(op, packOp, rewriter);
+        })
+        .Case([&](tensor::ExpandShapeOp op) {
+          return bubbleUpPackOpThroughExpandShape(op, packOp, rewriter);
         })
         .Default([](Operation *) { return failure(); });
   }
