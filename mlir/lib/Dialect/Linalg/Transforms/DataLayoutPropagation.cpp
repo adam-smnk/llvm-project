@@ -17,6 +17,8 @@
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/SetOperations.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include <optional>
@@ -700,41 +702,52 @@ bubbleUpPackOpThroughExpandShape(tensor::ExpandShapeOp expandOp,
                                  tensor::PackOp packOp,
                                  PatternRewriter &rewriter) {
   // Cannot propagate shape expansion if there is outer dimensions permutation.
-  auto outerDimsPerm = packOp.getOuterDimsPerm();
+  ArrayRef<int64_t> outerDimsPerm = packOp.getOuterDimsPerm();
   if (!outerDimsPerm.empty() && !isIdentityPermutation(outerDimsPerm)) {
     return rewriter.notifyMatchFailure(
         packOp, "expects outer_dims_perm is empty or an identity permutation");
   }
 
-  // The operation must expand only the leading dimension.
+  // Cannot propagate shape expansion if multiple tiles are created.
+  if (packOp.getInnerDimsPos().size() > 1) {
+    return rewriter.notifyMatchFailure(packOp,
+                                       "only one dimension can be packed");
+  }
+
+  // Validate dimensions' relations between shape expansion and packing.
   SmallVector<ReassociationIndices, 4> reassoc =
       expandOp.getReassociationIndices();
-  if (!llvm::all_of(llvm::seq<int64_t>(1, reassoc.size()),
-                    [&reassoc](int64_t i) { return reassoc[i].size() == 1; })) {
-    return rewriter.notifyMatchFailure(
-        packOp, "expects expansion of the leading dimension only");
+  ArrayRef<int64_t> packInnerDims = packOp.getInnerDimsPos();
+  llvm::SetVector<int64_t> packDimsPos(packInnerDims.begin(),
+                                       packInnerDims.end());
+
+  SmallVector<int64_t> innerDimsPos;
+  for (auto [id, indices] : llvm::enumerate(reassoc)) {
+    llvm::SetVector<int64_t> expandDimPos(indices.begin(), indices.end());
+    llvm::SetVector<int64_t> packedDims =
+        llvm::set_intersection(packDimsPos, expandDimPos);
+
+    // The expanded dimension is not packed - simply continue.
+    if (packedDims.empty())
+      continue;
+    // Shape expansion cannot be propagated when multiple expanded dimension are
+    // packed.
+    if (packedDims.size() > 1)
+      return rewriter.notifyMatchFailure(
+          packOp, "only one of the expanded dimensions can be packed");
+    // Only the inner-most dim should be packed. Otherwise, elements order will
+    // be affected after operation reordering.
+    if (packedDims[0] != indices.back())
+      return rewriter.notifyMatchFailure(
+          packOp, "can only pack the inner-most expanded dimension");
+
+    // Project the pack inner dim to its position before expansion by taking
+    // the current position of the reassociation set.
+    innerDimsPos.push_back(id);
   }
 
-  // At most one expanded dimension can be packed.
-  int64_t numExpandedDims = reassoc[0].size();
-  if (llvm::count_if(packOp.getInnerDimsPos(),
-                     [&](int64_t pos) { return pos < numExpandedDims; }) > 1) {
-    return rewriter.notifyMatchFailure(
-        packOp, "only one expanded dimension can be present in inner_dims_pos");
-  }
-
-  // Adjust innerDimsPos - assign expanded dimensions to the leading dimension
-  // and shift the rest accordingly.
-  SmallVector<int64_t> innerDimsPos{packOp.getInnerDimsPos()};
-  int64_t posShift = numExpandedDims - 1;
-  for (size_t i = 0; i < innerDimsPos.size(); i++) {
-    if (innerDimsPos[i] < numExpandedDims)
-      innerDimsPos[i] = 0;
-    else
-      innerDimsPos[i] -= posShift;
-  }
-
-  auto newPackType = tensor::PackOp::inferPackedType(
+  // Project the shape expansion to the new packed shape.
+  RankedTensorType newPackType = tensor::PackOp::inferPackedType(
       expandOp.getSrcType(), packOp.getStaticInnerTiles(), innerDimsPos,
       packOp.getOuterDimsPerm());
   auto reassocExpand =
@@ -750,7 +763,7 @@ bubbleUpPackOpThroughExpandShape(tensor::ExpandShapeOp expandOp,
       packOp.getMixedTiles(), packOp.getPaddingValue(),
       packOp.getOuterDimsPerm());
 
-  auto newExpandOp = rewriter.create<tensor::ExpandShapeOp>(
+  Value newExpandOp = rewriter.create<tensor::ExpandShapeOp>(
       packOp.getLoc(), packOp.getDestType(), packedVal, *reassocExpand);
   rewriter.replaceOp(packOp, newExpandOp);
 
