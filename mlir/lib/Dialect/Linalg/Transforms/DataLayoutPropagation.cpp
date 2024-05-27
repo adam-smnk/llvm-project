@@ -696,7 +696,7 @@ bubbleUpPackOpThroughCollapseShape(tensor::CollapseShapeOp collapseOp,
   return success();
 }
 
-/// Project dimsPos to their collapsed position in the reassocIndices.
+/// Project dimsPos to their collapsed positions in the reassocIndices.
 ///
 /// For example, given dimsPos [0, 1, 2, 4], and matching reassocIndices
 /// [[0], [1, 2], [3], [4]], it returns [0, 1, 1, 3]. Because for pos 0,
@@ -706,8 +706,13 @@ static SmallVector<int64_t>
 projectDimsPosIntoReassocPos(ArrayRef<int64_t> dimsPos,
                              ArrayRef<ReassociationIndices> reassocIndices) {
   SmallVector<int64_t> projectedPos;
+
+  // Map each dimension to the position of corresponding reassociation index.
   for (auto pos : dimsPos) {
     for (auto [idx, indices] : llvm::enumerate(reassocIndices)) {
+      // If the dimension is present in the current indices group, the group
+      // position within the reassociation map is the desired projected
+      // dimension position.
       if (llvm::any_of(indices,
                        [&](int64_t expandDim) { return expandDim == pos; })) {
         projectedPos.push_back(idx);
