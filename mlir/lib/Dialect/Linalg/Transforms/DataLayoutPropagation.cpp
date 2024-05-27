@@ -696,6 +696,30 @@ bubbleUpPackOpThroughCollapseShape(tensor::CollapseShapeOp collapseOp,
   return success();
 }
 
+/// Project dimsPos to their collapsed position in the reassocIndices.
+///
+/// For example, given dimsPos [0, 1, 2, 4], and matching reassocIndices
+/// [[0], [1, 2], [3], [4]], it returns [0, 1, 1, 3]. Because for pos 0,
+/// the reassoc dim [0] is 0. For pos 1 and 2, the reassoc dim in pos
+/// [1, 2] is 1. And for pos 4, the reassoc dim [4] is 3.
+static SmallVector<int64_t>
+projectDimsPosIntoReassocPos(ArrayRef<int64_t> dimsPos,
+                             ArrayRef<ReassociationIndices> reassocIndices) {
+  SmallVector<int64_t> projectedPos;
+  for (auto pos : dimsPos) {
+    for (auto [idx, indices] : llvm::enumerate(reassocIndices)) {
+      if (llvm::any_of(indices,
+                       [&](int64_t expandDim) { return expandDim == pos; })) {
+        projectedPos.push_back(idx);
+        break;
+      }
+    }
+  }
+  assert(projectedPos.size() == dimsPos.size() && "Invalid dim pos projection");
+
+  return projectedPos;
+}
+
 /// Bubble up pack op through expand shape op.
 static LogicalResult
 bubbleUpPackOpThroughExpandShape(tensor::ExpandShapeOp expandOp,
@@ -708,12 +732,6 @@ bubbleUpPackOpThroughExpandShape(tensor::ExpandShapeOp expandOp,
         packOp, "expects outer_dims_perm is empty or an identity permutation");
   }
 
-  // Cannot propagate shape expansion if multiple tiles are created.
-  if (packOp.getInnerDimsPos().size() > 1) {
-    return rewriter.notifyMatchFailure(packOp,
-                                       "only one dimension can be packed");
-  }
-
   // Validate dimensions' relations between shape expansion and packing.
   SmallVector<ReassociationIndices, 4> reassoc =
       expandOp.getReassociationIndices();
@@ -721,8 +739,7 @@ bubbleUpPackOpThroughExpandShape(tensor::ExpandShapeOp expandOp,
   llvm::SetVector<int64_t> packDimsPos(packInnerDims.begin(),
                                        packInnerDims.end());
 
-  SmallVector<int64_t> innerDimsPos;
-  for (auto [id, indices] : llvm::enumerate(reassoc)) {
+  for (auto [idx, indices] : llvm::enumerate(reassoc)) {
     llvm::SetVector<int64_t> expandDimPos(indices.begin(), indices.end());
     llvm::SetVector<int64_t> packedDims =
         llvm::set_intersection(packDimsPos, expandDimPos);
@@ -740,26 +757,27 @@ bubbleUpPackOpThroughExpandShape(tensor::ExpandShapeOp expandOp,
     if (packedDims[0] != indices.back())
       return rewriter.notifyMatchFailure(
           packOp, "can only pack the inner-most expanded dimension");
-
-    // Project the pack inner dim to its position before expansion by taking
-    // the current position of the reassociation set.
-    innerDimsPos.push_back(id);
   }
+
+  // Project the pack inner dims pos to the positions before shape expansion.
+  SmallVector<int64_t> projectedInnerDimsPos =
+      projectDimsPosIntoReassocPos(packInnerDims, reassoc);
 
   // Project the shape expansion to the new packed shape.
   RankedTensorType newPackType = tensor::PackOp::inferPackedType(
-      expandOp.getSrcType(), packOp.getStaticInnerTiles(), innerDimsPos,
-      packOp.getOuterDimsPerm());
+      expandOp.getSrcType(), packOp.getStaticInnerTiles(),
+      projectedInnerDimsPos, packOp.getOuterDimsPerm());
   auto reassocExpand =
       getReassociationIndicesForReshape(newPackType, packOp.getDestType());
   if (!reassocExpand)
-    return failure();
+    return rewriter.notifyMatchFailure(
+        packOp, "could not reassociate dims after bubbling up");
 
   Value destTensor = tensor::PackOp::createDestinationTensor(
       rewriter, packOp.getLoc(), expandOp.getSrc(), packOp.getMixedTiles(),
-      innerDimsPos, packOp.getOuterDimsPerm());
+      projectedInnerDimsPos, packOp.getOuterDimsPerm());
   Value packedVal = rewriter.create<tensor::PackOp>(
-      packOp.getLoc(), expandOp.getSrc(), destTensor, innerDimsPos,
+      packOp.getLoc(), expandOp.getSrc(), destTensor, projectedInnerDimsPos,
       packOp.getMixedTiles(), packOp.getPaddingValue(),
       packOp.getOuterDimsPerm());
 
