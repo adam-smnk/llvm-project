@@ -23,4 +23,21 @@ def XeGPUFoldAliasOps : Pass<"xegpu-fold-alias-ops"> {
   ];
 }
 
+def XeGPUArchConfig : Pass<"xegpu-arch-config"> {
+  let summary = "Attach an XeGPU target DLTI configuration";
+  let description = [{
+    Attaches DLTI descriptor with hardware characteristics for the selected
+    target architecture.
+
+    The entries indicate which features are available and their supported
+    configuration variants if any.
+  }];
+  let options = [
+    Option<"arch", "arch", "int",
+            /*default=*/"1",
+           "Target architecture">,
+  ];
+  let dependentDialects = [ "mlir::DLTIDialect" ];
+}
+
 #endif // MLIR_DIALECT_XEGPU_TRANSFORMS_PASSES_TD

@@ -1,4 +1,5 @@
 add_mlir_dialect_library(MLIRXeGPUTransforms
+  XeGPUArchConfig.cpp
   XeGPUFoldAliasOps.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -9,6 +10,7 @@ add_mlir_dialect_library(MLIRXeGPUTransforms
 
   LINK_LIBS PUBLIC
   MLIRAffineUtils
+  MLIRDLTIDialect
   MLIRIR
   MLIRMemRefDialect
   MLIRXeGPUDialect
