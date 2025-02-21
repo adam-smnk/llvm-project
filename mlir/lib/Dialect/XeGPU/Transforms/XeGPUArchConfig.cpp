@@ -7,10 +7,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/XeGPU/Transforms/Passes.h"
+#include "mlir/Dialect/XeGPU/Transforms/PassesEnums.cpp.inc"
 
+#include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/XeGPU/Transforms/Transforms.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
 

@@ -11,6 +11,7 @@
 #define MLIR_DIALECT_XEGPU_TRANSFORMS_PASSES_TD
 
 include "mlir/Pass/PassBase.td"
+include "mlir/IR/EnumAttr.td"
 
 def XeGPUFoldAliasOps : Pass<"xegpu-fold-alias-ops"> {
   let summary = "Fold alias ops into XeGPU ops";
@@ -23,6 +24,15 @@ def XeGPUFoldAliasOps : Pass<"xegpu-fold-alias-ops"> {
   ];
 }
 
+def Arch : I32EnumAttr<"Arch", "Intel GPU architecture",
+    [
+      I32EnumAttrCase<"PVC", 0, "pvc">,
+      I32EnumAttrCase<"ARC", 1, "arc">,
+    ]>{
+  let cppNamespace = "mlir::xegpu";
+  let genSpecializedAttr = 0;
+}
+
 def XeGPUArchConfig : Pass<"xegpu-arch-config"> {
   let summary = "Attach an XeGPU target DLTI configuration";
   let description = [{
@@ -33,9 +43,16 @@ def XeGPUArchConfig : Pass<"xegpu-arch-config"> {
     configuration variants if any.
   }];
   let options = [
-    Option<"arch", "arch", "int",
-            /*default=*/"1",
-           "Target architecture">,
+    Option<"arch", "arch", "mlir::xegpu::Arch",
+           /*default=*/"mlir::xegpu::Arch::PVC",
+           "Target architecture",
+           [{::llvm::cl::values(
+                 clEnumValN(mlir::xegpu::Arch::PVC,
+                            "pvc", "Intel PVC GPU"),
+                 clEnumValN(mlir::xegpu::Arch::ARC,
+                            "arc",
+                            "Intel ARC GPU")
+           )}]>
   ];
   let dependentDialects = [ "mlir::DLTIDialect" ];
 }
