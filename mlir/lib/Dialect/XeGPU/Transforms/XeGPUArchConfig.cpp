@@ -11,6 +11,7 @@
 
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/XeGPU/Transforms/Transforms.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
@@ -36,5 +37,23 @@ struct XeGPUArchConfigPass final
 } // namespace
 
 void XeGPUArchConfigPass::runOnOperation() {
+  Operation *op = getOperation();
+  MLIRContext *ctx = &getContext();
+  OpBuilder builder(&getContext());
+
+  auto targetId =
+      StringAttr::get(ctx, "gpu-intel-" + xegpu::stringifyArch(arch));
+  // Do nothing if the target system spec already exists.
+  if (succeeded(dlti::query(op, SmallVector<DataLayoutEntryKey>{targetId})))
+    return;
+
+  llvm::errs() << *op << " - No attr yet\n";
+  // auto targetAttr = builder.getAttr<DataLayoutEntryAttr>(
+  //     StringAttr::get(ctx, targetId), Attribute());
+  // // auto deviceSpecAttr = builder.getAttr<TargetDeviceSpecAttr>();
+  // auto systemAttr = builder.getAttr<TargetSystemSpecAttr>(
+  //     SmallVector<DataLayoutEntryInterface>{targetAttr});
+  // op->setAttr(systemAttr.name, systemAttr);
+
   return;
 }
