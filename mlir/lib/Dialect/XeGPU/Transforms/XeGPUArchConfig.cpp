@@ -78,7 +78,14 @@ void XeGPUArchConfigPass::runOnOperation() {
   auto deviceAttr =
       builder.getAttr<DataLayoutEntryAttr>(targetId, deviceSpecAttr);
 
+  SmallVector<DataLayoutEntryInterface> systemEntries = {deviceAttr};
+  if (auto systemAttr =
+          op->getAttrOfType<TargetSystemSpecAttr>(TargetSystemSpecAttr::name)) {
+    ArrayRef<DataLayoutEntryInterface> currentEntries = systemAttr.getEntries();
+    systemEntries.append(currentEntries.begin(), currentEntries.end());
+  }
+
   auto systemSpecAttr = builder.getAttr<TargetSystemSpecAttr>(
-      SmallVector<DataLayoutEntryInterface>{deviceAttr});
-  op->setAttr(systemSpecAttr.name, systemSpecAttr);
+      SmallVector<DataLayoutEntryInterface>{systemEntries});
+  op->setAttr(TargetSystemSpecAttr::name, systemSpecAttr);
 }
