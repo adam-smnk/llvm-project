@@ -34,26 +34,51 @@ struct XeGPUArchConfigPass final
   void runOnOperation() override;
 };
 
+DataLayoutEntryAttr getEntry(OpBuilder builder, StringRef key, int64_t value) {
+  return builder.getAttr<DataLayoutEntryAttr>(builder.getAttr<StringAttr>(key),
+                                              builder.getI64IntegerAttr(value));
+}
+
+FailureOr<DataLayoutEntryAttr> getDpasConfig(OpBuilder builder,
+                                             xegpu::Arch arch) {
+  if (arch != xegpu::Arch::PVC)
+    return failure();
+
+  SmallVector<DataLayoutEntryInterface> entries;
+  entries.push_back(getEntry(builder, "repeat_count", 8));
+  entries.push_back(getEntry(builder, "exec_size", 16));
+  entries.push_back(getEntry(builder, "depth", 8));
+
+  auto cfgId = builder.getAttr<StringAttr>("DPAS_HW");
+  auto dltiMap = builder.getAttr<MapAttr>(entries);
+
+  return builder.getAttr<DataLayoutEntryAttr>(cfgId, dltiMap);
+}
+
 } // namespace
 
 void XeGPUArchConfigPass::runOnOperation() {
   Operation *op = getOperation();
   MLIRContext *ctx = &getContext();
-  OpBuilder builder(&getContext());
+  OpBuilder builder(ctx);
 
   auto targetId =
-      StringAttr::get(ctx, "gpu-intel-" + xegpu::stringifyArch(arch));
-  // Do nothing if the target system spec already exists.
-  if (succeeded(dlti::query(op, SmallVector<DataLayoutEntryKey>{targetId})))
+      builder.getAttr<StringAttr>("gpu-intel-" + xegpu::stringifyArch(arch));
+  FailureOr<Attribute> queryDevice =
+      dlti::query(op, SmallVector<DataLayoutEntryKey>{targetId});
+  if (succeeded(queryDevice))
     return;
 
-  llvm::errs() << *op << " - No attr yet\n";
-  // auto targetAttr = builder.getAttr<DataLayoutEntryAttr>(
-  //     StringAttr::get(ctx, targetId), Attribute());
-  // // auto deviceSpecAttr = builder.getAttr<TargetDeviceSpecAttr>();
-  // auto systemAttr = builder.getAttr<TargetSystemSpecAttr>(
-  //     SmallVector<DataLayoutEntryInterface>{targetAttr});
-  // op->setAttr(systemAttr.name, systemAttr);
+  SmallVector<DataLayoutEntryInterface> deviceEntries;
+  FailureOr<DataLayoutEntryAttr> dpasCfg = getDpasConfig(builder, arch);
+  if (succeeded(dpasCfg))
+    deviceEntries.push_back(*dpasCfg);
 
-  return;
+  auto deviceSpecAttr = builder.getAttr<TargetDeviceSpecAttr>(deviceEntries);
+  auto deviceAttr =
+      builder.getAttr<DataLayoutEntryAttr>(targetId, deviceSpecAttr);
+
+  auto systemSpecAttr = builder.getAttr<TargetSystemSpecAttr>(
+      SmallVector<DataLayoutEntryInterface>{deviceAttr});
+  op->setAttr(systemSpecAttr.name, systemSpecAttr);
 }
