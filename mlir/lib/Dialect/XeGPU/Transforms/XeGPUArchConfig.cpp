@@ -38,7 +38,7 @@ DataLayoutEntryAttr getEntry(OpBuilder builder, StringRef key, int64_t value) {
                                               builder.getI64IntegerAttr(value));
 }
 
-// Returns config entry if given `arch` has DPAS hardware.
+// Returns DLTI DPAS entry if given `arch` has DPAS hardware.
 std::optional<DataLayoutEntryAttr> getDpasConfig(OpBuilder builder,
                                                  xegpu::Arch arch) {
   SmallVector<DataLayoutEntryInterface> entries;
