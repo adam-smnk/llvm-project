@@ -13,6 +13,8 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 
+#include <optional>
+
 namespace mlir {
 namespace xegpu {
 #define GEN_PASS_DEF_XEGPUARCHCONFIG
@@ -36,14 +38,13 @@ DataLayoutEntryAttr getEntry(OpBuilder builder, StringRef key, int64_t value) {
                                               builder.getI64IntegerAttr(value));
 }
 
-FailureOr<DataLayoutEntryAttr> getDpasConfig(OpBuilder builder,
-                                             xegpu::Arch arch) {
-  if (arch != xegpu::Arch::PVC)
-    return failure();
-
+// Returns config entry if given `arch` has DPAS hardware.
+std::optional<DataLayoutEntryAttr> getDpasConfig(OpBuilder builder,
+                                                 xegpu::Arch arch) {
   SmallVector<DataLayoutEntryInterface> entries;
   entries.push_back(getEntry(builder, "repeat_count", 8));
-  entries.push_back(getEntry(builder, "exec_size", 16));
+  int64_t execSize = arch == xegpu::Arch::ARC ? 8 : 16;
+  entries.push_back(getEntry(builder, "exec_size", execSize));
   entries.push_back(getEntry(builder, "depth", 8));
 
   auto cfgId = builder.getAttr<StringAttr>("DPAS_HW");
@@ -63,12 +64,13 @@ void XeGPUArchConfigPass::runOnOperation() {
       builder.getAttr<StringAttr>("gpu-intel-" + xegpu::stringifyArch(arch));
   FailureOr<Attribute> queryDevice =
       dlti::query(op, SmallVector<DataLayoutEntryKey>{targetId});
+  // Do nothing if the device spec already exists.
   if (succeeded(queryDevice))
     return;
 
   SmallVector<DataLayoutEntryInterface> deviceEntries;
-  FailureOr<DataLayoutEntryAttr> dpasCfg = getDpasConfig(builder, arch);
-  if (succeeded(dpasCfg))
+  std::optional<DataLayoutEntryAttr> dpasCfg = getDpasConfig(builder, arch);
+  if (dpasCfg)
     deviceEntries.push_back(*dpasCfg);
 
   auto deviceSpecAttr = builder.getAttr<TargetDeviceSpecAttr>(deviceEntries);
