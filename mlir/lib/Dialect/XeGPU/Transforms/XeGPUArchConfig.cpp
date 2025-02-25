@@ -10,11 +10,8 @@
 #include "mlir/Dialect/XeGPU/Transforms/PassesEnums.cpp.inc"
 
 #include "mlir/Dialect/DLTI/DLTI.h"
-#include "mlir/Dialect/XeGPU/Transforms/Transforms.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/Support/Debug.h"
 
 namespace mlir {
 namespace xegpu {
@@ -78,13 +75,15 @@ void XeGPUArchConfigPass::runOnOperation() {
   auto deviceAttr =
       builder.getAttr<DataLayoutEntryAttr>(targetId, deviceSpecAttr);
 
+  // Update target system spec descriptor.
+  // The device spec for the target arch is set or updated, if already
+  // present. Other device specs are preserved.
   SmallVector<DataLayoutEntryInterface> systemEntries = {deviceAttr};
   if (auto systemAttr =
           op->getAttrOfType<TargetSystemSpecAttr>(TargetSystemSpecAttr::name)) {
     ArrayRef<DataLayoutEntryInterface> currentEntries = systemAttr.getEntries();
     systemEntries.append(currentEntries.begin(), currentEntries.end());
   }
-
   auto systemSpecAttr = builder.getAttr<TargetSystemSpecAttr>(
       SmallVector<DataLayoutEntryInterface>{systemEntries});
   op->setAttr(TargetSystemSpecAttr::name, systemSpecAttr);
