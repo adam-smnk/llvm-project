@@ -13,8 +13,6 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 
-#include <optional>
-
 namespace mlir {
 namespace xegpu {
 #define GEN_PASS_DEF_XEGPUARCHCONFIG
@@ -33,14 +31,13 @@ struct XeGPUArchConfigPass final
   void runOnOperation() override;
 };
 
-DataLayoutEntryAttr getEntry(OpBuilder builder, StringRef key, int64_t value) {
+DataLayoutEntryAttr getEntry(Builder &builder, StringRef key, int64_t value) {
   return builder.getAttr<DataLayoutEntryAttr>(builder.getAttr<StringAttr>(key),
                                               builder.getI64IntegerAttr(value));
 }
 
-// Returns DLTI DPAS entry if given `arch` has DPAS hardware.
-std::optional<DataLayoutEntryAttr> getDpasConfig(OpBuilder builder,
-                                                 xegpu::Arch arch) {
+// Returns DLTI DPAS config for given `arch`.
+DataLayoutEntryAttr getDpasConfig(Builder &builder, xegpu::Arch arch) {
   SmallVector<DataLayoutEntryInterface> entries;
   entries.push_back(getEntry(builder, "repeat_count", 8));
   int64_t execSize = arch == xegpu::Arch::ARC ? 8 : 16;
@@ -57,8 +54,7 @@ std::optional<DataLayoutEntryAttr> getDpasConfig(OpBuilder builder,
 
 void XeGPUArchConfigPass::runOnOperation() {
   Operation *op = getOperation();
-  MLIRContext *ctx = &getContext();
-  OpBuilder builder(ctx);
+  Builder builder(op);
 
   auto targetId =
       builder.getAttr<StringAttr>("gpu-intel-" + xegpu::stringifyArch(arch));
@@ -68,10 +64,9 @@ void XeGPUArchConfigPass::runOnOperation() {
   if (succeeded(queryDevice))
     return;
 
+  // Populate device spec entries.
   SmallVector<DataLayoutEntryInterface> deviceEntries;
-  std::optional<DataLayoutEntryAttr> dpasCfg = getDpasConfig(builder, arch);
-  if (dpasCfg)
-    deviceEntries.push_back(*dpasCfg);
+  deviceEntries.push_back(getDpasConfig(builder, arch));
 
   auto deviceSpecAttr = builder.getAttr<TargetDeviceSpecAttr>(deviceEntries);
   auto deviceAttr =
