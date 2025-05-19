@@ -70,6 +70,9 @@
 #include "llvm/TargetParser/Triple.h"
 #include <cerrno>
 #include <optional>
+#include <asm/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #if !defined(_MSC_VER) && !defined(__MINGW32__)
 #include <unistd.h>
@@ -439,6 +442,9 @@ int main(int argc, char **argv, char * const *envp) {
     sys::Process::PreventCoreFiles();
 
   ExitOnErr(loadDylibs());
+
+  int XFEATURE_XTILEDATA = 18;
+  syscall(SYS_arch_prctl, 0x1023, XFEATURE_XTILEDATA);
 
   if (EntryFunc.empty()) {
     WithColor::error(errs(), argv[0])

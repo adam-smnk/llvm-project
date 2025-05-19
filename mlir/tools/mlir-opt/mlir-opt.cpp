@@ -27,6 +27,10 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
 
+#include <asm/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 using namespace llvm;
 using namespace mlir;
 
@@ -324,6 +328,9 @@ int main(int argc, char **argv) {
   // cmake dependency when a safe dialect interface registration mechanism is
   // implemented, see D157703 (and corresponding note on the declaration).
   registerAllGPUToLLVMIRTranslations(registry);
+
+  int XFEATURE_XTILEDATA = 18;
+  syscall(SYS_arch_prctl, 0x1023, XFEATURE_XTILEDATA);
 
 #ifdef MLIR_INCLUDE_TESTS
   ::test::registerTestDialect(registry);
