@@ -3521,15 +3521,69 @@ DiagnosedSilenceableFailure
 transform::TileUsingForOp::apply(transform::TransformRewriter &rewriter,
                                  TransformResults &transformResults,
                                  TransformState &state) {
-  ArrayRef<int64_t> tileSizes = getStaticSizes();
-
   SmallVector<Operation *> targets =
       llvm::to_vector(state.getPayloadOps(getTarget()));
+  // Preprocessing: iterate getDynamicSizes() and expand any op handle whose
+  // payload ops produce multiple index-typed results into individual
+  // (handle, resultIdx) entries -- one per tile size dimension. Param handles
+  // and single-result op handles are kept as-is with resultIdx = 0.
+  // expandedMixedSizes / expandedScalable mirror getMixedSizes() /
+  // getScalableSizes() but with each multi-result dynamic slot replaced by N
+  // kDynamic placeholders.
+  // expandedLoopToIRLoop[k] maps the k-th actual loop (i.e. k-th non-zero
+  // expanded slot) to the corresponding index in getLoops(). All P expanded
+  // slots from a multi-result handle share the same IR loop result index.
+  SmallVector<std::pair<Value, unsigned>> expandedDynamicSizes;
+  SmallVector<OpFoldResult> expandedMixedSizes;
+  SmallVector<bool> expandedScalable;
+  SmallVector<unsigned> expandedLoopToIRLoop;
+  {
+    auto origScalable = getScalableSizes();
+    unsigned dynIdx = 0;
+    unsigned irLoopIdx = 0;
+    for (auto [ofrIdx, ofr] : llvm::enumerate(getMixedSizes())) {
+      if (auto attr = llvm::dyn_cast_if_present<Attribute>(ofr)) {
+        expandedMixedSizes.push_back(ofr);
+        expandedScalable.push_back(origScalable[ofrIdx]);
+        if (cast<IntegerAttr>(attr).getInt() != 0)
+          expandedLoopToIRLoop.push_back(irLoopIdx++);
+        continue;
+      }
+      Value tv = getDynamicSizes()[dynIdx++];
+      if (isa<TransformParamTypeInterface>(tv.getType())) {
+        expandedDynamicSizes.push_back({tv, 0});
+        expandedMixedSizes.push_back(ofr);
+        expandedScalable.push_back(false);
+        expandedLoopToIRLoop.push_back(irLoopIdx++);
+        continue;
+      }
+      // Op handle: determine result arity from the first payload op.
+      SmallVector<Operation *> producers =
+          llvm::to_vector(state.getPayloadOps(tv));
+      unsigned numResults =
+          (producers.empty() || producers[0]->getNumResults() <= 1)
+              ? 1
+              : producers[0]->getNumResults();
+      for (unsigned r = 0; r < numResults; ++r) {
+        expandedDynamicSizes.push_back({tv, r});
+        // Use the Value OFR (not a kDynamic Attribute placeholder) so the
+        // tiling callback correctly routes these slots through the dynamic
+        // producer lookup rather than treating them as static sizes.
+        expandedMixedSizes.push_back(numResults == 1 ? ofr : OpFoldResult(tv));
+        expandedScalable.push_back(false);
+        // All P slots from the same multi-result handle share one IR loop
+        // result; single-result handles still advance irLoopIdx by 1.
+        expandedLoopToIRLoop.push_back(irLoopIdx);
+      }
+      ++irLoopIdx;
+    }
+  }
+
   SmallVector<SmallVector<Operation *>> dynamicSizeProducers;
   SmallVector<SmallVector<int64_t>> paramSizes;
-  dynamicSizeProducers.reserve(getDynamicSizes().size());
-  paramSizes.reserve(getDynamicSizes().size());
-  for (Value transformValue : getDynamicSizes()) {
+  dynamicSizeProducers.reserve(expandedDynamicSizes.size());
+  paramSizes.reserve(expandedDynamicSizes.size());
+  for (auto [transformValue, resultIdx] : expandedDynamicSizes) {
     if (isa<TransformParamTypeInterface>(transformValue.getType())) {
       dynamicSizeProducers.push_back({});
       ArrayRef<Attribute> params = state.getParams(transformValue);
@@ -3564,8 +3618,8 @@ transform::TileUsingForOp::apply(transform::TransformRewriter &rewriter,
     }
 
     for (Operation *op : dynamicSizeProducers.back()) {
-      if (op->getNumResults() == 1 &&
-          isa<IndexType>(op->getResult(0).getType())) {
+      if ((unsigned)op->getNumResults() > resultIdx &&
+          isa<IndexType>(op->getResult(resultIdx).getType())) {
         continue;
       }
 
@@ -3580,8 +3634,7 @@ transform::TileUsingForOp::apply(transform::TransformRewriter &rewriter,
 
   SmallVector<Operation *> tiled;
   SmallVector<SmallVector<Operation *, 4>, 4> loops;
-  loops.resize(getLoops().size());
-  auto scalableSizes = getScalableSizes();
+  loops.resize(expandedLoopToIRLoop.size());
   for (auto [i, op] : llvm::enumerate(targets)) {
     auto tilingInterface = dyn_cast<TilingInterface>(op);
     if (!tilingInterface) {
@@ -3591,18 +3644,19 @@ transform::TileUsingForOp::apply(transform::TransformRewriter &rewriter,
       diag.attachNote(op->getLoc()) << "target op";
       return diag;
     }
-    if (tileSizes.size() > tilingInterface.getLoopIteratorTypes().size()) {
+    if (expandedMixedSizes.size() >
+        tilingInterface.getLoopIteratorTypes().size()) {
       DiagnosedSilenceableFailure diag =
           emitSilenceableError()
           << "too many tiles provided, expected at most "
           << tilingInterface.getLoopIteratorTypes().size() << " found "
-          << tileSizes.size();
+          << expandedMixedSizes.size();
       diag.attachNote(op->getLoc()) << "target op";
       return diag;
     }
 
     scf::SCFTilingOptions tilingOptions;
-    if (tileSizes.empty()) {
+    if (expandedMixedSizes.empty()) {
       tilingOptions.setTileSizeComputationFunction(
           [](OpBuilder &, Operation *) -> SmallVector<OpFoldResult> {
             return {};
@@ -3611,12 +3665,12 @@ transform::TileUsingForOp::apply(transform::TransformRewriter &rewriter,
       tilingOptions.setTileSizeComputationFunction([&, index = i](OpBuilder &b,
                                                                   Operation *) {
         SmallVector<OpFoldResult> sizes;
-        sizes.reserve(tileSizes.size());
+        sizes.reserve(expandedMixedSizes.size());
         unsigned dynamicIdx = 0;
 
-        for (auto [ofrIdx, ofr] : llvm::enumerate(getMixedSizes())) {
+        for (auto [ofrIdx, ofr] : llvm::enumerate(expandedMixedSizes)) {
           if (auto attr = llvm::dyn_cast_if_present<Attribute>(ofr)) {
-            if (scalableSizes[ofrIdx]) {
+            if (expandedScalable[ofrIdx]) {
               auto val = arith::ConstantIndexOp::create(
                   b, getLoc(), cast<IntegerAttr>(attr).getInt());
               Value vscale =
@@ -3628,15 +3682,16 @@ transform::TileUsingForOp::apply(transform::TransformRewriter &rewriter,
             }
             continue;
           }
-          ArrayRef<Operation *> dynamicSizes = dynamicSizeProducers[dynamicIdx];
-          ArrayRef<int64_t> params = paramSizes[dynamicIdx];
-          ++dynamicIdx;
+          unsigned curDynIdx = dynamicIdx++;
+          ArrayRef<Operation *> dynamicSizes = dynamicSizeProducers[curDynIdx];
+          ArrayRef<int64_t> params = paramSizes[curDynIdx];
+          unsigned resultIdx = expandedDynamicSizes[curDynIdx].second;
           assert((dynamicSizes.empty() ^ params.empty()) &&
                  "expected either dynamic sizes or parameters");
           if (!params.empty()) {
             sizes.push_back(b.getIndexAttr(params[index]));
           } else {
-            sizes.push_back(dynamicSizes[index]->getResult(0));
+            sizes.push_back(dynamicSizes[index]->getResult(resultIdx));
           }
         }
         return sizes;
@@ -3657,8 +3712,14 @@ transform::TileUsingForOp::apply(transform::TransformRewriter &rewriter,
   }
 
   transformResults.set(cast<OpResult>(getTiledLinalgOp()), tiled);
-  for (const auto &en : llvm::enumerate(loops))
-    transformResults.set(cast<OpResult>(getLoops()[en.index()]), en.value());
+  // Remap expanded loop levels back to IR-declared loop results. For a
+  // multi-result handle expanded into P slots, all P loops are aggregated
+  // into the single corresponding IR loop result.
+  SmallVector<SmallVector<Operation *, 4>> irLoops(getLoops().size());
+  for (auto [expandedIdx, loopsForLevel] : llvm::enumerate(loops))
+    irLoops[expandedLoopToIRLoop[expandedIdx]].append(loopsForLevel);
+  for (auto [irIdx, loopsForIRResult] : llvm::enumerate(irLoops))
+    transformResults.set(cast<OpResult>(getLoops()[irIdx]), loopsForIRResult);
 
   return DiagnosedSilenceableFailure::success();
 }
