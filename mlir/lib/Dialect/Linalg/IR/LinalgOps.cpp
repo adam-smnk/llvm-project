@@ -6958,8 +6958,7 @@ LogicalResult ScaledContractOp::verify() {
 
       SmallVector<bool, 8> seen(affineMap.getNumInputs(), false);
       // Allow, at most, only one instance of each input dimension in the result
-      // expressions. Zeros are allowed as long as the number of result
-      // expressions is lower or equal than the number of input expressions.
+      // expressions.
       for (auto expr : affineMap.getResults()) {
         AffineDimExpr dim = nullptr;
         if (isa<AffineDimExpr>(expr)) {
@@ -6980,13 +6979,13 @@ LogicalResult ScaledContractOp::verify() {
             return emitError("block scale RHS must be constant");
           if (scaleFactor.getValue() <= 0)
             return emitError("block scale factor must be positive");
+          dim = scaleDim;
         } else {
           return emitError("unsupported scaling variant");
         }
 
         if (!dim)
-          return emitError("scale affine_map result must only have dim or zero "
-                           "result expressions");
+          return emitError("invalid scale affine_map result expression");
         if (seen[dim.getPosition()])
           return emitError(
               "scale affine_map must not have duplicate result dimensions");
@@ -7020,6 +7019,64 @@ LogicalResult ScaledContractOp::verify() {
   }
 
   // Cross-validate maps of operand and their scale.
+  for (auto &&[inputMap, inputType, scaleMap, scaleType] :
+       llvm::zip(SmallVector<AffineMap>{maps[0], maps[2]},
+                 SmallVector<Type>{types[0], types[2]},
+                 SmallVector<AffineMap>{maps[1], maps[3]},
+                 SmallVector<Type>{types[1], types[3]})) {
+    if (inputMap.getNumResults() < scaleMap.getNumResults())
+      return emitError("scale must have at most the same rank as input");
+    if (scaleMap.getNumResults() == 0)
+      continue;
+
+    auto inputShape = dyn_cast<ShapedType>(inputType).getShape();
+    auto scaleShape = dyn_cast<ShapedType>(scaleType).getShape();
+
+    // Scale map must be a sub-map of the input map:
+    //   - missing scale dim indicates scaling over whole input dimension
+    //   - scale dim with floordiv indicates reusing scaling factor over
+    //     parts of input dimension; the factor must match the ratio of input
+    //     dim and scale dim sizes;
+    // Scale dims must not be permuted w.r.t. input dims.
+    unsigned scaleIdx = 0;
+    for (auto [idx, inputExpr] : llvm::enumerate(inputMap.getResults())) {
+      if (scaleIdx >= scaleMap.getNumResults())
+        break;
+
+      auto inputDim = dyn_cast<AffineDimExpr>(inputExpr);
+      assert(inputDim && "input result is a dim expression");
+
+      auto scaleExpr = scaleMap.getResult(scaleIdx);
+      if (auto scaleDim = dyn_cast<AffineDimExpr>(scaleExpr)) {
+        if (scaleDim == inputDim)
+          scaleIdx++;
+      } else if (auto scaleBinExpr = dyn_cast<AffineBinaryOpExpr>(scaleExpr)) {
+        assert(scaleBinExpr.getKind() == AffineExprKind::FloorDiv &&
+               "only floordiv is supported for now");
+        auto scaleDim = dyn_cast<AffineDimExpr>(scaleBinExpr.getLHS());
+        if (scaleDim != inputDim)
+          continue;
+        int64_t scaleFactor =
+            dyn_cast<AffineConstantExpr>(scaleBinExpr.getRHS()).getValue();
+        // Validate scaling factor for static shapes.
+        // For dynamic shapes, it is assumed that all sizes are correct.
+        if (inputShape[idx] != ShapedType::kDynamic &&
+            scaleShape[scaleIdx] != ShapedType::kDynamic &&
+            inputShape[idx] / scaleShape[scaleIdx] != scaleFactor) {
+          return emitError() << "Invalid shapes for the scale factor, expected "
+                             << inputShape[idx] / scaleShape[scaleIdx]
+                             << " but got " << scaleFactor;
+        }
+        scaleIdx++;
+      } else {
+        llvm_unreachable("unknown scale expression");
+      }
+    }
+
+    // All scale dims must be accounted for in the input map.
+    if (scaleIdx != scaleMap.getNumResults())
+      return emitError("order of scale dims must match input dims");
+  }
 
   bool hasContractingDim = false;
   for (size_t dimIndex = 0; dimIndex < (size_t)iterationSpaceDims; dimIndex++) {

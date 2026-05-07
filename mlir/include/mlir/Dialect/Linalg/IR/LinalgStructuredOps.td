@@ -1239,7 +1239,6 @@ def ScaledContractOp : LinalgStructuredBase_Op<"scaled_contract", [
     TODO: describe affine maps for the scales
     TODO: describe dim sizes for the scales
     TODO: describe the broadcast and transpose semantics - disable both?
-    TODO: provide examples
 
     ```mlir
     %D = linalg.scaled_contract
@@ -1247,7 +1246,7 @@ def ScaledContractOp : LinalgStructuredBase_Op<"scaled_contract", [
           affine_map<(m, n, k) -> (m, k)>,
           affine_map<(m, n, k) -> (m floordiv 128, k floordiv 128)>, // A - 128x128 block scale
           affine_map<(m, n, k) -> (k, n)>,
-          affine_map<(m, n, k) -> (k)> // B - row-wise scale
+          affine_map<(m, n, k) -> (k)>, // B - row-wise scale
           affine_map<(m, n, k) -> (m, n)>]
         ins(%A, %scale_A, %B, %scale_B
           : tensor<256x512xi8>, tensor<2x4xf8E8M0FNU>,
@@ -1261,7 +1260,7 @@ def ScaledContractOp : LinalgStructuredBase_Op<"scaled_contract", [
           affine_map<(batch, m, n, k) -> (batch, m, k)>,
           affine_map<(batch, m, n, k) -> (batch, m, k floordiv 32)>, // A - 1x32 block scale
           affine_map<(batch, m, n, k) -> (batch, k, n)>,
-          affine_map<(batch, m, n, k) -> (batch, k, n floordiv 16)> // B - 1x16 block scale
+          affine_map<(batch, m, n, k) -> (batch, k, n floordiv 16)>, // B - 1x16 block scale
           affine_map<(batch, m, n, k) -> (batch, m, n)>]
         ins(%A, %scale_A, %B, %scale_B
           : tensor<?x?x?xf8E5M2>, tensor<?x?x?xf8E8M0FNU>,
@@ -1270,7 +1269,11 @@ def ScaledContractOp : LinalgStructuredBase_Op<"scaled_contract", [
     ```
     TODO: describe assumptions on dynamic sizes - static scaling block size
 
-    Numeric casting is performed on the inputs and scales, casting/promoting/truncating
+    Input shapes must be perfectly divisible by corresponding scaling factors
+    if any are present. In case of dynamic shapes, it is assumed that all sizes
+    are correct.
+
+    Numeric casting is performed on the inputs and scales, promoting/truncating
     them to the same data type as the accumulator/output.
 
     TODO: Allow control over the combining/accumulating op and possibly the
