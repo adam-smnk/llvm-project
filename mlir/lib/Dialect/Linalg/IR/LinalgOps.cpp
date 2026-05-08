@@ -6849,16 +6849,28 @@ void ScaledContractOp::regionBuilder(
   }
 
   // TODO: Support fields with operators besides mult & add.
-  Type outType = block.getArgument(2).getType();
+  Type outType = block.getArgument(4).getType();
   Value lhsAtOutType =
       helper.buildTypeFn(castSignedness, outType, block.getArgument(0));
-  Value rhsAtOutType =
+  Value lhsScaleAtOutType =
       helper.buildTypeFn(castSignedness, outType, block.getArgument(1));
-  Value productAtOutType = helper.buildBinaryFn(BinaryFn::mul, lhsAtOutType,
-                                                rhsAtOutType, emitError);
+  Value scaledLhs = helper.buildBinaryFn(BinaryFn::mul, lhsAtOutType,
+                                         lhsScaleAtOutType, emitError);
+  if (!scaledLhs)
+    return;
+  Value rhsAtOutType =
+      helper.buildTypeFn(castSignedness, outType, block.getArgument(2));
+  Value rhsScaleAtOutType =
+      helper.buildTypeFn(castSignedness, outType, block.getArgument(3));
+  Value scaledRhs = helper.buildBinaryFn(BinaryFn::mul, rhsAtOutType,
+                                         rhsScaleAtOutType, emitError);
+  if (!scaledRhs)
+    return;
+  Value productAtOutType =
+      helper.buildBinaryFn(BinaryFn::mul, scaledLhs, scaledRhs, emitError);
   if (!productAtOutType)
     return;
-  Value result = helper.buildBinaryFn(BinaryFn::add, block.getArgument(2),
+  Value result = helper.buildBinaryFn(BinaryFn::add, block.getArgument(4),
                                       productAtOutType, emitError);
   if (!result)
     return;
