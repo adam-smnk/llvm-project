@@ -7145,6 +7145,133 @@ Speculation::Speculatability ScaledContractOp::getSpeculatability() {
   return getGenericSpeculatabilityImpl(cast<LinalgOp>(getOperation()));
 }
 
+/// Given a scaled contraction A, scaleA, B, scaleB, C, this method decomposes
+/// the operation into:
+///
+/// 1. An unscaled contraction accumulating into a zero-initialized temporary
+///    buffer T of 32-bit accumulator type:
+///      T[H] = SUM_{reduction dims} A[I] * B[J]
+///
+/// 2. An elementwise scaling generic that applies the scales and accumulates
+///    into the original C output:
+///      C[H] += cast(T[H]) * cast(scaleA[I']) * cast(scaleB[J'])
+///    where I' and J' are the scale index maps projected to the output space.
+///
+FailureOr<SmallVector<Value>>
+ScaledContractOp::decomposeOperation(OpBuilder &b) {
+  MLIRContext *ctx = b.getContext();
+  Location loc = getLoc();
+
+  if (!hasPureTensorSemantics())
+    return emitOpError(
+        "scaled contract decomposition only supported for tensor semantics");
+
+  // Validate that no scale depends on reduction dimension.
+  // Otherwise, contraction cannot be decomposed.
+  SmallVector<utils::IteratorType> iterTypes = getIteratorTypesArray();
+  auto usesReductionDim = [&](AffineMap map) -> bool {
+    for (AffineExpr result : map.getResults()) {
+      AffineDimExpr dim = nullptr;
+      if (auto expr = dyn_cast<AffineDimExpr>(result))
+        dim = expr;
+      else if (auto scaleBinExpr = dyn_cast<AffineBinaryOpExpr>(result)) {
+        dim = dyn_cast<AffineDimExpr>(scaleBinExpr.getLHS());
+      }
+      assert(dim && "invalid scale map");
+      if (iterTypes[dim.getPosition()] == utils::IteratorType::reduction)
+        return true;
+    }
+    return false;
+  };
+  SmallVector<AffineMap> maps = getIndexingMapsArray();
+  if (usesReductionDim(maps[1]) || usesReductionDim(maps[3]))
+    return emitOpError(
+        "cannot decompose scaled contract with reduction dim scaling");
+
+  Value A = getInputs()[0];
+  Value scaleA = getInputs()[1];
+  Value B = getInputs()[2];
+  Value scaleB = getInputs()[3];
+  Value C = getOutputs()[0];
+  if (isa<ComplexType>(getElementTypeOrSelf(C.getType())))
+    return emitError(
+        "cannot decompose scaled contract with complex element type");
+
+  OpBuilder::InsertionGuard guard(b);
+  b.setInsertionPoint(*this);
+
+  // First, perform standard contraction on inputs without scaling.
+  // The contraction accumulates into 32-bit type of the same element
+  // type as the input.
+  Type inputElemType = getElementTypeOrSelf(A.getType());
+  Type accElemType = isa<IntegerType>(inputElemType)
+                         ? cast<Type>(b.getI32Type())
+                         : cast<Type>(b.getF32Type());
+
+  // Create a zero-initialized temporary for the contraction.
+  SmallVector<OpFoldResult> outputDims = tensor::getMixedSizes(b, loc, C);
+  Value emptyTemp = tensor::EmptyOp::create(b, loc, outputDims, accElemType);
+  Value zeroVal = arith::getZeroConstant(b, loc, accElemType);
+  Value zeroTemp =
+      linalg::FillOp::create(b, loc, zeroVal, emptyTemp).getResult(0);
+
+  ArrayAttr contractionMaps =
+      b.getAffineMapArrayAttr({maps[0], maps[2], maps[4]});
+  SmallVector<NamedAttribute> contractAttrs;
+  if (auto castAttr = getCastAttr())
+    contractAttrs.push_back(b.getNamedAttr("cast", castAttr));
+  Value temp = linalg::ContractOp::create(b, loc, /*inputs=*/ValueRange{A, B},
+                                          /*outputs=*/ValueRange{zeroTemp},
+                                          contractionMaps, contractAttrs)
+                   .getResult(0);
+
+  // Follow-up with scaling elementwise operation.
+  // Iterates over the output dims only (all parallel).
+  unsigned numOrigDims = maps[4].getNumDims();
+  unsigned numOutputDims = maps[4].getNumResults();
+  // Use constant 0 as placeholder for reduction dims.
+  SmallVector<AffineExpr> dimSubst(numOrigDims, getAffineConstantExpr(0, ctx));
+  for (unsigned r = 0; r < numOutputDims; r++) {
+    auto dimExpr = cast<AffineDimExpr>(maps[4].getResult(r));
+    dimSubst[dimExpr.getPosition()] = getAffineDimExpr(r, ctx);
+  }
+  // Project a scale map from the full iteration space to the output dim
+  // space.
+  auto projectToOutputSpace = [&](AffineMap map) -> AffineMap {
+    return map.replaceDimsAndSymbols(dimSubst, {}, numOutputDims, 0);
+  };
+
+  // Identity map for temp and output (both have the same shape as C).
+  AffineMap identityMap = AffineMap::getMultiDimIdentityMap(numOutputDims, ctx);
+  SmallVector<AffineMap> genericMaps = {
+      identityMap, projectToOutputSpace(maps[1]), projectToOutputSpace(maps[3]),
+      identityMap};
+  SmallVector<utils::IteratorType> genericIterTypes(
+      numOutputDims, utils::IteratorType::parallel);
+  Type outElemType = getElementTypeOrSelf(C.getType());
+  TypeFn castSignedness = getCast();
+
+  auto scalingGeneric = linalg::GenericOp::create(
+      b, loc, TypeRange{C.getType()}, ValueRange{temp, scaleA, scaleB},
+      ValueRange{C}, genericMaps, genericIterTypes,
+      [&](OpBuilder &bb, Location, ValueRange args) {
+        RegionBuilderHelper helper(bb, *bb.getInsertionBlock());
+        Value scaleACast =
+            helper.buildTypeFn(castSignedness, outElemType, args[1]);
+        Value scaleBCast =
+            helper.buildTypeFn(castSignedness, outElemType, args[2]);
+        Value scaleProd =
+            helper.buildBinaryFn(BinaryFn::mul, scaleACast, scaleBCast);
+        Value tempCast =
+            helper.buildTypeFn(castSignedness, outElemType, args[0]);
+        Value scaled = helper.buildBinaryFn(BinaryFn::mul, tempCast, scaleProd);
+        Value result = helper.buildBinaryFn(BinaryFn::add, args[3], scaled);
+        helper.yieldOutputs({result});
+      });
+
+  return SmallVector<Value>{scalingGeneric.getResult(0)};
+}
+
 } // namespace linalg
 } // namespace mlir
 

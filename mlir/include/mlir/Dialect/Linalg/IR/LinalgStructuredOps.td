@@ -1218,6 +1218,7 @@ def BatchReduceMatmulOp : LinalgStructuredBase_Op<"batch_reduce_matmul", [
 //===----------------------------------------------------------------------===//
 
 def ScaledContractOp : LinalgStructuredBase_Op<"scaled_contract", [
+    DeclareOpInterfaceMethods<AggregatedOpInterface, ["decomposeOperation"]>,
     AttrSizedOperandSegments]> {
   let summary = [{
     Perform a scaled contraction on two inputs where their scaling is described
