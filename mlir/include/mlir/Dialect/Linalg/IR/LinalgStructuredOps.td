@@ -1320,6 +1320,7 @@ def ScaledContractOp : LinalgStructuredBase_Op<"scaled_contract", [
   let hasCustomAssemblyFormat = 1;
   let hasFolder = 1;
   let hasVerifier = 1;
+  let hasCanonicalizeMethod = 1;
 
   let extraClassDeclaration = structuredOpsBaseDecls # [{
     // Declare/implement functions necessary for LinalgStructuredInterface.

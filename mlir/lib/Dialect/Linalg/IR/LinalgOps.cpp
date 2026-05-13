@@ -7145,6 +7145,77 @@ Speculation::Speculatability ScaledContractOp::getSpeculatability() {
   return getGenericSpeculatabilityImpl(cast<LinalgOp>(getOperation()));
 }
 
+LogicalResult ScaledContractOp::canonicalize(ScaledContractOp scaledContractOp,
+                                             PatternRewriter &rewriter) {
+  SmallVector<AffineMap> maps = scaledContractOp.getIndexingMapsArray();
+  SmallVector<Value> inputs = llvm::to_vector(scaledContractOp.getInputs());
+  bool changed = false;
+
+  // Remove unit dimensions of scales.
+  // This form simplifies later checks w.r.t. scaling pattern.
+  for (int scaleInputIdx : {1, 3}) {
+    Value scale = inputs[scaleInputIdx];
+    AffineMap scaleMap = maps[scaleInputIdx];
+
+    auto scaleType = dyn_cast<ShapedType>(scale.getType());
+    if (!scaleType || scaleType.getRank() == 0)
+      continue;
+
+    // Collect the results and dimensions to keep.
+    SmallVector<int64_t> newShape;
+    SmallVector<AffineExpr> newMapResults;
+    ArrayRef<int64_t> scaleShape = scaleType.getShape();
+    for (auto [idx, dim] : llvm::enumerate(scaleShape)) {
+      if (dim == 1)
+        continue;
+      newShape.push_back(dim);
+      newMapResults.push_back(scaleMap.getResult(idx));
+    }
+    if (newShape.size() == scaleShape.size())
+      continue;
+
+    auto reassociation =
+        getReassociationIndicesForCollapse(scaleShape, newShape);
+    if (!reassociation)
+      continue;
+
+    // Collapse the unit dimensions.
+    Location loc = scaledContractOp.getLoc();
+    Type elemType = scaleType.getElementType();
+    Value collapsedScale;
+    if (isa<RankedTensorType>(scaleType)) {
+      auto newType = RankedTensorType::get(newShape, elemType);
+      collapsedScale = tensor::CollapseShapeOp::create(rewriter, loc, newType,
+                                                       scale, *reassociation);
+    } else if (isa<MemRefType>(scaleType)) {
+      auto newType = MemRefType::get(newShape, elemType);
+      collapsedScale = memref::CollapseShapeOp::create(rewriter, loc, newType,
+                                                       scale, *reassociation);
+    } else {
+      llvm_unreachable("Expected ranked memref or tensor type");
+    }
+
+    inputs[scaleInputIdx] = collapsedScale;
+    maps[scaleInputIdx] =
+        AffineMap::get(scaleMap.getNumDims(), scaleMap.getNumSymbols(),
+                       newMapResults, rewriter.getContext());
+    changed = true;
+  }
+
+  if (!changed)
+    return failure();
+
+  SmallVector<NamedAttribute> attrs;
+  if (auto castAttr = scaledContractOp.getCastAttr())
+    attrs.push_back(rewriter.getNamedAttr("cast", castAttr));
+  rewriter.replaceOpWithNewOp<ScaledContractOp>(
+      scaledContractOp, scaledContractOp.getResultTensors().getTypes(), inputs,
+      scaledContractOp.getOutputs(), rewriter.getAffineMapArrayAttr(maps),
+      attrs);
+
+  return success();
+}
+
 /// Given a scaled contraction A, scaleA, B, scaleB, C, this method decomposes
 /// the operation into:
 ///
