@@ -414,6 +414,7 @@ verifyScaledContractTileSizes(linalg::ScaledContractOp scaledContractOp,
       int64_t scaleFactor =
           cast<AffineConstantExpr>(binExpr.getRHS()).getValue();
       std::optional<int64_t> tileSize = getConstantIntValue(sizes[dimPos]);
+      // TODO: Improve verification for non-constant tile sizes
       if (tileSize &&
           !(*tileSize % scaleFactor == 0 || scaleFactor % *tileSize == 0)) {
         return scaledContractOp.emitOpError()

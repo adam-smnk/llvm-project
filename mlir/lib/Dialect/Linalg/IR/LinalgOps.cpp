@@ -6905,6 +6905,7 @@ LogicalResult ScaledContractOp::verify() {
   SmallVector<size_t> inOccurrences;
   SmallVector<size_t> outOccurrences;
 
+  // TODO: Refactor to reuse the same input validation from linalg.contract
   // A helper so that for each operand's affine_map and type we check that ...
   auto checkAffineMapAndType = [&](AffineMap affineMap, Type operandType,
                                    bool isInput) -> LogicalResult {
