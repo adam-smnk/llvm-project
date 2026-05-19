@@ -7236,12 +7236,14 @@ ScaledContractOp::decomposeOperation(OpBuilder &b) {
   b.setInsertionPoint(*this);
 
   // First, perform standard contraction on inputs without scaling.
-  // The contraction accumulates into 32-bit type of the same element
-  // type as the input.
+  // The contraction accumulates into 32-bit type if the input element type has
+  // a smaller bit-width; otherwise it accumulates into the input element type.
   Type inputElemType = getElementTypeOrSelf(A.getType());
-  Type accElemType = isa<IntegerType>(inputElemType)
-                         ? cast<Type>(b.getI32Type())
-                         : cast<Type>(b.getF32Type());
+  unsigned inputBitWidth = inputElemType.getIntOrFloatBitWidth();
+  Type accElemType =
+      isa<IntegerType>(inputElemType)
+          ? (inputBitWidth < 32 ? cast<Type>(b.getI32Type()) : inputElemType)
+          : (inputBitWidth < 32 ? cast<Type>(b.getF32Type()) : inputElemType);
 
   // Create a zero-initialized temporary for the contraction.
   SmallVector<OpFoldResult> outputDims = tensor::getMixedSizes(b, loc, C);
