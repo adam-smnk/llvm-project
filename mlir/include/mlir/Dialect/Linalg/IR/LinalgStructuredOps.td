@@ -1270,9 +1270,7 @@ def ScaledContractOp : LinalgStructuredBase_Op<"scaled_contract", [
     ```
     TODO: describe assumptions on dynamic sizes - static scaling block size
 
-    Input shapes must be perfectly divisible by corresponding scaling factors
-    if any are present. In case of dynamic shapes, it is assumed that all sizes
-    are correct.
+    In case of dynamic shapes, it is assumed that all sizes are correct.
 
     Numeric casting is performed on the inputs and scales, promoting/truncating
     them to the same data type as the accumulator/output.

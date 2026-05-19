@@ -7071,10 +7071,12 @@ LogicalResult ScaledContractOp::verify() {
         if (inputShape[idx] != ShapedType::kDynamic &&
             scaleShape[scaleIdx] != ShapedType::kDynamic &&
             !((scaleShape[scaleIdx] == 1 && inputShape[idx] <= scaleFactor) ||
-              inputShape[idx] / scaleShape[scaleIdx] == scaleFactor)) {
-          return emitError() << "Invalid shapes for the scale factor, expected "
-                             << inputShape[idx] / scaleShape[scaleIdx]
-                             << " but got " << scaleFactor;
+              llvm::divideCeilSigned(inputShape[idx], scaleFactor) ==
+                  static_cast<int64_t>(scaleShape[scaleIdx]))) {
+          return emitError()
+                 << "Invalid scale shape at dim " << idx << ", expected "
+                 << llvm::divideCeilSigned(inputShape[idx], scaleFactor)
+                 << " but got " << scaleShape[scaleIdx];
         }
         scaleIdx++;
       } else {
