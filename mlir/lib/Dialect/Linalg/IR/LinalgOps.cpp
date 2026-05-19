@@ -7257,11 +7257,10 @@ ScaledContractOp::decomposeOperation(OpBuilder &b) {
   SmallVector<NamedAttribute> contractAttrs;
   if (auto castAttr = getCastAttr())
     contractAttrs.push_back(b.getNamedAttr("cast", castAttr));
-  Value contract =
-      linalg::ContractOp::create(b, loc, /*inputs=*/ValueRange{A, B},
-                                 /*outputs=*/ValueRange{zeroTemp},
-                                 contractionMaps, contractAttrs)
-          .getResult(0);
+  Value temp = linalg::ContractOp::create(b, loc, /*inputs=*/ValueRange{A, B},
+                                          /*outputs=*/ValueRange{zeroTemp},
+                                          contractionMaps, contractAttrs)
+                   .getResult(0);
 
   // Follow-up with scaling elementwise operation.
   // Iterates over the output dims only (all parallel).
@@ -7281,69 +7280,33 @@ ScaledContractOp::decomposeOperation(OpBuilder &b) {
 
   // Identity map for temp and output (both have the same shape as C).
   AffineMap identityMap = AffineMap::getMultiDimIdentityMap(numOutputDims, ctx);
+  SmallVector<AffineMap> genericMaps = {
+      identityMap, projectToOutputSpace(maps[1]), projectToOutputSpace(maps[3]),
+      identityMap};
+  SmallVector<utils::IteratorType> genericIterTypes(
+      numOutputDims, utils::IteratorType::parallel);
   Type outElemType = getElementTypeOrSelf(C.getType());
-  TypeFn castSignedness = TypeFn::cast_signed;
-  if (auto castAttr = getCastAttr())
-    castSignedness = castAttr.getValue();
+  TypeFn castSignedness = getCast();
 
-  SmallVector<utils::IteratorType> allParallel(numOutputDims,
-                                               utils::IteratorType::parallel);
+  auto scalingGeneric = linalg::GenericOp::create(
+      b, loc, TypeRange{C.getType()}, ValueRange{temp, scaleA, scaleB},
+      ValueRange{C}, genericMaps, genericIterTypes,
+      [&](OpBuilder &bb, Location, ValueRange args) {
+        RegionBuilderHelper helper(bb, *bb.getInsertionBlock());
+        Value scaleACast =
+            helper.buildTypeFn(castSignedness, outElemType, args[1]);
+        Value scaleBCast =
+            helper.buildTypeFn(castSignedness, outElemType, args[2]);
+        Value scaleProd =
+            helper.buildBinaryFn(BinaryFn::mul, scaleACast, scaleBCast);
+        Value tempCast =
+            helper.buildTypeFn(castSignedness, outElemType, args[0]);
+        Value scaled = helper.buildBinaryFn(BinaryFn::mul, tempCast, scaleProd);
+        Value result = helper.buildBinaryFn(BinaryFn::add, args[3], scaled);
+        helper.yieldOutputs({result});
+      });
 
-  // Compute elementwise product of the two scales over the output space,
-  // using projected scale affine maps to handle broadcast/transpose.
-  SmallVector<AffineMap> scaleProdMaps = {projectToOutputSpace(maps[1]),
-                                          projectToOutputSpace(maps[3]),
-                                          identityMap};
-  Value emptyOut = tensor::EmptyOp::create(b, loc, outputDims, outElemType);
-  Value scaleProd =
-      linalg::GenericOp::create(
-          b, loc, TypeRange{emptyOut.getType()}, ValueRange{scaleA, scaleB},
-          ValueRange{emptyOut}, scaleProdMaps, allParallel,
-          [&](OpBuilder &bb, Location, ValueRange args) {
-            RegionBuilderHelper helper(bb, *bb.getInsertionBlock());
-            Value castA =
-                helper.buildTypeFn(castSignedness, outElemType, args[0]);
-            Value castB =
-                helper.buildTypeFn(castSignedness, outElemType, args[1]);
-            Value res = helper.buildBinaryFn(BinaryFn::mul, castA, castB);
-            helper.yieldOutputs({res});
-          })
-          .getResult(0);
-
-  // Scale the contraction result by the scale product.
-  Value scaledContract =
-      linalg::GenericOp::create(
-          b, loc, TypeRange{emptyOut.getType()},
-          ValueRange{contract, scaleProd}, ValueRange{emptyOut},
-          SmallVector<AffineMap>(3, identityMap), allParallel,
-          [&](OpBuilder &bb, Location, ValueRange args) {
-            RegionBuilderHelper helper(bb, *bb.getInsertionBlock());
-            Value castA =
-                helper.buildTypeFn(castSignedness, outElemType, args[0]);
-            Value castB =
-                helper.buildTypeFn(castSignedness, outElemType, args[1]);
-            Value res = helper.buildBinaryFn(BinaryFn::mul, castA, castB);
-            helper.yieldOutputs({res});
-          })
-          .getResult(0);
-
-  // Accumulate scaled result into C.
-  Value result =
-      linalg::GenericOp::create(
-          b, loc, TypeRange{C.getType()}, ValueRange{scaledContract},
-          ValueRange{C}, SmallVector<AffineMap>(2, identityMap), allParallel,
-          [&](OpBuilder &bb, Location, ValueRange args) {
-            RegionBuilderHelper helper(bb, *bb.getInsertionBlock());
-            Value castA =
-                helper.buildTypeFn(castSignedness, outElemType, args[0]);
-            Value castB =
-                helper.buildTypeFn(castSignedness, outElemType, args[1]);
-            Value res = helper.buildBinaryFn(BinaryFn::add, castA, castB);
-            helper.yieldOutputs({res});
-          })
-          .getResult(0);
-
-  return SmallVector<Value>{result};
+  return SmallVector<Value>{scalingGeneric.getResult(0)};
 }
 
 } // namespace linalg
