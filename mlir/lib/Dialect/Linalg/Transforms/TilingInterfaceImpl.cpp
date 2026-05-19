@@ -413,9 +413,11 @@ verifyScaledContractTileSizes(linalg::ScaledContractOp scaledContractOp,
       unsigned dimPos = cast<AffineDimExpr>(binExpr.getLHS()).getPosition();
       int64_t scaleFactor =
           cast<AffineConstantExpr>(binExpr.getRHS()).getValue();
-      std::optional<int64_t> tileSize = getConstantIntValue(sizes[dimPos]);
-      // TODO: Improve verification for non-constant tile sizes
-      if (tileSize &&
+      FailureOr<int64_t> tileSize =
+          ValueBoundsConstraintSet::computeConstantBound(
+              presburger::BoundType::UB, sizes[dimPos],
+              /*stopCondition=*/nullptr, ValueBoundsOptions{/*closedUB=*/true});
+      if (succeeded(tileSize) &&
           !(*tileSize % scaleFactor == 0 || scaleFactor % *tileSize == 0)) {
         return scaledContractOp.emitOpError()
                << "tile size " << *tileSize << " for dim " << dimPos
