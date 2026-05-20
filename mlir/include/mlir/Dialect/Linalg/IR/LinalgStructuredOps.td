@@ -1235,49 +1235,55 @@ def ScaledContractOp : LinalgStructuredBase_Op<"scaled_contract", [
       `D[H] = (SUM_{(I ∪ J) \ H} (A[I] * scale_A[I]) * (B[J] * scale_B[J])) + C[H]`
 
     The iteration type of each dim is inferred.
+
+    The input operands `A`, `B`, and `C` follow the standard contraction semantics
+    together with broadcasting and transposition rules.
     See `linalg.contract` for further details.
 
-    TODO: describe affine maps for the scales
-    TODO: describe dim sizes for the scales
-    TODO: describe the broadcast and transpose semantics - disable both?
+    **Affine maps for scales**
 
+    Each scale indexing map describes the scaling scheme for the corresponding
+    input `A` and `B`. The following scaling schemes are supported:
+
+    - Tensor scaling - no dimensions: a scalar value used to scale the whole input.
+    - Dimension scaling - dimension `d`: one scale value per element along `d`.
+    - Block scaling - binary expression `d floordiv B`: one scale value for every
+      `B` elements along `d` where `B` corresponds to the block size.
+
+    Scale maps may only use dimensions present in the corresponding input's map.
+    A dimension absent from the scale map indicate that a single scale value is
+    reused across the whole input dimension.
+    Scale dimensions must not be permuted w.r.t. to the input's dimensions.
+
+    **Dim sizes for scales**
+
+    - Tensor scaling: a unit-size scale.
+    - Dimension scaling (`d`): the scale dim size equals the input dim size.
+    - Block scaling (`d floordiv B`): the scale dim size equals
+      `ceil(input_dim_size / B)`.
+
+    For dynamic shapes, all sizes are assumed to be correct at runtime.
+
+    Example scaled matmul with transposed B:
     ```mlir
     %D = linalg.scaled_contract
         indexing_maps = [
           affine_map<(m, n, k) -> (m, k)>,
-          affine_map<(m, n, k) -> (m floordiv 128, k floordiv 128)>, // A - 128x128 block scale
-          affine_map<(m, n, k) -> (k, n)>,
-          affine_map<(m, n, k) -> (k)>, // B - row-wise scale
+          affine_map<(m, n, k) -> (m floordiv 32, k floordiv 128)>, // A - 32x128 block scale
+          affine_map<(m, n, k) -> (n, k)>,
+          affine_map<(m, n, k) -> (n)>, // B - row-wise scale
           affine_map<(m, n, k) -> (m, n)>]
         ins(%A, %scale_A, %B, %scale_B
-          : tensor<256x512xi8>, tensor<2x4xf8E8M0FNU>,
-            tensor<512x128xi8>, tensor<512xf8E8M0FNU>)
-        outs(%C: tensor<256x128xf32>) -> tensor<256x128xf32>
+          : tensor<200x512xi8>, tensor<7x4xf8E8M0FNU>,
+            tensor<128x512xi8>, tensor<128xf8E8M0FNU>)
+        outs(%C: tensor<200x128xf32>) -> tensor<200x128xf32>
     ```
-
-    ```mlir
-    %D = linalg.scaled_contract
-        indexing_maps = [
-          affine_map<(batch, m, n, k) -> (batch, m, k)>,
-          affine_map<(batch, m, n, k) -> (batch, m, k floordiv 32)>, // A - 1x32 block scale
-          affine_map<(batch, m, n, k) -> (batch, k, n)>,
-          affine_map<(batch, m, n, k) -> (batch, k, n floordiv 16)>, // B - 1x16 block scale
-          affine_map<(batch, m, n, k) -> (batch, m, n)>]
-        ins(%A, %scale_A, %B, %scale_B
-          : tensor<?x?x?xf8E5M2>, tensor<?x?x?xf8E8M0FNU>,
-            tensor<?x?x?xf8E5M2>, tensor<?x?x?xf8E8M0FNU>)
-        outs(%C: tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
-    ```
-    TODO: describe assumptions on dynamic sizes - static scaling block size
-
-    In case of dynamic shapes, it is assumed that all sizes are correct.
 
     Numeric casting is performed on the inputs and scales, promoting/truncating
     them to the same data type as the accumulator/output.
 
     TODO: Allow control over the combining/accumulating op and possibly the
           multiplication op.
-    TODO: Support more scaling patterns via scales' maps.
   }];
 
   let arguments = (ins
