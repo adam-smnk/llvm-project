@@ -7062,17 +7062,12 @@ LogicalResult ScaledContractOp::verify() {
           continue;
         int64_t scaleFactor =
             dyn_cast<AffineConstantExpr>(scaleBinExpr.getRHS()).getValue();
-        // Validate scaling factor for static shapes:
-        //   - for whole-dim scaling (scale dim size 1), the input dim size must
-        //     be smaller or equal to the scaling factor;
-        //   - for block scaling (multiple scales), there must be the exact
-        //     number of scales as prescribed by the scaling factor;
+        // Validate scaling factor for static shapes.
         // For dynamic shapes, it is assumed that all sizes are correct.
         if (inputShape[idx] != ShapedType::kDynamic &&
             scaleShape[scaleIdx] != ShapedType::kDynamic &&
-            !((scaleShape[scaleIdx] == 1 && inputShape[idx] <= scaleFactor) ||
-              llvm::divideCeilSigned(inputShape[idx], scaleFactor) ==
-                  static_cast<int64_t>(scaleShape[scaleIdx]))) {
+            llvm::divideCeilSigned(inputShape[idx], scaleFactor) !=
+                static_cast<int64_t>(scaleShape[scaleIdx])) {
           return emitError()
                  << "Invalid scale shape at dim " << idx << ", expected "
                  << llvm::divideCeilSigned(inputShape[idx], scaleFactor)
