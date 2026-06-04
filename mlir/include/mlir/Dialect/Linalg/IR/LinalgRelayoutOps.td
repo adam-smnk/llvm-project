@@ -429,14 +429,14 @@ def Linalg_MXPackOp : Op<Linalg_Dialect, "mx_pack", [
               "$_op.getResult(1).getType() == $scale_dest.getType()">>]> {
   let summary = "linalg.mx_pack operation";
   let description = [{
-    The "mx_pack" operation convert an input data into a microscaled (MX)
-    output and a collection of applied scales.
+    The "mx_pack" operation convert an input into a microscaled (MX) output and
+    a collection of applied scales.
 
-    `scale_dims` specifies over which input dimensions different scales are applied.
+    `scale_dims` specifies over which input dimensions different scaling is applied.
     A single shared scale is used for each contiguous block of `k[i]` elements along
-    the i-th specified dimensions, where `k[i]` is the corresponding scaling block
-    size, and all remaining input dimensions.
-    When no dims are specified, the whole input is scaled with a single value.
+    the i-th selected dimensions, where `k[i]` is the corresponding scaling block
+    size, and all other unselected input dimensions.
+    When no dims are selected, the whole input is scaled with a single value.
 
     `scale_blocks` specifies the scaling block sizes `k` for each dimension listed
     in `scale_dims`.
