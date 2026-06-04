@@ -410,4 +410,107 @@ def Linalg_UnPackOp : Linalg_RelayoutOp<"unpack"> {
   let hasCustomAssemblyFormat = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// MXPackOp
+//===----------------------------------------------------------------------===//
+
+def Linalg_MXPackOp : Op<Linalg_Dialect, "mx_pack", [
+    DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
+    DestinationStyleOpInterface,
+    ConditionallySpeculatable,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface,
+        ["reifyResultShapes"]>,
+    PredOpTrait<"pack result type matches type of pack dest",
+        CPred<"$_op.getNumResults() == 0 || "
+              "$_op.getResult(0).getType() == $dest.getType()">>,
+    PredOpTrait<"scale result type matches type of scale dest",
+        CPred<"$_op.getNumResults() == 0 || "
+              "$_op.getResult(1).getType() == $scale_dest.getType()">>]> {
+  let summary = "linalg.mx_pack operation";
+  let description = [{
+    The "mx_pack" operation convert an input data into a microscaled (MX)
+    output and a collection of applied scales.
+
+    `scale_dims` specifies over which input dimensions different scales are applied.
+    A single shared scale is used for each contiguous block of `k[i]` elements along
+    the i-th specified dimensions, where `k[i]` is the corresponding scaling block
+    size, and all remaining input dimensions.
+    When no dims are specified, the whole input is scaled with a single value.
+
+    `scale_blocks` specifies the scaling block sizes `k` for each dimension listed
+    in `scale_dims`.
+
+    The scaled output always has the same shape as the input.
+    The scales' rank is equal to number of `scale_dims`, with the i-th dimension size
+    being `ceil(inputShape[scale_dims[i]] / scale_blocks[i])`.
+
+    Example:
+    ```mlir
+    // A single scale for the whole input.
+    %mx_pack, %mx_scale = linalg.mx_pack %source
+      scale_dims = []
+      scale_blocks = []
+      into %dest, %scale_dest
+      : tensor<256xf32> -> tensor<256xi8>, tensor<f8E8M0FNU>
+
+    // One scale per row of input elements.
+    %mx_pack, %mx_scale = linalg.mx_pack %source
+      scale_dims = [0]
+      scale_blocks = [1]
+      into %dest, %scale_dest
+      : tensor<128x512xf32> -> tensor<128x512xi8>, tensor<128xf8E8M0FNU>
+
+    // One scale per 64x128 block of input elements.
+    %mx_pack, %mx_scale = linalg.mx_pack %source
+      scale_dims = [0, 1]
+      scale_blocks = [64, 128]
+      into %dest, %scale_dest
+      : tensor<128x500xf32> -> tensor<128x500xf8E5M2>, tensor<2x4xf8E8M0FNU>
+    ```
+  }];
+
+  let arguments = (ins TensorOrMemRef<[AnyType]>:$source,
+      TensorOrMemRef<[AnyType]>:$dest,
+      TensorOrMemRef<[AnyType]>:$scale_dest,
+      DenseI64ArrayAttr:$scale_dims,
+      DenseI64ArrayAttr:$scale_blocks);
+
+  // Two results for tensor semantics, zero for memref semantics.
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+
+  let builders = [
+    OpBuilder<(ins "Value":$source, "Value":$dest, "Value":$scaleDest,
+        "ArrayRef<int64_t>":$scaleDims, "ArrayRef<int64_t>":$scaleBlocks)>
+  ];
+
+  let extraClassDeclaration = [{
+    ShapedType getSourceType() {
+      return ::llvm::cast<ShapedType>(getSource().getType());
+    }
+    ShapedType getDestType() {
+      return ::llvm::cast<ShapedType>(getDest().getType());
+    }
+    ShapedType getScaleDestType() {
+      return ::llvm::cast<ShapedType>(getScaleDest().getType());
+    }
+
+    /// Destination passing style interface method.
+    MutableOperandRange getDpsInitsMutable() {
+      return ::mlir::MutableOperandRange(getOperation(), 1, 2);
+    }
+
+    /// Interface method for ConditionallySpeculatable.
+    Speculation::Speculatability getSpeculatability();
+
+    /// Returns the shape of the resulting scales.
+    static SmallVector<int64_t> inferScaleShape(ArrayRef<int64_t> inputShape,
+                                                ArrayRef<int64_t> scaleDims,
+                                                ArrayRef<int64_t> scaleBlocks);
+  }];
+
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+}
+
 #endif // LINALG_RELEAYOUT_OPS

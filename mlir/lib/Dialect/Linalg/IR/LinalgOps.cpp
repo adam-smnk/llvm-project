@@ -7304,6 +7304,242 @@ ScaledContractOp::decomposeOperation(OpBuilder &b) {
   return SmallVector<Value>{scalingGeneric.getResult(0)};
 }
 
+//===----------------------------------------------------------------------===//
+// MXPackOp
+//===----------------------------------------------------------------------===//
+
+void MXPackOp::getAsmResultNames(
+    function_ref<void(Value, StringRef)> setNameFn) {
+  auto results = getResults();
+  if (!results.empty()) {
+    assert(results.size() == 2 && "Expected exactly 2 results for MXPackOp");
+    setNameFn(results[0], "mx_pack");
+    setNameFn(results[1], "mx_scale");
+  }
+}
+
+void MXPackOp::build(OpBuilder &builder, OperationState &state, Value source,
+                     Value dest, Value scaleDest, ArrayRef<int64_t> scaleDims,
+                     ArrayRef<int64_t> scaleBlocks) {
+  state.addOperands({source, dest, scaleDest});
+  state.addAttribute("scale_dims", builder.getDenseI64ArrayAttr(scaleDims));
+  state.addAttribute("scale_blocks", builder.getDenseI64ArrayAttr(scaleBlocks));
+  if (llvm::isa<RankedTensorType>(dest.getType()))
+    state.addTypes({dest.getType(), scaleDest.getType()});
+}
+
+ParseResult MXPackOp::parse(OpAsmParser &parser, OperationState &result) {
+  OpAsmParser::UnresolvedOperand source, dest, scaleDest;
+  Type sourceType, destType, scaleDestType;
+
+  if (parser.parseOperand(source))
+    return failure();
+
+  if (parser.parseKeyword("scale_dims") || parser.parseEqual())
+    return failure();
+  SmallVector<int64_t> scaleDimsVec;
+  if (parser.parseCommaSeparatedList(AsmParser::Delimiter::Square, [&]() {
+        int64_t value;
+        if (parser.parseInteger(value))
+          return failure();
+        scaleDimsVec.push_back(value);
+        return success();
+      }))
+    return failure();
+  result.addAttribute("scale_dims",
+                      parser.getBuilder().getDenseI64ArrayAttr(scaleDimsVec));
+
+  if (parser.parseKeyword("scale_blocks") || parser.parseEqual())
+    return failure();
+  SmallVector<int64_t> scaleBlocksVec;
+  if (parser.parseCommaSeparatedList(AsmParser::Delimiter::Square, [&]() {
+        int64_t value;
+        if (parser.parseInteger(value))
+          return failure();
+        scaleBlocksVec.push_back(value);
+        return success();
+      }))
+    return failure();
+  result.addAttribute("scale_blocks",
+                      parser.getBuilder().getDenseI64ArrayAttr(scaleBlocksVec));
+
+  if (parser.parseKeyword("into") || parser.parseOperand(dest) ||
+      parser.parseComma() || parser.parseOperand(scaleDest))
+    return failure();
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  if (parser.parseColon() || parser.parseType(sourceType))
+    return failure();
+  if (failed(parser.parseOptionalArrow())) {
+    return parser.emitError(parser.getCurrentLocation(),
+                            "mx_pack requires '->' and destination types");
+  }
+  if (parser.parseType(destType) || parser.parseComma() ||
+      parser.parseType(scaleDestType))
+    return failure();
+
+  if (parser.resolveOperand(source, sourceType, result.operands) ||
+      parser.resolveOperand(dest, destType, result.operands) ||
+      parser.resolveOperand(scaleDest, scaleDestType, result.operands))
+    return failure();
+
+  if (!llvm::isa<MemRefType>(destType))
+    result.addTypes({destType, scaleDestType});
+
+  return success();
+}
+
+void MXPackOp::print(OpAsmPrinter &p) {
+  p << " " << getSource();
+
+  p << " scale_dims = [";
+  llvm::interleaveComma(getScaleDims(), p);
+  p << "]";
+
+  p << " scale_blocks = [";
+  llvm::interleaveComma(getScaleBlocks(), p);
+  p << "]";
+
+  p << " into " << getDest() << ", " << getScaleDest();
+
+  p.printOptionalAttrDict((*this)->getAttrs(), {"scale_dims", "scale_blocks"});
+
+  p << " : " << getSource().getType();
+  p << " -> " << getDest().getType() << ", " << getScaleDest().getType();
+}
+
+SmallVector<int64_t> MXPackOp::inferScaleShape(ArrayRef<int64_t> inputShape,
+                                               ArrayRef<int64_t> scaleDims,
+                                               ArrayRef<int64_t> scaleBlocks) {
+  assert(scaleDims.size() == scaleBlocks.size() &&
+         "scale dims and scale blocks must have the same size");
+  SmallVector<int64_t> scaleShape;
+  for (auto [dim, block] : llvm::zip_equal(scaleDims, scaleBlocks)) {
+    if (ShapedType::isDynamic(inputShape[dim]))
+      scaleShape.push_back(ShapedType::kDynamic);
+    else
+      scaleShape.push_back(llvm::divideCeilSigned(inputShape[dim], block));
+  }
+  return scaleShape;
+}
+
+LogicalResult MXPackOp::verify() {
+  auto scaleDims = getScaleDims();
+  auto scaleBlocks = getScaleBlocks();
+
+  if (scaleDims.size() != scaleBlocks.size())
+    return emitOpError("scale dims and scale blocks must have the same length");
+
+  ShapedType sourceType = getSourceType();
+  ShapedType destType = getDestType();
+  ShapedType scaleDestType = getScaleDestType();
+
+  if (!hasPureBufferSemantics() && !hasPureTensorSemantics())
+    return emitOpError("mixing tensor and buffer semantics is not allowed");
+  const unsigned numResults = getNumResults();
+  if (hasPureTensorSemantics() && numResults != 2)
+    return emitOpError("expected 2 results, got ") << numResults;
+  if (hasPureBufferSemantics() && numResults != 0)
+    return emitOpError("expected 0 results, got ") << numResults;
+
+  if (sourceType.getShape() != destType.getShape())
+    return emitOpError("dest must have the same shape as source");
+
+  int64_t sourceRank = sourceType.getRank();
+  SmallVector<bool> seenDims(sourceRank, false);
+  for (auto [idx, dim] : llvm::enumerate(scaleDims)) {
+    if (dim < 0 || dim >= sourceRank) {
+      return emitOpError() << "scale_dims[" << idx << "] = " << dim
+                           << " is out of range for source rank " << sourceRank;
+    }
+    if (seenDims[dim])
+      return emitOpError("scale dims must not contain duplicate values");
+    seenDims[dim] = true;
+    if (idx > 0 && dim < scaleDims[idx - 1])
+      return emitOpError("scale dims must not be permuted");
+  }
+
+  for (auto [idx, block] : llvm::enumerate(scaleBlocks)) {
+    if (block <= 0) {
+      return emitOpError() << "scale_blocks[" << idx
+                           << "] must be positive, got " << block;
+    }
+  }
+
+  if (static_cast<int64_t>(scaleDestType.getRank()) !=
+      static_cast<int64_t>(scaleDims.size()))
+    return emitOpError("scales rank must equal the number of scale dims");
+
+  for (size_t idx = 0; idx < scaleDims.size(); ++idx) {
+    int64_t dim = scaleDims[idx];
+    int64_t block = scaleBlocks[idx];
+    int64_t inputDimSize = sourceType.getDimSize(dim);
+    int64_t scaleDimSize = scaleDestType.getDimSize(idx);
+    if (!ShapedType::isDynamic(inputDimSize) &&
+        !ShapedType::isDynamic(scaleDimSize)) {
+      int64_t expected = llvm::divideCeilSigned(inputDimSize, block);
+      if (scaleDimSize != expected) {
+        return emitOpError() << "scale dim " << idx << " should be " << expected
+                             << " (= ceil(" << inputDimSize << " / " << block
+                             << ")), but got " << scaleDimSize;
+      }
+    }
+  }
+
+  return success();
+}
+
+LogicalResult
+MXPackOp::reifyResultShapes(OpBuilder &builder,
+                            ReifiedRankedShapedTypeDims &reifiedReturnShapes) {
+  // For memref semantics there are no results.
+  if (!hasPureTensorSemantics())
+    return success();
+  auto reifyOperandShape = [&](Value operand) {
+    int64_t rank = llvm::cast<RankedTensorType>(operand.getType()).getRank();
+    SmallVector<OpFoldResult> shape(rank);
+    for (int64_t dim = 0; dim < rank; ++dim)
+      shape[dim] = createFoldedDimOp(builder, getLoc(), operand, dim);
+    reifiedReturnShapes.push_back(std::move(shape));
+  };
+  reifyOperandShape(getDest());
+  reifyOperandShape(getScaleDest());
+  return success();
+}
+
+void MXPackOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  if (hasPureTensorSemantics())
+    return;
+
+  for (OpOperand &opOperand : getOperation()->getOpOperands()) {
+    if (!llvm::isa<MemRefType>(opOperand.get().getType()))
+      continue;
+
+    if (&opOperand == &getSourceMutable()) {
+      effects.emplace_back(MemoryEffects::Read::get(), &opOperand, /*stage=*/0,
+                           /*effectOnFullRegion=*/true,
+                           SideEffects::DefaultResource::get());
+    } else {
+      effects.emplace_back(MemoryEffects::Read::get(), &opOperand, /*stage=*/0,
+                           /*effectOnFullRegion=*/true,
+                           SideEffects::DefaultResource::get());
+      effects.emplace_back(MemoryEffects::Write::get(), &opOperand, /*stage=*/0,
+                           /*effectOnFullRegion=*/true,
+                           SideEffects::DefaultResource::get());
+    }
+  }
+}
+
+Speculation::Speculatability MXPackOp::getSpeculatability() {
+  if (!hasPureTensorSemantics())
+    return Speculation::NotSpeculatable;
+  return Speculation::Speculatable;
+}
+
 } // namespace linalg
 } // namespace mlir
 
