@@ -510,6 +510,7 @@ def Linalg_MXPackOp : Op<Linalg_Dialect, "mx_pack", [
   }];
 
   let hasVerifier = 1;
+  let hasCanonicalizeMethod = 1;
   let hasCustomAssemblyFormat = 1;
 }
 

@@ -7534,6 +7534,66 @@ void MXPackOp::getEffects(
   }
 }
 
+LogicalResult MXPackOp::canonicalize(MXPackOp mxPackOp,
+                                     PatternRewriter &rewriter) {
+  Value scaleDest = mxPackOp.getScaleDest();
+  auto scaleDestType = cast<ShapedType>(scaleDest.getType());
+  if (scaleDestType.getRank() == 0)
+    return failure();
+
+  // Remove unit dimensions of scales.
+  ArrayRef<int64_t> scaleShape = scaleDestType.getShape();
+  SmallVector<int64_t> newShape;
+  SmallVector<int64_t> newScaleDims;
+  SmallVector<int64_t> newScaleBlocks;
+  for (auto [dim, scaleDim, scaleBlock] : llvm::zip_equal(
+           scaleShape, mxPackOp.getScaleDims(), mxPackOp.getScaleBlocks())) {
+    if (dim == 1)
+      continue;
+    newShape.push_back(dim);
+    newScaleDims.push_back(scaleDim);
+    newScaleBlocks.push_back(scaleBlock);
+  }
+
+  if (newShape.size() == scaleShape.size())
+    return failure();
+
+  auto reassociation = getReassociationIndicesForCollapse(scaleShape, newShape);
+  if (!reassociation)
+    return failure();
+
+  Location loc = mxPackOp.getLoc();
+  Type elemType = scaleDestType.getElementType();
+  Value newScaleDest;
+  if (isa<RankedTensorType>(scaleDestType)) {
+    newScaleDest = tensor::CollapseShapeOp::create(
+        rewriter, loc, RankedTensorType::get(newShape, elemType), scaleDest,
+        *reassociation);
+  } else if (isa<MemRefType>(scaleDestType)) {
+    newScaleDest = memref::CollapseShapeOp::create(
+        rewriter, loc, MemRefType::get(newShape, elemType), scaleDest,
+        *reassociation);
+  } else {
+    llvm_unreachable("Expected ranked memref or tensor type");
+  }
+
+  auto newOp =
+      MXPackOp::create(rewriter, loc, mxPackOp.getSource(), mxPackOp.getDest(),
+                       newScaleDest, newScaleDims, newScaleBlocks);
+
+  auto results = mxPackOp.getResults();
+  if (!results.empty()) {
+    rewriter.replaceAllUsesWith(results[0], newOp.getResult(0));
+    Value expandedScale = tensor::ExpandShapeOp::create(
+        rewriter, loc, cast<RankedTensorType>(scaleDestType),
+        newOp.getResult(1), *reassociation);
+    rewriter.replaceAllUsesWith(results[1], expandedScale);
+  }
+
+  rewriter.eraseOp(mxPackOp);
+  return success();
+}
+
 Speculation::Speculatability MXPackOp::getSpeculatability() {
   if (!hasPureTensorSemantics())
     return Speculation::NotSpeculatable;
