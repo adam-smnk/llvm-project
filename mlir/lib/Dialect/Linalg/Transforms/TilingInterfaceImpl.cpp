@@ -1764,6 +1764,171 @@ struct UnPackOpTiling
   }
 };
 
+/// Compute the `scale_dest` tile (offsets and sizes) implied by a data tile of
+/// `linalg.mx_pack`. The data tile is described by `offsets`/`sizes` over the
+/// `dest` (i.e. source) dimensions. Each scaling dimension `scale_dims[i]` is
+/// tied to scale dimension `i` through the scaling block size with the relation
+///   scaleOffset[i] = offsets[scale_dims[i]] floordiv scale_blocks[i]
+///   scaleSize[i]   = sizes[scale_dims[i]]   ceildiv  scale_blocks[i]
+/// This mirrors the affine relation between the `dest` and `scale_dest` maps,
+/// e.g. for a 2-D `dest` map `(d0, d1) -> (d0, d1)` the `scale_dest` map is
+/// `(d0, d1) -> (d0 floordiv scale_blocks[0], d1 floordiv scale_blocks[1])`.
+static void getMXPackScaleTile(OpBuilder &b, Location loc, MXPackOp mxPackOp,
+                               ArrayRef<OpFoldResult> offsets,
+                               ArrayRef<OpFoldResult> sizes,
+                               SmallVectorImpl<OpFoldResult> &scaleOffsets,
+                               SmallVectorImpl<OpFoldResult> &scaleSizes) {
+  AffineExpr dim0 = b.getAffineDimExpr(0);
+  for (auto [scaleDim, block] :
+       llvm::zip_equal(mxPackOp.getScaleDims(), mxPackOp.getScaleBlocks())) {
+    scaleOffsets.push_back(affine::makeComposedFoldedAffineApply(
+        b, loc, dim0.floorDiv(block), {offsets[scaleDim]}));
+    scaleSizes.push_back(affine::makeComposedFoldedAffineApply(
+        b, loc, dim0.ceilDiv(block), {sizes[scaleDim]}));
+  }
+}
+
+struct MXPackOpTiling
+    : public TilingInterface::ExternalModel<MXPackOpTiling, linalg::MXPackOp> {
+
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
+    // The iteration domain is defined over the `dest` (and source) dimensions.
+    // Only the scaling dimensions can be computed in parallel and thus tiled;
+    // every other dimension is reduced into the per-block abs-max (see
+    // `MXPackOp::decomposeOperation`) and is therefore a reduction dimension.
+    auto mxPackOp = cast<MXPackOp>(op);
+    SmallVector<utils::IteratorType> iteratorTypes(
+        mxPackOp.getSourceType().getRank(), utils::IteratorType::reduction);
+    for (int64_t scaleDim : mxPackOp.getScaleDims())
+      iteratorTypes[scaleDim] = utils::IteratorType::parallel;
+    return iteratorTypes;
+  }
+
+  SmallVector<Range> getIterationDomain(Operation *op, OpBuilder &b) const {
+    auto mxPackOp = cast<MXPackOp>(op);
+    Location loc = mxPackOp.getLoc();
+    OpFoldResult zero = b.getIndexAttr(0);
+    OpFoldResult one = b.getIndexAttr(1);
+    Value dest = mxPackOp.getDest();
+    int64_t rank = mxPackOp.getDestType().getRank();
+    SmallVector<Range> loopBounds(rank);
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      loopBounds[dim].offset = zero;
+      loopBounds[dim].stride = one;
+      loopBounds[dim].size = createFoldedDimOp(b, loc, dest, dim);
+    }
+    return loopBounds;
+  }
+
+  LogicalResult
+  getResultTilePosition(Operation *op, OpBuilder &b, unsigned resultNumber,
+                        ArrayRef<OpFoldResult> offsets,
+                        ArrayRef<OpFoldResult> sizes,
+                        SmallVector<OpFoldResult> &resultOffsets,
+                        SmallVector<OpFoldResult> &resultSizes) const {
+    auto mxPackOp = cast<MXPackOp>(op);
+    // Result 0 is the packed `dest`, which shares the op's iteration domain.
+    if (resultNumber == 0) {
+      resultOffsets.assign(offsets.begin(), offsets.end());
+      resultSizes.assign(sizes.begin(), sizes.end());
+      return success();
+    }
+    // Result 1 is the `scale_dest`, whose tile is implied by the scaling
+    // dimensions of the data tile.
+    assert(resultNumber == 1 && "mx_pack is expected to have two results");
+    getMXPackScaleTile(b, mxPackOp.getLoc(), mxPackOp, offsets, sizes,
+                       resultOffsets, resultSizes);
+    return success();
+  }
+
+  FailureOr<TilingResult>
+  getTiledImplementation(Operation *op, OpBuilder &b,
+                         ArrayRef<OpFoldResult> offsets,
+                         ArrayRef<OpFoldResult> sizes) const {
+    auto mxPackOp = cast<MXPackOp>(op);
+    // TODO: Support Memref MXPackOp. Temporarily return failure.
+    if (!mxPackOp.hasPureTensorSemantics())
+      return failure();
+
+    Location loc = mxPackOp.getLoc();
+    ArrayRef<int64_t> scaleDims = mxPackOp.getScaleDims();
+    ArrayRef<int64_t> scaleBlocks = mxPackOp.getScaleBlocks();
+    ArrayRef<int64_t> destShape = mxPackOp.getDestType().getShape();
+    int64_t rank = mxPackOp.getSourceType().getRank();
+
+    // A non-scaling dimension feeds the shared per-block reduction and must be
+    // taken as a whole, i.e. it cannot be tiled.
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      if (llvm::is_contained(scaleDims, dim))
+        continue;
+      std::optional<int64_t> tileSize = getConstantIntValue(sizes[dim]);
+      if (tileSize && ShapedType::isStatic(destShape[dim]) &&
+          *tileSize != destShape[dim]) {
+        LLVM_DEBUG({
+          llvm::dbgs() << "mx_pack tiling is only supported along scaling "
+                          "dimensions\n";
+        });
+        return failure();
+      }
+    }
+    // A tile of a scaling dimension must cover whole scaling blocks: splitting
+    // a block would require scale values shared across tiles, which defeats the
+    // parallel tiling. Hence the tile size has to be equal to or a multiple of
+    // the block size (the trailing partial tile at the dimension boundary is
+    // the only exception) and the tile offset has to be block-aligned. Both are
+    // verified whenever the sizes/offsets are statically known.
+    for (auto [scaleDim, block] : llvm::zip_equal(scaleDims, scaleBlocks)) {
+      std::optional<int64_t> offset = getConstantIntValue(offsets[scaleDim]);
+      if (offset && *offset % block != 0) {
+        LLVM_DEBUG({
+          llvm::dbgs() << "mx_pack tile is not aligned to the scaling block "
+                          "size\n";
+        });
+        return failure();
+      }
+      std::optional<int64_t> tileSize = getConstantIntValue(sizes[scaleDim]);
+      if (tileSize && ShapedType::isStatic(destShape[scaleDim]) &&
+          *tileSize != destShape[scaleDim] && *tileSize % block != 0) {
+        LLVM_DEBUG({
+          llvm::dbgs() << "mx_pack tile size is not a multiple of the scaling "
+                          "block size\n";
+        });
+        return failure();
+      }
+    }
+
+    auto oneAttr = b.getI64IntegerAttr(1);
+    SmallVector<OpFoldResult> strides(rank, oneAttr);
+
+    auto sourceSlice = tensor::ExtractSliceOp::create(
+        b, loc, mxPackOp.getSource(), offsets, sizes, strides);
+
+    SmallVector<OpFoldResult> outputOffsets, outputSizes;
+    if (failed(getResultTilePosition(op, b, 0, offsets, sizes, outputOffsets,
+                                     outputSizes)))
+      return failure();
+    auto destSlice = tensor::ExtractSliceOp::create(
+        b, loc, mxPackOp.getDest(), outputOffsets, outputSizes, strides);
+
+    SmallVector<OpFoldResult> scaleOffsets, scaleSizes;
+    if (failed(getResultTilePosition(op, b, 1, offsets, sizes, scaleOffsets,
+                                     scaleSizes)))
+      return failure();
+    SmallVector<OpFoldResult> scaleStrides(scaleDims.size(), oneAttr);
+    auto scaleSlice =
+        tensor::ExtractSliceOp::create(b, loc, mxPackOp.getScaleDest(),
+                                       scaleOffsets, scaleSizes, scaleStrides);
+
+    auto tiledMXPackOp = MXPackOp::create(b, loc, sourceSlice, destSlice,
+                                          scaleSlice, scaleDims, scaleBlocks);
+
+    return TilingResult{{tiledMXPackOp},
+                        SmallVector<Value>(tiledMXPackOp->getResults()),
+                        llvm::to_vector(ArrayRef<Operation *>{
+                            sourceSlice, destSlice, scaleSlice})};
+  }
+};
+
 } // namespace
 
 template <typename OpType>
@@ -1787,6 +1952,7 @@ void mlir::linalg::registerTilingInterfaceExternalModels(
     registerOne<linalg::GenericOp>(ctx);
     linalg::PackOp::attachInterface<PackOpTiling>(*ctx);
     linalg::UnPackOp::attachInterface<UnPackOpTiling>(*ctx);
+    linalg::MXPackOp::attachInterface<MXPackOpTiling>(*ctx);
     registerAll<
 #include "mlir/Dialect/Linalg/IR/LinalgStructuredOps.cpp.inc"
         >(ctx);
