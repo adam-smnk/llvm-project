@@ -418,6 +418,7 @@ def Linalg_MXPackOp : Op<Linalg_Dialect, "mx_pack", [
     DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
     DestinationStyleOpInterface,
     ConditionallySpeculatable,
+    DeclareOpInterfaceMethods<AggregatedOpInterface, ["decomposeOperation"]>,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
     DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface,
         ["reifyResultShapes"]>,

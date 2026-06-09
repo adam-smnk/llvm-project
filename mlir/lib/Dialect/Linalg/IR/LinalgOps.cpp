@@ -17,6 +17,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
@@ -7598,6 +7599,318 @@ Speculation::Speculatability MXPackOp::getSpeculatability() {
   if (!hasPureTensorSemantics())
     return Speculation::NotSpeculatable;
   return Speculation::Speculatable;
+}
+
+/// Given a source tensor x and scale/block configuration, this method converts
+/// mx_pack(x) to the following sequence of operations:
+///
+/// 1. Pack x into tiled blocks along scale_dims with tile sizes scale_blocks:
+///    p = pack(x, inner_dims_pos=scale_dims, inner_tiles=scale_blocks, pad=0.0)
+///
+/// 2. Compute the per-block absolute maximum by reducing p over all dimensions
+///    that are not scale outer dimensions (i.e. non-tiled outer dims and all
+///    inner tile dims):
+///    m = max(abs(p), dim=non_scale_outer_dims + inner_tile_dims)
+///
+/// 3. Compute a per-block scale and its inverse for later normalization:
+///    scale[i]     = 2^(biased_exp(m[i]) - adjBias) <target scale type>
+///    inv_scale[i] = 2^(adjBias - biased_exp(m[i])) <source data type>
+///
+/// 4. Normalize p by multiplying each element with its block's inv_scale.
+///    Produces (sourceRank + k)-dimensional tensor pn (same shape as p):
+///    pn[...] = p[...] * inv_scale[block_of(...)]
+///
+/// 5. Round, clamp, and convert pn to the target element type:
+///    q[...] = cast<iN>(round(clamp(pn[...])))
+///
+/// 6. Unpack q back to the original source shape, writing into dest.
+///    result = linalg.unpack(q, inner_dims_pos=scale_dims,
+///                           inner_tiles=scale_blocks)
+FailureOr<SmallVector<Value>> MXPackOp::decomposeOperation(OpBuilder &b) {
+  MLIRContext *ctx = b.getContext();
+  Location loc = getLoc();
+
+  if (!hasPureTensorSemantics())
+    return emitOpError(
+        "mx_pack decomposition only supported for tensor semantics");
+
+  ShapedType sourceType = getSourceType();
+  ShapedType destType = getDestType();
+  ShapedType scaleDestType = getScaleDestType();
+
+  auto srcFloatType = dyn_cast<FloatType>(sourceType.getElementType());
+  if (!srcFloatType)
+    return emitOpError("mx_pack decomposition requires float source type");
+
+  auto dstIntType = dyn_cast<IntegerType>(destType.getElementType());
+  auto dstFloatType = dyn_cast<FloatType>(destType.getElementType());
+  if (!dstIntType && !dstFloatType)
+    return emitOpError(
+        "mx_pack decomposition requires integer or float dest type");
+
+  auto scaleElemFloatType = dyn_cast<FloatType>(scaleDestType.getElementType());
+  if (!scaleElemFloatType)
+    return emitOpError("mx_pack decomposition only supports float scale types");
+
+  ArrayRef<int64_t> scaleDims = getScaleDims();
+  ArrayRef<int64_t> scaleBlocks = getScaleBlocks();
+
+  Value source = getSource();
+  Value dest = getDest();
+  Value scaleDest = getScaleDest();
+
+  int64_t sourceRank = sourceType.getRank();
+  int64_t k = (int64_t)scaleDims.size();
+  int64_t packedRank = sourceRank + k;
+
+  OpBuilder::InsertionGuard guard(b);
+  b.setInsertionPoint(*this);
+
+  // -----------------------------------------------------------------------
+  // Step 1: Pack the source tensor into tiled blocks.
+  // Padding with 0.0 ensures padded elements do not affect the per-block
+  // abs-max computation.
+  // -----------------------------------------------------------------------
+  SmallVector<OpFoldResult> mixedTiles;
+  for (int64_t block : scaleBlocks)
+    mixedTiles.push_back(b.getIndexAttr(block));
+
+  SmallVector<int64_t> packedShape =
+      PackOp::inferPackedShape(sourceType.getShape(), scaleBlocks, scaleDims);
+
+  Value packedEmpty =
+      tensor::EmptyOp::create(b, loc, packedShape, srcFloatType);
+  Value zeroPadFloat = arith::ConstantFloatOp::create(
+      b, loc, srcFloatType, APFloat::getZero(srcFloatType.getFloatSemantics()));
+  Value packed =
+      linalg::PackOp::create(
+          b, loc, source, packedEmpty,
+          SmallVector<int64_t>(scaleDims.begin(), scaleDims.end()), mixedTiles,
+          zeroPadFloat)
+          .getResult();
+
+  // -----------------------------------------------------------------------
+  // Step 2: Compute absolute maximum per scale block.
+  //
+  // Scale shape: for each scale_dim[j], the outer packed dim at position
+  // scale_dims[j] gives the extent.
+  // Reduction dims: all packed dims that are not the scale outer dims, i.e.
+  //   - outer dims of non-tiled source dimensions, and
+  //   - all inner tile dims (positions [sourceRank .. packedRank-1]).
+  // -----------------------------------------------------------------------
+  auto scaleShape = scaleDestType.getShape();
+  SmallVector<int64_t> reductionDims;
+  for (int64_t i = 0; i < sourceRank; ++i)
+    if (!llvm::is_contained(scaleDims, i))
+      reductionDims.push_back(i);
+  for (int64_t i = sourceRank; i < packedRank; ++i)
+    reductionDims.push_back(i);
+
+  Value amaxEmpty =
+      tensor::EmptyOp::create(b, loc, scaleShape, srcFloatType);
+  Value zeroFloat = arith::ConstantFloatOp::create(
+      b, loc, srcFloatType, APFloat::getZero(srcFloatType.getFloatSemantics()));
+  Value amaxInit =
+      linalg::FillOp::create(b, loc, zeroFloat, amaxEmpty).getResult(0);
+
+  Value amax =
+      linalg::ReduceOp::create(
+          b, loc, ValueRange{packed}, ValueRange{amaxInit}, reductionDims,
+          [](OpBuilder &b, Location loc, ValueRange args) {
+            Value absVal = math::AbsFOp::create(b, loc, args[0]);
+            Value maxVal = arith::MaximumFOp::create(b, loc, absVal, args[1]);
+            linalg::YieldOp::create(b, loc, maxVal);
+          })
+          .getResult(0);
+
+  // -----------------------------------------------------------------------
+  // Step 3: Compute per-block scale and inverse scale for normalization.
+  //
+  // Get exponent using: frexp(x) = m * 2^exp, where 0.5 <= |m| < 1,
+  // therfore, exp = floor(log2(x)) + 1, and:
+  //   adj       = exp - bias
+  //   scale     = 2^adj    (MX scale value)
+  //   inv_scale = 2^(-adj) (used to normalize input data)
+  //
+  // The bias depends on the destination type:
+  //   - Integer:  bias = N - 1  (e.g. 7 for i8), so that after normalization
+  //               values maintain symmetry within range [-(2^(N-1)-1),
+  //               2^(N-1)-1].
+  //   - Float:    bias = maxExponent (e.g. 8 for F8E4M3, 15 for f16)
+  // -----------------------------------------------------------------------
+  int64_t frexpBias =
+      dstIntType
+          ? static_cast<int64_t>(dstIntType.getWidth()) - 1
+          : static_cast<int64_t>(dstFloatType.getFloatSemantics().maxExponent);
+  Type i32Type = b.getI32Type();
+  auto frexpStructType =
+      LLVM::LLVMStructType::getLiteral(ctx, {srcFloatType, i32Type});
+
+  // Create empty tensors for the normalization inverse scales.
+  Value invScalesEmpty =
+      tensor::EmptyOp::create(b, loc, scaleShape, srcFloatType);
+  SmallVector<AffineMap> scaleCompMaps(
+      3, AffineMap::getMultiDimIdentityMap(k, ctx));
+  SmallVector<utils::IteratorType> scaleIterTypes(k,
+                                                  utils::IteratorType::parallel);
+
+  auto scaleCompGeneric = linalg::GenericOp::create(
+      b, loc, TypeRange{invScalesEmpty.getType(), scaleDest.getType()},
+      ValueRange{amax}, ValueRange{invScalesEmpty, scaleDest}, scaleCompMaps,
+      scaleIterTypes, [&](OpBuilder &b, Location loc, ValueRange args) {
+        // TODO: Replace with equivalent math dialect op.
+        Value frexpPair =
+            LLVM::FractionExpOp::create(b, loc, frexpStructType, args[0]);
+        Value exp = LLVM::ExtractValueOp::create(b, loc, i32Type, frexpPair,
+                                                 ArrayRef<int64_t>{1});
+
+        // adj = exp - bias
+        Value biasConst =
+            arith::ConstantIntOp::create(b, loc, i32Type, frexpBias);
+        Value adj = arith::SubIOp::create(b, loc, exp, biasConst);
+
+        // negAdj = 0 - adj, for inverse scale 2^(-adj)
+        Value zeroI32 = arith::ConstantIntOp::create(b, loc, i32Type, 0);
+        Value negAdj = arith::SubIOp::create(b, loc, zeroI32, adj);
+
+        // scale = 2^adj, converted to the scale element type.
+        Value adjSrc = arith::SIToFPOp::create(b, loc, srcFloatType, adj);
+        Value scaleSrc = math::Exp2Op::create(b, loc, adjSrc);
+        unsigned scaleBits = scaleElemFloatType.getWidth();
+        unsigned srcBits = srcFloatType.getWidth();
+        Value scale;
+        if (scaleBits < srcBits)
+          scale = arith::TruncFOp::create(b, loc, scaleElemFloatType, scaleSrc);
+        else if (scaleBits > srcBits)
+          scale = arith::ExtFOp::create(b, loc, scaleElemFloatType, scaleSrc);
+        else if (scaleSrc.getType() != scaleElemFloatType)
+          scale =
+              arith::ConvertFOp::create(b, loc, scaleElemFloatType, scaleSrc);
+        else
+          scale = scaleSrc;
+
+        // inv_scale = 2^(-adj), kept at input's precision for normalization
+        Value negAdjSrc = arith::SIToFPOp::create(b, loc, srcFloatType, negAdj);
+        Value invScale = math::Exp2Op::create(b, loc, negAdjSrc);
+
+        linalg::YieldOp::create(b, loc, ValueRange{invScale, scale});
+      });
+  Value invScales = scaleCompGeneric.getResult(0);
+  Value mxScales = scaleCompGeneric.getResult(1);
+
+  // -----------------------------------------------------------------------
+  // Step 4: Normalize packed data by multiplying each element with its
+  // per-block inverse scale.
+  //
+  // The inverse-scale tensor has rank k (scale space). We build an affine
+  // map that projects the packed iteration space (rank packedRank) down to
+  // scale space by selecting only the scale outer dims:
+  //   (d0,..,d_{n+k-1}) -> (d_{sd0},..,d_{sd_{k-1}})
+  // -----------------------------------------------------------------------
+  SmallVector<AffineExpr> scaleExprs;
+  for (int64_t sd : scaleDims)
+    scaleExprs.push_back(getAffineDimExpr(sd, ctx));
+  AffineMap scaleMap = AffineMap::get(packedRank, 0, scaleExprs, ctx);
+  AffineMap identityPackedMap =
+      AffineMap::getMultiDimIdentityMap(packedRank, ctx);
+  SmallVector<utils::IteratorType> normalizeIterTypes(
+      packedRank, utils::IteratorType::parallel);
+
+  Value normalizedPacked =
+      linalg::GenericOp::create(
+          b, loc, TypeRange{packed.getType()}, ValueRange{invScales},
+          ValueRange{packed},
+          SmallVector<AffineMap>{scaleMap, identityPackedMap},
+          normalizeIterTypes,
+          [](OpBuilder &b, Location loc, ValueRange args) {
+            Value mul = arith::MulFOp::create(b, loc, args[0], args[1]);
+            linalg::YieldOp::create(b, loc, mul);
+          })
+          .getResult(0);
+
+  // -----------------------------------------------------------------------
+  // Step 5: Round, clamp, and convert to the target element type.
+  //
+  // Rounding using ties to nearest even mode.
+  // For integer output: clamp range is [-(2^(N-1)-1), 2^(N-1)-1]  to maintain
+  // symmetry between the max and min values to avoid a negative bias.
+  // For float output: clamp to the output type's largest finite value with
+  // rounding ties to even.
+  // -----------------------------------------------------------------------
+  Type dstElemType = destType.getElementType();
+  Value mxTiledEmpty =
+      tensor::EmptyOp::create(b, loc, packedShape, dstElemType);
+
+  Value mxTiled =
+      linalg::GenericOp::create(
+          b, loc, TypeRange{mxTiledEmpty.getType()},
+          ValueRange{normalizedPacked}, ValueRange{mxTiledEmpty},
+          SmallVector<AffineMap>{identityPackedMap, identityPackedMap},
+          SmallVector<utils::IteratorType>(packedRank,
+                                           utils::IteratorType::parallel),
+          [&](OpBuilder &b, Location loc, ValueRange args) {
+            Value rounded = math::RoundEvenOp::create(b, loc, args[0]);
+            auto makeConst = [&](APFloat fval) -> Value {
+              bool ignoredLosesInfo;
+              (void)fval.convert(srcFloatType.getFloatSemantics(),
+                                 APFloat::rmNearestTiesToEven,
+                                 &ignoredLosesInfo);
+              return arith::ConstantFloatOp::create(b, loc, srcFloatType, fval);
+            };
+            Value minVal, maxVal;
+            if (dstIntType) {
+              int64_t maxIntVal =
+                  dstIntType.getDefaultMaximum(/*isSigned=*/true);
+              minVal = makeConst(APFloat(static_cast<double>(-maxIntVal)));
+              maxVal = makeConst(APFloat(static_cast<double>(maxIntVal)));
+            } else {
+              minVal = makeConst(
+                  APFloat::getLargest(dstFloatType.getFloatSemantics(),
+                                      /*Negative=*/true));
+              maxVal = makeConst(
+                  APFloat::getLargest(dstFloatType.getFloatSemantics(),
+                                      /*Negative=*/false));
+            }
+            Value clamped = arith::MaximumFOp::create(b, loc, rounded, minVal);
+            clamped = arith::MinimumFOp::create(b, loc, clamped, maxVal);
+            Value converted;
+            if (dstIntType) {
+              converted = arith::FPToSIOp::create(b, loc, dstIntType, clamped);
+            } else {
+              unsigned dstBits = dstFloatType.getWidth();
+              unsigned srcBits = srcFloatType.getWidth();
+              auto roundingModeAttr = arith::RoundingModeAttr::get(
+                  b.getContext(), arith::RoundingMode::to_nearest_even);
+              if (dstBits < srcBits) {
+                converted = arith::TruncFOp::create(b, loc, dstFloatType,
+                                                    clamped, roundingModeAttr,
+                                                    /*fastmath=*/nullptr);
+              } else if (dstBits > srcBits) {
+                converted =
+                    arith::ExtFOp::create(b, loc, dstFloatType, clamped);
+              } else if (dstFloatType != srcFloatType) {
+                converted = arith::ConvertFOp::create(b, loc, dstFloatType,
+                                                      clamped, roundingModeAttr,
+                                                      /*fastmath=*/nullptr);
+              } else {
+                converted = clamped;
+              }
+            }
+            linalg::YieldOp::create(b, loc, converted);
+          })
+          .getResult(0);
+
+  // -----------------------------------------------------------------------
+  // Step 6: Unpack the scaled tiled tensor back to the original shape,
+  // writing into the provided dest buffer to satisfy DPS semantics.
+  // -----------------------------------------------------------------------
+  Value mxPack =
+      linalg::UnPackOp::create(
+          b, loc, mxTiled, dest,
+          SmallVector<int64_t>(scaleDims.begin(), scaleDims.end()), mixedTiles)
+          .getResult();
+
+  return SmallVector<Value>{mxPack, mxScales};
 }
 
 } // namespace linalg
