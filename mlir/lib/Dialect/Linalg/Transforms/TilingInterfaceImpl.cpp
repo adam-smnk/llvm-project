@@ -1873,10 +1873,12 @@ struct MXPackOpTiling
     }
     // A tile of a scaling dimension must cover whole scaling blocks: splitting
     // a block would require scale values shared across tiles, which defeats the
-    // parallel tiling. Hence the tile size has to be equal to or a multiple of
-    // the block size (the trailing partial tile at the dimension boundary is
-    // the only exception) and the tile offset has to be block-aligned. Both are
-    // verified whenever the sizes/offsets are statically known.
+    // parallel tiling. Hence the tile size has to be equal to the full
+    // dimension or a multiple of the block size, and the tile offset has to be
+    // block-aligned. Both are verified whenever the sizes/offsets are
+    // statically known. A partial trailing tile at the dimension boundary is
+    // produced with a dynamic (or block-multiple) size and is handled at
+    // runtime, so it is not rejected here.
     for (auto [scaleDim, block] : llvm::zip_equal(scaleDims, scaleBlocks)) {
       std::optional<int64_t> offset = getConstantIntValue(offsets[scaleDim]);
       if (offset && *offset % block != 0) {
@@ -1926,6 +1928,127 @@ struct MXPackOpTiling
                         SmallVector<Value>(tiledMXPackOp->getResults()),
                         llvm::to_vector(ArrayRef<Operation *>{
                             sourceSlice, destSlice, scaleSlice})};
+  }
+
+  LogicalResult getIterationDomainTileFromResultTile(
+      Operation *op, OpBuilder &b, unsigned resultNumber,
+      ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
+      SmallVectorImpl<OpFoldResult> &iterDomainOffsets,
+      SmallVectorImpl<OpFoldResult> &iterDomainSizes) const {
+    auto mxPackOp = cast<MXPackOp>(op);
+    // Result 0 is the packed `dest`, which shares the op's iteration domain, so
+    // its tile maps directly onto the iteration domain.
+    if (resultNumber == 0) {
+      iterDomainOffsets.assign(offsets.begin(), offsets.end());
+      iterDomainSizes.assign(sizes.begin(), sizes.end());
+      return success();
+    }
+    // Result 1 is the `scale_dest`. Invert the per-block relation to recover
+    // the data tile: each scaling dimension `i` constrains iteration dimension
+    // `scale_dims[i]` to `[offset[i] * block, size[i] * block)` (clamped to the
+    // dimension), while the reduced (non-scaling) dimensions are not present in
+    // `scale_dest` and therefore span their full extent.
+    assert(resultNumber == 1 && "mx_pack is expected to have two results");
+    Location loc = mxPackOp.getLoc();
+    Value dest = mxPackOp.getDest();
+    ArrayRef<int64_t> destShape = mxPackOp.getDestType().getShape();
+    int64_t rank = destShape.size();
+    OpFoldResult zero = b.getIndexAttr(0);
+    iterDomainOffsets.assign(rank, zero);
+    iterDomainSizes.clear();
+    for (int64_t dim = 0; dim < rank; ++dim)
+      iterDomainSizes.push_back(createFoldedDimOp(b, loc, dest, dim));
+
+    using AV = affine::AffineValueExpr;
+    affine::AffineBuilder ab(b, loc);
+    AffineExpr dim0, dim1, sym0;
+    bindDims(b.getContext(), dim0, dim1);
+    bindSymbols(b.getContext(), sym0);
+    for (auto [scaleDim, block, scaleOffset, scaleSize] :
+         llvm::zip_equal(mxPackOp.getScaleDims(), mxPackOp.getScaleBlocks(),
+                         offsets, sizes)) {
+      AV avBlock = AV(sym0).bind(b.getIndexAttr(block));
+      // iterOffset = scaleOffset * block.
+      OpFoldResult iterOffset = ab.mul(AV(dim0).bind(scaleOffset), avBlock);
+      iterDomainOffsets[scaleDim] = iterOffset;
+      // The data tile spans `scaleSize` whole blocks, i.e. `scaleSize * block`
+      // elements.
+      OpFoldResult fullSize = ab.mul(AV(dim0).bind(scaleSize), avBlock);
+      // When the dimension is a static multiple of the block size, every block
+      // is full and the data tile size is exactly `scaleSize * block`. Using it
+      // directly keeps the slice static-shaped whenever the scale tile size is
+      // statically known, instead of forcing a dynamic shape through the
+      // clamping `affine.min` used for a possibly-partial trailing block.
+      if (ShapedType::isStatic(destShape[scaleDim]) &&
+          destShape[scaleDim] % block == 0) {
+        iterDomainSizes[scaleDim] = fullSize;
+        continue;
+      }
+      // Otherwise the trailing block may be partial; clamp the size to the
+      // dimension: iterSize = min(scaleSize * block, dimSize - iterOffset).
+      OpFoldResult remaining = ab.sub(AV(dim0).bind(iterDomainSizes[scaleDim]),
+                                      AV(dim1).bind(iterOffset));
+      iterDomainSizes[scaleDim] = ab.min({fullSize, remaining});
+    }
+    return success();
+  }
+
+  FailureOr<TilingResult>
+  generateResultTileValue(Operation *op, OpBuilder &b, unsigned resultNumber,
+                          ArrayRef<OpFoldResult> offsets,
+                          ArrayRef<OpFoldResult> sizes) const {
+    // Map the requested result tile back to an iteration domain tile and reuse
+    // the standalone tiling, which enforces the same tiling constraints.
+    SmallVector<OpFoldResult> iterDomainOffsets, iterDomainSizes;
+    if (failed(getIterationDomainTileFromResultTile(
+            op, b, resultNumber, offsets, sizes, iterDomainOffsets,
+            iterDomainSizes)))
+      return failure();
+    FailureOr<TilingResult> tilingResult =
+        getTiledImplementation(op, b, iterDomainOffsets, iterDomainSizes);
+    if (failed(tilingResult))
+      return failure();
+    if (tilingResult->tiledOps.size() != 1)
+      return op->emitOpError("failed to generate tiled implementation");
+    return TilingResult{
+        tilingResult->tiledOps,
+        SmallVector<Value>{tilingResult->tiledValues[resultNumber]},
+        tilingResult->generatedSlices};
+  }
+
+  LogicalResult getIterationDomainTileFromOperandTiles(
+      Operation *op, OpBuilder &b, ArrayRef<unsigned> operandNumbers,
+      ArrayRef<SmallVector<OpFoldResult>> allOffsets,
+      ArrayRef<SmallVector<OpFoldResult>> allSizes,
+      SmallVectorImpl<OpFoldResult> &iterDomainOffsets,
+      SmallVectorImpl<OpFoldResult> &iterDomainSizes) const {
+    auto mxPackOp = cast<MXPackOp>(op);
+    // Only fusion across the `source` operand is supported; `dest` and
+    // `scale_dest` are the op's own destination operands.
+    if (operandNumbers.size() != 1 ||
+        operandNumbers[0] != mxPackOp.getSourceMutable().getOperandNumber()) {
+      LLVM_DEBUG(
+          { llvm::dbgs() << "unsupported operands for consumer fusion\n"; });
+      return failure();
+    }
+    // The `source` shares the op's iteration domain, so its tile maps directly.
+    iterDomainOffsets.assign(allOffsets[0].begin(), allOffsets[0].end());
+    iterDomainSizes.assign(allSizes[0].begin(), allSizes[0].end());
+    return success();
+  }
+
+  FailureOr<TilingResult> getTiledImplementationFromOperandTiles(
+      Operation *op, OpBuilder &b, ArrayRef<unsigned> operandNumbers,
+      ArrayRef<SmallVector<OpFoldResult>> allOffsets,
+      ArrayRef<SmallVector<OpFoldResult>> allSizes) const {
+    // Map the operand tile back to an iteration domain tile and reuse the
+    // standalone tiling, which enforces the same tiling constraints.
+    SmallVector<OpFoldResult> iterDomainOffsets, iterDomainSizes;
+    if (failed(getIterationDomainTileFromOperandTiles(
+            op, b, operandNumbers, allOffsets, allSizes, iterDomainOffsets,
+            iterDomainSizes)))
+      return failure();
+    return getTiledImplementation(op, b, iterDomainOffsets, iterDomainSizes);
   }
 };
 
