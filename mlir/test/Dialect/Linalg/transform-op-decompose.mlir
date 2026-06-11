@@ -412,3 +412,63 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+func.func @scaled_contract(
+    %A: tensor<8x16xi8>, %sA: tensor<8xf8E8M0FNU>,
+    %B: tensor<4x16xi8>, %sB: tensor<4xf8E8M0FNU>,
+    %C: tensor<8x4xf32>) -> tensor<8x4xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x16xi8>, tensor<8xf8E8M0FNU>, tensor<4x16xi8>, tensor<4xf8E8M0FNU>)
+      outs(%C : tensor<8x4xf32>) -> tensor<8x4xf32>
+  return %D : tensor<8x4xf32>
+}
+
+// CHECK-DAG: #[[$CONTRACT_A:.+]] = affine_map<(d0, d1, d2) -> (d0, d2)>
+// CHECK-DAG: #[[$CONTRACT_B:.+]] = affine_map<(d0, d1, d2) -> (d1, d2)>
+// CHECK-DAG: #[[$CONTRACT_C:.+]] = affine_map<(d0, d1, d2) -> (d0, d1)>
+// CHECK-DAG: #[[$SCALE_OUT:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK-DAG: #[[$SCALE_A:.+]] = affine_map<(d0, d1) -> (d0)>
+// CHECK-DAG: #[[$SCALE_B:.+]] = affine_map<(d0, d1) -> (d1)>
+
+// CHECK-LABEL: func @scaled_contract
+//  CHECK-SAME:   %[[A:[a-zA-Z0-9]+]]: tensor<8x16xi8>
+//  CHECK-SAME:   %[[SA:[a-zA-Z0-9]+]]: tensor<8xf8E8M0FNU>
+//  CHECK-SAME:   %[[B:[a-zA-Z0-9]+]]: tensor<4x16xi8>
+//  CHECK-SAME:   %[[SB:[a-zA-Z0-9]+]]: tensor<4xf8E8M0FNU>
+//  CHECK-SAME:   %[[C:[a-zA-Z0-9]+]]: tensor<8x4xf32>
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<8x4xi32>
+//       CHECK:   %[[ZERO:.+]] = arith.constant 0 : i32
+//       CHECK:   %[[FILL:.+]] = linalg.fill ins(%[[ZERO]] : i32) outs(%[[EMPTY]] : tensor<8x4xi32>) -> tensor<8x4xi32>
+//       CHECK:   %[[CONTRACT:.+]] = linalg.contract
+//  CHECK-SAME:     indexing_maps = [#[[$CONTRACT_A]], #[[$CONTRACT_B]], #[[$CONTRACT_C]]]
+//  CHECK-SAME:     ins(%[[A]], %[[B]] : tensor<8x16xi8>, tensor<4x16xi8>)
+//  CHECK-SAME:     outs(%[[FILL]] : tensor<8x4xi32>)
+//       CHECK:   %[[SCALED:.+]] = linalg.generic
+//  CHECK-SAME:     indexing_maps = [#[[$SCALE_OUT]], #[[$SCALE_A]], #[[$SCALE_B]], #[[$SCALE_OUT]]]
+//  CHECK-SAME:     iterator_types = ["parallel", "parallel"]
+//  CHECK-SAME:     ins(%[[CONTRACT]], %[[SA]], %[[SB]] : tensor<8x4xi32>, tensor<8xf8E8M0FNU>, tensor<4xf8E8M0FNU>)
+//  CHECK-SAME:     outs(%[[C]] : tensor<8x4xf32>)
+//       CHECK:   ^bb0(%[[IN:.+]]: i32, %[[IN_SA:.+]]: f8E8M0FNU, %[[IN_SB:.+]]: f8E8M0FNU, %[[OUT:.+]]: f32):
+//       CHECK:     %[[SA_EXT:.+]] = arith.extf %[[IN_SA]] : f8E8M0FNU to f32
+//       CHECK:     %[[SB_EXT:.+]] = arith.extf %[[IN_SB]] : f8E8M0FNU to f32
+//       CHECK:     %[[SS:.+]] = arith.mulf %[[SA_EXT]], %[[SB_EXT]] : f32
+//       CHECK:     %[[IN_FP:.+]] = arith.sitofp %[[IN]] : i32 to f32
+//       CHECK:     %[[PROD:.+]] = arith.mulf %[[IN_FP]], %[[SS]] : f32
+//       CHECK:     %[[ACC:.+]] = arith.addf %[[OUT]], %[[PROD]] : f32
+//       CHECK:     linalg.yield %[[ACC]] : f32
+//       CHECK:   return %[[SCALED]] : tensor<8x4xf32>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.scaled_contract"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.structured.decompose_interface %0 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
