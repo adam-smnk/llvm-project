@@ -30,6 +30,7 @@ add_mlir_dialect_library(MLIRLinalgDialect
   MLIRParser
   MLIRSideEffectInterfaces
   MLIRSparseTensorDialect
+  MLIRLLVMDialect
   MLIRSCFDialect
   MLIRMathDialect
   MLIRMemRefDialect
