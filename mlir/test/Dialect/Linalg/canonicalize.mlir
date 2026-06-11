@@ -2393,3 +2393,36 @@ func.func @no_fold_pack_cast_inner_tile_inlined_mismatch(%arg0: tensor<8x3xi32>,
     into %dest : tensor<?x?xi32> -> tensor<?x3x?x1xi32>
   return %pack : tensor<?x3x?x1xi32>
 }
+
+// -----
+
+// CHECK: #[[$MAP_A:.+]] = affine_map<(d0, d1, d2) -> (d0, d2)>
+// CHECK: #[[$MAP_SCALE_A:.+]] = affine_map<(d0, d1, d2) -> (d0 floordiv 32)>
+// CHECK: #[[$MAP_B:.+]] = affine_map<(d0, d1, d2) -> (d1, d2)>
+// CHECK: #[[$MAP_SCALE_B:.+]] = affine_map<(d0, d1, d2) -> (d1)>
+// CHECK: #[[$MAP_C:.+]] = affine_map<(d0, d1, d2) -> (d0, d1)>
+// CHECK-LABEL: func @scaled_contract_drop_unit_scale_dim
+//  CHECK-SAME:   %[[A:[a-zA-Z0-9]+]]: tensor<256x512xi8>
+//  CHECK-SAME:   %[[SA:[a-zA-Z0-9]+]]: tensor<8x1xf8E8M0FNU>
+//  CHECK-SAME:   %[[B:[a-zA-Z0-9]+]]: tensor<128x512xi8>
+//  CHECK-SAME:   %[[SB:[a-zA-Z0-9]+]]: tensor<128xf8E8M0FNU>
+//  CHECK-SAME:   %[[C:[a-zA-Z0-9]+]]: tensor<256x128xf32>
+//       CHECK:   %[[COLLAPSED:.+]] = tensor.collapse_shape %[[SA]] {{\[}}[0, 1]] : tensor<8x1xf8E8M0FNU> into tensor<8xf8E8M0FNU>
+//       CHECK:   linalg.scaled_contract
+//  CHECK-SAME:     indexing_maps = [#[[$MAP_A]], #[[$MAP_SCALE_A]], #[[$MAP_B]], #[[$MAP_SCALE_B]], #[[$MAP_C]]]
+//  CHECK-SAME:     ins(%[[A]], %[[COLLAPSED]], %[[B]], %[[SB]] : tensor<256x512xi8>, tensor<8xf8E8M0FNU>, tensor<128x512xi8>, tensor<128xf8E8M0FNU>)
+//  CHECK-SAME:     outs(%[[C]] : tensor<256x128xf32>)
+func.func @scaled_contract_drop_unit_scale_dim(
+    %A: tensor<256x512xi8>, %sA: tensor<8x1xf8E8M0FNU>,
+    %B: tensor<128x512xi8>, %sB: tensor<128xf8E8M0FNU>,
+    %C: tensor<256x128xf32>) -> tensor<256x128xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m floordiv 32, k floordiv 512)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<256x512xi8>, tensor<8x1xf8E8M0FNU>, tensor<128x512xi8>, tensor<128xf8E8M0FNU>)
+      outs(%C : tensor<256x128xf32>) -> tensor<256x128xf32>
+  return %D : tensor<256x128xf32>
+}
