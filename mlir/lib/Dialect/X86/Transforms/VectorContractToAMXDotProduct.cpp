@@ -18,6 +18,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Casting.h"
@@ -203,10 +204,14 @@ static LogicalResult validateContractOps(OpBuilder &rewriter,
 }
 
 // Index-producing operations whose backward slice can be safely cloned while
-// remapping loop induction variables.
+// remapping loop induction variables. An op qualifies when it is pure (free of
+// memory effects and speculatable, so duplicating it cannot change semantics or
+// introduce undefined behavior) and produces a single index/integer result -
+// the structural shape that `remapIndex` relies on when re-materializing access
+// offset computations such as arith add/sub/mul/constant and affine.apply.
 static bool isCloneableIndexOp(Operation *op) {
-  return isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ConstantOp,
-             arith::ConstantIndexOp, affine::AffineApplyOp>(op);
+  return isPure(op) && op->getNumResults() == 1 &&
+         op->getResult(0).getType().isIntOrIndex();
 }
 
 // Re-materializes the index value `v` for a new loop nest by cloning the
