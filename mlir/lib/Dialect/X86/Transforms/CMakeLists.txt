@@ -9,6 +9,7 @@ add_mlir_dialect_library(MLIRX86Transforms
   VectorContractToAMXDotProduct.cpp
 
   LINK_LIBS PUBLIC
+  MLIRAffineDialect
   MLIRArithDialect
   MLIRIR
   MLIRLinalgDialect
@@ -16,6 +17,7 @@ add_mlir_dialect_library(MLIRX86Transforms
   MLIRLLVMDialect
   MLIRVectorDialect
   MLIRVectorUtils
+  MLIRValueBoundsOpInterface
   MLIRX86Dialect
   MLIRX86Utils
   )

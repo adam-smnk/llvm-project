@@ -6,6 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Utils/VectorUtils.h"
@@ -16,6 +18,8 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/ValueBoundsOpInterface.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Casting.h"
 
 #include "mlir/Pass/Pass.h"
@@ -198,28 +202,232 @@ static LogicalResult validateContractOps(OpBuilder &rewriter,
   return success();
 }
 
-// Returns the loop index position to get mapped during the
-// MemRef type clone.
-static unsigned getIndexPosition(Value operand, scf::ForOp loop) {
-  Value iv = loop.getInductionVar();
+// Index-producing operations whose backward slice can be safely cloned while
+// remapping loop induction variables.
+static bool isCloneableIndexOp(Operation *op) {
+  return isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ConstantOp,
+             arith::ConstantIndexOp, affine::AffineApplyOp>(op);
+}
 
-  Value srcBuff;
-  llvm::TypeSwitch<Operation *>(operand.getDefiningOp())
-      .Case<TransferReadOp, LoadOp>(
-          [&](auto readOp) { srcBuff = readOp.getOperand(0); });
+// Re-materializes the index value `v` for a new loop nest by cloning the
+// backward slice of index arithmetic (arith add/sub/mul/constant and
+// affine.apply) while substituting the loop induction variables recorded in
+// `mapping` (old induction var -> new induction var). An index operation is
+// re-materialized when either one of its operands was substituted or it is
+// defined inside one of the `escapeRegions` (the bodies of the loops being
+// replaced) - in the latter case the original would not dominate the new
+// location. Values that are loop invariant and defined outside those regions
+// (enclosing induction variables, block arguments, hoisted constants) are
+// returned unchanged, so the produced IR matches the canonical lowering when
+// the induction variable already appears directly as an access offset.
+static Value remapIndex(OpBuilder &b, Value v, IRMapping &mapping,
+                        ArrayRef<Region *> escapeRegions) {
+  if (Value mapped = mapping.lookupOrNull(v))
+    return mapped;
 
-  auto subview = srcBuff.getDefiningOp<memref::SubViewOp>();
-  if (!subview)
-    return 0;
+  Operation *def = v.getDefiningOp();
+  if (!def || !isCloneableIndexOp(def))
+    return v;
 
-  auto offsets = subview.getOffsets();
+  for (Value operand : def->getOperands())
+    remapIndex(b, operand, mapping, escapeRegions);
 
-  for (auto it : llvm::enumerate(offsets)) {
-    if (it.value() == iv)
-      return it.index();
+  bool operandRemapped = llvm::any_of(def->getOperands(), [&](Value operand) {
+    return static_cast<bool>(mapping.lookupOrNull(operand));
+  });
+  bool insideEscapeRegion = llvm::any_of(escapeRegions, [&](Region *r) {
+    return r->findAncestorOpInRegion(*def) != nullptr;
+  });
+
+  // Nothing was substituted and the value already dominates the new location;
+  // reuse it instead of emitting a redundant clone.
+  if (!operandRemapped && !insideEscapeRegion)
+    return v;
+
+  Operation *clone = b.clone(*def, mapping);
+  mapping.map(v, clone->getResult(0));
+  return clone->getResult(0);
+}
+
+// Clones a memref access op (memref.subview, or a 0-operand op such as
+// memref.get_global) into `b`, remapping the loop induction variables in
+// `ivSubs` (old -> new) throughout the access offset computations. This follows
+// arbitrary arith/affine index computations, generalizing the simpler case
+// where an induction variable is used directly as a subview offset operand.
+static Operation *
+cloneAccessRemappingIVs(OpBuilder &b, Operation *accessOp,
+                        ArrayRef<std::pair<Value, Value>> ivSubs) {
+  IRMapping mapping;
+  SmallVector<Region *> escapeRegions;
+  for (const auto &sub : ivSubs) {
+    mapping.map(sub.first, sub.second);
+    Value oldIv = sub.first;
+    if (Region *r = oldIv.getParentRegion())
+      escapeRegions.push_back(r);
   }
 
-  return 0;
+  for (Value operand : accessOp->getOperands())
+    remapIndex(b, operand, mapping, escapeRegions);
+
+  return b.clone(*accessOp, mapping);
+}
+
+// Describes how a set of direct vector reads can be rewritten into reads from a
+// single shared memref.subview addressed with tile-local constant offsets.
+struct ReadGroupPlan {
+  Value srcBuff;
+  SmallVector<TransferReadOp> reads;
+  TransferReadOp anchor;
+  SmallVector<SmallVector<int64_t>> tileOffsets; // per read, per dim (>= 0)
+  SmallVector<int64_t> sizes;                    // shared subview sizes
+};
+
+// Analyzes a set of vector reads that access `srcBuff` directly through
+// arith/affine-computed indices and checks whether they form a tiled access
+// that can be expressed as a single shared memref.subview. Performs no IR
+// mutation. Returns the rewrite plan on success.
+static FailureOr<ReadGroupPlan> analyzeReadGroup(Value srcBuff,
+                                                 ArrayRef<Operation *> reads) {
+  if (reads.empty())
+    return failure();
+
+  auto firstRead = dyn_cast<TransferReadOp>(reads.front());
+  if (!firstRead)
+    return failure();
+
+  auto vecTy = dyn_cast<VectorType>(firstRead.getType());
+  auto memTy = dyn_cast<MemRefType>(srcBuff.getType());
+  if (!vecTy || !memTy)
+    return failure();
+
+  int64_t rank = memTy.getRank();
+  // Only handle reads whose indices and vector shape line up with the source
+  // rank through the default minor-identity access map.
+  if (vecTy.getRank() != rank ||
+      static_cast<int64_t>(firstRead.getIndices().size()) != rank)
+    return failure();
+
+  SmallVector<SmallVector<int64_t>> deltas(reads.size());
+  for (auto [readIdx, opPtr] : llvm::enumerate(reads)) {
+    auto read = dyn_cast<TransferReadOp>(opPtr);
+    if (!read || read.getBase() != srcBuff || read.getType() != vecTy ||
+        static_cast<int64_t>(read.getIndices().size()) != rank ||
+        !read.getPermutationMap().isMinorIdentity())
+      return failure();
+
+    deltas[readIdx].resize(rank);
+    for (int64_t d = 0; d < rank; d++) {
+      FailureOr<int64_t> delta = ValueBoundsConstraintSet::computeConstantDelta(
+          read.getIndices()[d], firstRead.getIndices()[d]);
+      if (failed(delta))
+        return failure();
+      deltas[readIdx][d] = *delta;
+    }
+  }
+
+  // The component-wise minimum corner anchors the shared subview. It must be
+  // one of the reads so its offset operands are available (dominate the
+  // subview).
+  SmallVector<int64_t> minDelta(rank, 0);
+  SmallVector<int64_t> maxDelta(rank, 0);
+  for (const auto &d : deltas) {
+    for (int64_t i = 0; i < rank; i++) {
+      minDelta[i] = std::min(minDelta[i], d[i]);
+      maxDelta[i] = std::max(maxDelta[i], d[i]);
+    }
+  }
+
+  std::optional<size_t> anchor;
+  for (auto [readIdx, d] : llvm::enumerate(deltas)) {
+    if (llvm::equal(d, minDelta)) {
+      anchor = readIdx;
+      break;
+    }
+  }
+  if (!anchor)
+    return failure();
+
+  auto anchorRead = cast<TransferReadOp>(reads[*anchor]);
+
+  // Ensure the anchor's offset operands dominate every read being rewritten and
+  // that all reads share a block (so program order is well defined).
+  DominanceInfo dom;
+  for (Operation *opPtr : reads) {
+    if (opPtr->getBlock() != anchorRead->getBlock())
+      return failure();
+    for (Value idx : anchorRead.getIndices())
+      if (!dom.dominates(idx, opPtr))
+        return failure();
+  }
+
+  ReadGroupPlan plan;
+  plan.srcBuff = srcBuff;
+  plan.anchor = anchorRead;
+  plan.sizes.reserve(rank);
+  for (int64_t d = 0; d < rank; d++)
+    plan.sizes.push_back(maxDelta[d] - minDelta[d] + vecTy.getDimSize(d));
+
+  for (auto [readIdx, opPtr] : llvm::enumerate(reads)) {
+    plan.reads.push_back(cast<TransferReadOp>(opPtr));
+    SmallVector<int64_t> offsets(rank);
+    for (int64_t d = 0; d < rank; d++)
+      offsets[d] = deltas[readIdx][d] - minDelta[d];
+    plan.tileOffsets.push_back(std::move(offsets));
+  }
+
+  return plan;
+}
+
+// Materializes a previously analyzed read group: creates the shared
+// memref.subview and rewrites each read to address it with tile-local constant
+// offsets. The tile-offset constants are obtained from `getOffsetConst`, which
+// must materialize them at a point dominating both the reads and the new loop
+// nest. Returns the created subview op.
+static memref::SubViewOp
+applyReadGroup(PatternRewriter &rewriter, const ReadGroupPlan &plan,
+               llvm::function_ref<Value(int64_t)> getOffsetConst) {
+  int64_t rank = plan.sizes.size();
+  TransferReadOp anchor = plan.anchor;
+  auto vecTy = cast<VectorType>(anchor.getType());
+
+  // The shared subview is created before the earliest read in program order so
+  // it dominates every rewritten read.
+  TransferReadOp earliest = plan.reads.front();
+  for (auto readVal : plan.reads) {
+    TransferReadOp read = readVal;
+    if (read->isBeforeInBlock(earliest))
+      earliest = read;
+  }
+
+  SmallVector<OpFoldResult> offsets;
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+  for (int64_t d = 0; d < rank; d++) {
+    offsets.push_back(anchor.getIndices()[d]);
+    sizes.push_back(rewriter.getIndexAttr(plan.sizes[d]));
+  }
+
+  rewriter.setInsertionPoint(earliest);
+  auto subview = memref::SubViewOp::create(
+      rewriter, anchor.getLoc(), plan.srcBuff, offsets, sizes, strides);
+
+  for (auto [readIdx, readVal] : llvm::enumerate(plan.reads)) {
+    TransferReadOp read = readVal;
+    rewriter.setInsertionPoint(read);
+    SmallVector<Value> tileOffsets;
+    for (int64_t d = 0; d < rank; d++)
+      tileOffsets.push_back(getOffsetConst(plan.tileOffsets[readIdx][d]));
+
+    auto newRead = vector::TransferReadOp::create(
+        rewriter, read.getLoc(), vecTy, subview.getResult(), tileOffsets,
+        read.getPadding(),
+        AffineMap::getMinorIdentityMap(rank, vecTy.getRank(),
+                                       rewriter.getContext()),
+        SmallVector<bool>(vecTy.getRank(), true));
+    rewriter.replaceOp(read, newRead.getResult());
+  }
+
+  return subview;
 }
 
 // Creates amx.tile_loads.
@@ -532,16 +740,12 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
       rewriter, loc, lowerBound, upperBound, step, loopItrArgs,
       [&](OpBuilder &rewriterNewInnerLoop, Location locNewInnerLoop,
           Value ivNewInnerLoop, ValueRange iterArgsNewInnerLoop) {
-        IRMapping mapping;
+        SmallVector<std::pair<Value, Value>> lhsIvSubs;
         if (outerLoop)
-          mapping.map(vectorOpLhs->getOperand(
-                          getIndexPosition(contractOp.getLhs(), outerLoop) + 1),
-                      ivOuterLoop);
-
-        mapping.map(vectorOpLhs->getOperand(
-                        getIndexPosition(contractOp.getLhs(), innerLoop) + 1),
-                    ivNewInnerLoop);
-        auto lhsClone = rewriterNewInnerLoop.clone(*vectorOpLhs, mapping);
+          lhsIvSubs.push_back({outerLoop.getInductionVar(), ivOuterLoop});
+        lhsIvSubs.push_back({innerLoop.getInductionVar(), ivNewInnerLoop});
+        auto lhsClone = cloneAccessRemappingIVs(rewriterNewInnerLoop,
+                                                vectorOpLhs, lhsIvSubs);
 
         Value indxToStoreInBuffer = c0;
         Value indxToLoadFromBuffer = c0;
@@ -600,35 +804,18 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
             }
           }
         }
-        IRMapping rhsMapping;
-
         Value matB;
         Operation *rhsOp = vectorOpRhs;
 
         // Clone for the subview type operations
         if (rhsOp->getNumOperands() > 0) {
+          SmallVector<std::pair<Value, Value>> rhsIvSubs;
+          if (outerLoop)
+            rhsIvSubs.push_back({outerLoop.getInductionVar(), ivOuterLoop});
+          rhsIvSubs.push_back({innerLoop.getInductionVar(), ivNewInnerLoop});
 
-          if (outerLoop) {
-            int64_t outerPos = getIndexPosition(contractOp.getRhs(), outerLoop);
-
-            if (outerPos >= 0) {
-              unsigned operandIdx = static_cast<unsigned>(outerPos + 1);
-
-              if (operandIdx < rhsOp->getNumOperands())
-                rhsMapping.map(rhsOp->getOperand(operandIdx), ivOuterLoop);
-            }
-          }
-
-          int64_t innerPos = getIndexPosition(contractOp.getRhs(), innerLoop);
-
-          if (innerPos >= 0) {
-            unsigned operandIdx = static_cast<unsigned>(innerPos + 1);
-
-            if (operandIdx < rhsOp->getNumOperands())
-              rhsMapping.map(rhsOp->getOperand(operandIdx), ivNewInnerLoop);
-          }
-
-          auto rhsClone = rewriterNewInnerLoop.clone(*rhsOp, rhsMapping);
+          auto rhsClone =
+              cloneAccessRemappingIVs(rewriterNewInnerLoop, rhsOp, rhsIvSubs);
           matB = rhsClone->getResult(0);
 
         } else {
@@ -1102,6 +1289,84 @@ struct VectorContractToAMXDotProduct
             contractOp, "Coudn't find the pair vector contract ");
     }
 
+    // The remaining lowering machinery expects each contraction operand to be
+    // read from a memref.subview that carries the reduction induction variable
+    // in its offset. When the operands are instead read directly from a base
+    // memref using arith/affine-computed indices (so there is no subview-typed
+    // defining op), normalize them into that canonical form first.
+    if (!vectorOpLhs || !vectorOpRhs) {
+      if (isVnni)
+        return rewriter.notifyMatchFailure(
+            contractOp, "Raw-memref normalization is only supported for the "
+                        "non-VNNI lowering path.");
+
+      // Pre-validate the reduction loop step(s) so that normalization, which
+      // mutates the IR, only runs when the rewrite is guaranteed to proceed.
+      int64_t stepValue = 16 * blockingFactor;
+      for (scf::ForOp loop : loopLists)
+        if (failed(validateLoopStep(rewriter, loop.getStep(), stepValue)))
+          return rewriter.notifyMatchFailure(
+              contractOp, "Invalid reduction loop step for raw-memref reads.");
+
+      // Collect the distinct LHS/RHS/ACC reads, preserving program order.
+      SmallVector<Operation *> lhsReads, rhsReads, accReads;
+      SmallPtrSet<Operation *, 8> seenLhs, seenRhs, seenAcc;
+      for (vector::ContractionOp op : ops) {
+        if (Operation *r = op.getLhs().getDefiningOp())
+          if (seenLhs.insert(r).second)
+            lhsReads.push_back(r);
+        if (Operation *r = op.getRhs().getDefiningOp())
+          if (seenRhs.insert(r).second)
+            rhsReads.push_back(r);
+        if (Operation *r = traceToVectorReadLikeParentOperation(op.getAcc()))
+          if (seenAcc.insert(r).second)
+            accReads.push_back(r);
+      }
+
+      auto accFirstRead = accReads.empty()
+                              ? nullptr
+                              : dyn_cast<TransferReadOp>(accReads.front());
+      if (!accFirstRead)
+        return rewriter.notifyMatchFailure(
+            contractOp, "Accumulator is not read by a transfer_read.");
+
+      // Analyze first (no IR mutation) so unsupported patterns bail cleanly.
+      FailureOr<ReadGroupPlan> lhsPlan = analyzeReadGroup(srcBuffLhs, lhsReads);
+      FailureOr<ReadGroupPlan> rhsPlan = analyzeReadGroup(srcBuffRhs, rhsReads);
+      FailureOr<ReadGroupPlan> accPlan =
+          analyzeReadGroup(accFirstRead.getBase(), accReads);
+
+      if (failed(lhsPlan) || failed(rhsPlan) || failed(accPlan))
+        return rewriter.notifyMatchFailure(
+            contractOp,
+            "Unsupported access structure for raw-memref normalization.");
+
+      // Tile-offset constants are materialized once at the start of the block
+      // enclosing the reduction loop so they dominate both the rewritten reads
+      // and the new loop nest the lowering will create in front of it.
+      Block *constBlock = loopLists.back()->getBlock();
+      DenseMap<int64_t, Value> offsetConstCache;
+      auto getOffsetConst = [&](int64_t v) -> Value {
+        auto it = offsetConstCache.find(v);
+        if (it != offsetConstCache.end())
+          return it->second;
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(constBlock);
+        Value c =
+            arith::ConstantIndexOp::create(rewriter, contractOp.getLoc(), v);
+        offsetConstCache.try_emplace(v, c);
+        return c;
+      };
+
+      // Materialize the shared subviews and redirect the reads.
+      vectorOpLhs = applyReadGroup(rewriter, *lhsPlan, getOffsetConst);
+      vectorOpRhs = applyReadGroup(rewriter, *rhsPlan, getOffsetConst);
+      applyReadGroup(rewriter, *accPlan, getOffsetConst);
+
+      // The accumulator reads now address a tile-sized subview; re-trace.
+      accReadOp = traceToVectorReadLikeParentOperation(contractOp.getAcc());
+    }
+
     scf::ForOp innerLoop;
     scf::ForOp outerLoop;
 
@@ -1184,16 +1449,10 @@ struct VectorContractToAMXDotProduct
             memref::AllocaOp::create(rewriter, outerLoop.getLoc(), bufferType);
 
         // First Shuffling outside the reduction loops
-        IRMapping rhsMapping;
-        rhsMapping.map(
-            vectorOpRhs->getOperand(
-                getIndexPosition(contractOp.getRhs(), outerLoop) + 1),
-            outerLoop.getLowerBound());
-        rhsMapping.map(
-            vectorOpRhs->getOperand(
-                getIndexPosition(contractOp.getRhs(), innerLoop) + 1),
-            innerLoop.getLowerBound());
-        auto rhsClone = rewriter.clone(*vectorOpRhs, rhsMapping);
+        auto rhsClone = cloneAccessRemappingIVs(
+            rewriter, vectorOpRhs,
+            {{outerLoop.getInductionVar(), outerLoop.getLowerBound()},
+             {innerLoop.getInductionVar(), innerLoop.getLowerBound()}});
 
         Value quotient_batch = arith::DivUIOp::create(
             rewriter, outerLoop.getLoc(), outerLoop.getLowerBound(),
@@ -1333,12 +1592,9 @@ struct VectorContractToAMXDotProduct
             memref::AllocaOp::create(rewriter, innerLoop.getLoc(), bufferType);
 
         // First Shuffling outside the reduction loops
-        IRMapping rhsMapping;
-        rhsMapping.map(
-            vectorOpRhs->getOperand(
-                getIndexPosition(contractOp.getRhs(), innerLoop) + 1),
-            innerLoop.getLowerBound());
-        auto rhsClone = rewriter.clone(*vectorOpRhs, rhsMapping);
+        auto rhsClone = cloneAccessRemappingIVs(
+            rewriter, vectorOpRhs,
+            {{innerLoop.getInductionVar(), innerLoop.getLowerBound()}});
 
         Value quotient_k = arith::DivUIOp::create(rewriter, innerLoop.getLoc(),
                                                   innerLoop.getLowerBound(),

@@ -15,6 +15,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
+#include "mlir/Interfaces/ValueBoundsOpInterface.h"
 
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
@@ -348,7 +349,9 @@ LogicalResult shuffleBeforeWriteLikeOp(PatternRewriter &rewriter,
 //  (2) - the defining source memref should be same for nonUnitDim
 //  operation,
 //  (3) - the nonUnit dim offset difference between the
-//  vector.contracts should be 8 or 16.
+//  vector.contracts should be 8 or 16. The offset may be a statically known
+//  constant or a loop-dependent value computed through arith operations or
+//  affine map applications (e.g. arith.addi or affine.apply).
 bool validatePairVectorContract(vector::ContractionOp contractOp,
                                 vector::ContractionOp pairContOp,
                                 bool rhsHasMultipleNonUnitDims,
@@ -414,13 +417,34 @@ bool validatePairVectorContract(vector::ContractionOp contractOp,
     if (indexVals[i] == indexValsPairContOp[i])
       continue;
 
+    // Determine the constant offset between the two index values. The indices
+    // may be statically known constants or loop-dependent values computed
+    // through arith operations or affine map applications (e.g. arith.addi or
+    // affine.apply). Constant indices are compared directly, while the
+    // value-bounds analysis is used to follow more complex index computations.
+    std::optional<int64_t> offset;
     auto v0 = getConstantIntValue(indexVals[i]);
     auto v1 = getConstantIntValue(indexValsPairContOp[i]);
+    if (v0 && v1) {
+      offset = *v1 - *v0;
+    } else if (auto idx0 = dyn_cast<Value>(indexVals[i])) {
+      if (auto idx1 = dyn_cast<Value>(indexValsPairContOp[i])) {
+        FailureOr<int64_t> delta =
+            ValueBoundsConstraintSet::computeConstantDelta(idx1, idx0);
+        if (succeeded(delta))
+          offset = *delta;
+      }
+    }
 
-    if (!v0 || !v1)
+    if (!offset)
       return false;
 
-    if ((*v1 - *v0) != nonUnitDimValue)
+    // A zero offset means the two (syntactically different) index values still
+    // address the same element, so this is not the differing dimension.
+    if (*offset == 0)
+      continue;
+
+    if (*offset != nonUnitDimValue)
       return false;
 
     oneConstantOffset = true;

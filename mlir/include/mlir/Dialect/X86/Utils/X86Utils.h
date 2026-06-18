@@ -31,7 +31,9 @@ bool isInVnniLayout(Operation *op, llvm::ArrayRef<AffineMap> indexingMaps,
 
 // Returns true if two contraction ops form a valid pair for VNNI packing.
 // It verifies that both contractions share the appropriate operand, read from
-// the same source buffer, and use constant indices that differ by 8 or 16.
+// the same source buffer, and use indices that differ by 8 or 16. The differing
+// index may be a statically known constant or a loop-dependent value computed
+// through arith operations or affine map applications.
 bool validatePairVectorContract(vector::ContractionOp contractOp,
                                 vector::ContractionOp pairContOp,
                                 bool rhsHasMultipleNonUnitDims,

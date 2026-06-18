@@ -10,5 +10,6 @@ add_mlir_dialect_library(MLIRX86Utils
   MLIRFuncDialect
   MLIRIR
   MLIRLinalgDialect
+  MLIRValueBoundsOpInterface
   MLIRVectorDialect
   )
