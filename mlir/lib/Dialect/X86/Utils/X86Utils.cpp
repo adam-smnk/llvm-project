@@ -349,9 +349,7 @@ LogicalResult shuffleBeforeWriteLikeOp(PatternRewriter &rewriter,
 //  (2) - the defining source memref should be same for nonUnitDim
 //  operation,
 //  (3) - the nonUnit dim offset difference between the
-//  vector.contracts should be 8 or 16. The offset may be a statically known
-//  constant or a loop-dependent value computed through arith operations or
-//  affine map applications (e.g. arith.addi or affine.apply).
+//  vector.contracts should be 8 or 16.
 bool validatePairVectorContract(vector::ContractionOp contractOp,
                                 vector::ContractionOp pairContOp,
                                 bool rhsHasMultipleNonUnitDims,
@@ -417,11 +415,6 @@ bool validatePairVectorContract(vector::ContractionOp contractOp,
     if (indexVals[i] == indexValsPairContOp[i])
       continue;
 
-    // Determine the constant offset between the two index values. The indices
-    // may be statically known constants or loop-dependent values computed
-    // through arith operations or affine map applications (e.g. arith.addi or
-    // affine.apply). Constant indices are compared directly, while the
-    // value-bounds analysis is used to follow more complex index computations.
     std::optional<int64_t> offset;
     auto v0 = getConstantIntValue(indexVals[i]);
     auto v1 = getConstantIntValue(indexValsPairContOp[i]);
@@ -436,15 +429,7 @@ bool validatePairVectorContract(vector::ContractionOp contractOp,
       }
     }
 
-    if (!offset)
-      return false;
-
-    // A zero offset means the two (syntactically different) index values still
-    // address the same element, so this is not the differing dimension.
-    if (*offset == 0)
-      continue;
-
-    if (*offset != nonUnitDimValue)
+    if (!offset || *offset != nonUnitDimValue)
       return false;
 
     oneConstantOffset = true;
