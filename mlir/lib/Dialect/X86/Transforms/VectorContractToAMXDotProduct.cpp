@@ -20,6 +20,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Casting.h"
 
@@ -275,6 +276,44 @@ cloneAccessRemappingIVs(OpBuilder &b, Operation *accessOp,
     remapIndex(b, operand, mapping, escapeRegions);
 
   return b.clone(*accessOp, mapping);
+}
+
+// Read-only companion of `remapIndex`: returns true if every index value
+// feeding `indices` can be re-materialized for a new loop nest. An index value
+// defined inside one of `escapeRegions` (the bodies of the loops being
+// replaced) must be produced by a cloneable index op so it can be rebuilt with
+// the substituted induction variable; otherwise re-materialization would leave
+// a dangling reference into the original loop body. Loop-invariant values and
+// induction variables (block arguments) are leaves and are always fine. Used to
+// bail before mutating the IR when an access cannot be reconstructed.
+static bool isRemappableIndexSlice(ValueRange indices,
+                                   ArrayRef<Region *> escapeRegions) {
+  SmallVector<Value> worklist(indices.begin(), indices.end());
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      continue; // Block argument (induction variable or function arg): leaf.
+
+    bool insideEscapeRegion = llvm::any_of(escapeRegions, [&](Region *r) {
+      return r->findAncestorOpInRegion(*def) != nullptr;
+    });
+    if (!insideEscapeRegion)
+      continue; // Loop invariant: reused unchanged.
+
+    // Defined inside a loop being replaced: it must be a cloneable index op so
+    // it can be re-materialized with the substituted induction variable.
+    if (!isCloneableIndexOp(def))
+      return false;
+
+    for (Value operand : def->getOperands())
+      worklist.push_back(operand);
+  }
+  return true;
 }
 
 // Describes how a set of direct vector reads can be rewritten into reads from a
@@ -1345,6 +1384,21 @@ struct VectorContractToAMXDotProduct
         return rewriter.notifyMatchFailure(
             contractOp,
             "Unsupported access structure for raw-memref normalization.");
+
+      // The LHS/RHS subviews created below are re-cloned for each new-loop
+      // iteration with the reduction induction variable substituted. Bail
+      // cleanly (before mutating the IR) if an operand's index computation
+      // cannot be re-materialized - e.g. it flows through a non-speculatable or
+      // side-effecting op defined inside the reduction loop.
+      SmallVector<Region *> escapeRegions;
+      for (scf::ForOp loop : loopLists)
+        escapeRegions.push_back(&loop.getRegion());
+
+      if (!isRemappableIndexSlice(lhsPlan->anchor.getIndices(), escapeRegions) ||
+          !isRemappableIndexSlice(rhsPlan->anchor.getIndices(), escapeRegions))
+        return rewriter.notifyMatchFailure(
+            contractOp, "Operand index computation cannot be re-materialized "
+                        "for the new loop (contains a non-cloneable op).");
 
       // Tile-offset constants are materialized once at the start of the block
       // enclosing the reduction loop so they dominate both the rewritten reads

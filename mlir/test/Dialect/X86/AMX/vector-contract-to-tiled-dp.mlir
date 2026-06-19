@@ -2343,3 +2343,130 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+// Negative: the loop step is correct (32), but the reduction K index is computed
+// inside the loop by arith.divui with a non-constant divisor. Division is not
+// speculatable (divide-by-zero is undefined), so the index op is not cloneable
+// and the access cannot be re-materialized for the rewritten loop. The pattern
+// bails before mutating the IR.
+
+!vecA = vector<16x32xbf16>
+!vecB = vector<32x16xbf16>
+!vecC = vector<16x16xf32>
+
+#map = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map1 = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map2 = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+func.func @negative_raw_nonspeculatable_index(
+    %arg0: memref<1024x1024xbf16>, %arg1: memref<1024x1024xbf16>,
+    %arg2: memref<1024x1024xf32>, %m: index, %n: index, %d: index) {
+  %cst = arith.constant 0.000000e+00 : f32
+  %cst_0 = arith.constant 0.000000e+00 : bf16
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  %c32 = arith.constant 32 : index
+  %c64 = arith.constant 64 : index
+  %m16 = arith.addi %m, %c16 : index
+  %n16 = arith.addi %n, %c16 : index
+  %2 = vector.transfer_read %arg2[%m, %n16], %cst {in_bounds = [true, true]} : memref<1024x1024xf32>, !vecC
+  %3 = vector.transfer_read %arg2[%m16, %n], %cst {in_bounds = [true, true]} : memref<1024x1024xf32>, !vecC
+  %4 = vector.transfer_read %arg2[%m, %n], %cst {in_bounds = [true, true]} : memref<1024x1024xf32>, !vecC
+  %5 = vector.transfer_read %arg2[%m16, %n16], %cst {in_bounds = [true, true]} : memref<1024x1024xf32>, !vecC
+  %6:4 = scf.for %arg5 = %c0 to %c64 step %c32 iter_args(%arg6 = %4, %arg7 = %2, %arg8 = %3, %arg9 = %5) -> (!vecC, !vecC, !vecC, !vecC) {
+    %k = arith.divui %arg5, %d : index
+    %10 = vector.transfer_read %arg0[%m, %k], %cst_0 {in_bounds = [true, true]} : memref<1024x1024xbf16>, !vecA
+    %11 = vector.transfer_read %arg1[%k, %n], %cst_0 {in_bounds = [true, true]} : memref<1024x1024xbf16>, !vecB
+    %12 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %10, %11, %arg6 : !vecA, !vecB into !vecC
+    %14 = vector.transfer_read %arg1[%k, %n16], %cst_0 {in_bounds = [true, true]} : memref<1024x1024xbf16>, !vecB
+    %15 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %10, %14, %arg7 : !vecA, !vecB into !vecC
+    %17 = vector.transfer_read %arg0[%m16, %k], %cst_0 {in_bounds = [true, true]} : memref<1024x1024xbf16>, !vecA
+    %18 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %17, %11, %arg8 : !vecA, !vecB into !vecC
+    %19 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %17, %14, %arg9 : !vecA, !vecB into !vecC
+    scf.yield %12, %15, %18, %19 : !vecC, !vecC, !vecC, !vecC
+  }
+  vector.transfer_write %6#3, %arg2[%m16, %n16] {in_bounds = [true, true]} : !vecC, memref<1024x1024xf32>
+  vector.transfer_write %6#2, %arg2[%m16, %n] {in_bounds = [true, true]} : !vecC, memref<1024x1024xf32>
+  vector.transfer_write %6#1, %arg2[%m, %n16] {in_bounds = [true, true]} : !vecC, memref<1024x1024xf32>
+  vector.transfer_write %6#0, %arg2[%m, %n] {in_bounds = [true, true]} : !vecC, memref<1024x1024xf32>
+  return
+}
+
+// CHECK-LABEL: @negative_raw_nonspeculatable_index
+// CHECK-NOT: x86.amx.tile_mulf
+// CHECK: vector.contract
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.x86.vector_contract_to_amx_dot_product
+    } : !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Negative: the loop step is correct (32), but the reduction K index is loaded
+// from memory inside the loop. memref.load has a read side effect, so the index
+// op is not cloneable and the access cannot be re-materialized for the
+// rewritten loop. The pattern bails before mutating the IR.
+
+!vecA = vector<16x32xbf16>
+!vecB = vector<32x16xbf16>
+!vecC = vector<16x16xf32>
+
+#map = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map1 = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map2 = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+func.func @negative_raw_side_effecting_index(
+    %arg0: memref<1024x1024xbf16>, %arg1: memref<1024x1024xbf16>,
+    %arg2: memref<1024x1024xf32>, %idx: memref<64xindex>, %m: index, %n: index) {
+  %cst = arith.constant 0.000000e+00 : f32
+  %cst_0 = arith.constant 0.000000e+00 : bf16
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  %c32 = arith.constant 32 : index
+  %c64 = arith.constant 64 : index
+  %m16 = arith.addi %m, %c16 : index
+  %n16 = arith.addi %n, %c16 : index
+  %2 = vector.transfer_read %arg2[%m, %n16], %cst {in_bounds = [true, true]} : memref<1024x1024xf32>, !vecC
+  %3 = vector.transfer_read %arg2[%m16, %n], %cst {in_bounds = [true, true]} : memref<1024x1024xf32>, !vecC
+  %4 = vector.transfer_read %arg2[%m, %n], %cst {in_bounds = [true, true]} : memref<1024x1024xf32>, !vecC
+  %5 = vector.transfer_read %arg2[%m16, %n16], %cst {in_bounds = [true, true]} : memref<1024x1024xf32>, !vecC
+  %6:4 = scf.for %arg5 = %c0 to %c64 step %c32 iter_args(%arg6 = %4, %arg7 = %2, %arg8 = %3, %arg9 = %5) -> (!vecC, !vecC, !vecC, !vecC) {
+    %k = memref.load %idx[%arg5] : memref<64xindex>
+    %10 = vector.transfer_read %arg0[%m, %k], %cst_0 {in_bounds = [true, true]} : memref<1024x1024xbf16>, !vecA
+    %11 = vector.transfer_read %arg1[%k, %n], %cst_0 {in_bounds = [true, true]} : memref<1024x1024xbf16>, !vecB
+    %12 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %10, %11, %arg6 : !vecA, !vecB into !vecC
+    %14 = vector.transfer_read %arg1[%k, %n16], %cst_0 {in_bounds = [true, true]} : memref<1024x1024xbf16>, !vecB
+    %15 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %10, %14, %arg7 : !vecA, !vecB into !vecC
+    %17 = vector.transfer_read %arg0[%m16, %k], %cst_0 {in_bounds = [true, true]} : memref<1024x1024xbf16>, !vecA
+    %18 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %17, %11, %arg8 : !vecA, !vecB into !vecC
+    %19 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %17, %14, %arg9 : !vecA, !vecB into !vecC
+    scf.yield %12, %15, %18, %19 : !vecC, !vecC, !vecC, !vecC
+  }
+  vector.transfer_write %6#3, %arg2[%m16, %n16] {in_bounds = [true, true]} : !vecC, memref<1024x1024xf32>
+  vector.transfer_write %6#2, %arg2[%m16, %n] {in_bounds = [true, true]} : !vecC, memref<1024x1024xf32>
+  vector.transfer_write %6#1, %arg2[%m, %n16] {in_bounds = [true, true]} : !vecC, memref<1024x1024xf32>
+  vector.transfer_write %6#0, %arg2[%m, %n] {in_bounds = [true, true]} : !vecC, memref<1024x1024xf32>
+  return
+}
+
+// CHECK-LABEL: @negative_raw_side_effecting_index
+// CHECK-NOT: x86.amx.tile_mulf
+// CHECK: vector.contract
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.x86.vector_contract_to_amx_dot_product
+    } : !transform.any_op
+    transform.yield
+  }
+}
