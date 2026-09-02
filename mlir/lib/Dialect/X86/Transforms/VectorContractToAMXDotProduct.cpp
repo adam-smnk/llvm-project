@@ -123,6 +123,28 @@ getSrcIndxValue(OpBuilder &rewriter, Location loc, Value operand,
   return std::make_pair(srcBuff, indices);
 }
 
+// Computes the sizes for a `sourceRank`-dimensional subview spanning exactly
+// the region read by a (possibly rank-reducing, e.g. via a minor-identity
+// permutation map) vector read into `vecTy`. Dimensions not covered by
+// `permMap` -- dropped by the read's projection -- get a size of 1. Returns
+// failure if `permMap` contains anything other than plain dimension
+// projections (e.g. a broadcast), which callers aren't designed to handle.
+static FailureOr<SmallVector<OpFoldResult>>
+getReadRegionSizes(MLIRContext *ctx, AffineMap permMap, VectorType vecTy,
+                   unsigned sourceRank) {
+  if (permMap.getNumResults() != static_cast<unsigned>(vecTy.getRank()))
+    return failure();
+
+  SmallVector<int64_t> sizes(sourceRank, 1);
+  for (auto [vectorDim, result] : llvm::enumerate(permMap.getResults())) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(result);
+    if (!dimExpr || dimExpr.getPosition() >= sourceRank)
+      return failure();
+    sizes[dimExpr.getPosition()] = vecTy.getDimSize(vectorDim);
+  }
+  return getAsIndexOpFoldResult(ctx, sizes);
+}
+
 // Function to validate the loop step value.
 static LogicalResult validateLoopStep(OpBuilder &rewriter, Value step,
                                       int64_t value) {
@@ -956,17 +978,31 @@ struct VectorContractToAMXDotProduct
       if (!isVnni) {
         VectorType vecTy;
         SmallVector<OpFoldResult> indexVals;
+        AffineMap permMap;
         llvm::TypeSwitch<Operation *>(contractOp.getRhs().getDefiningOp())
-            .Case<TransferReadOp, LoadOp>([&](auto readOp) {
+            .Case<TransferReadOp>([&](auto readOp) {
               indexVals = SmallVector<OpFoldResult>(readOp.getIndices().begin(),
                                                     readOp.getIndices().end());
               vecTy = readOp.getType();
+              permMap = readOp.getPermutationMap();
+            })
+            .Case<LoadOp>([&](auto readOp) {
+              indexVals = SmallVector<OpFoldResult>(readOp.getIndices().begin(),
+                                                    readOp.getIndices().end());
+              vecTy = readOp.getType();
+              permMap = AffineMap::getMinorIdentityMap(
+                  indexVals.size(), vecTy.getRank(), readOp.getContext());
             });
         auto one = rewriter.getIndexAttr(1);
         SmallVector<OpFoldResult> strides(indexVals.size(), one);
-        SmallVector<OpFoldResult> sizes = getAsIndexOpFoldResult(
-            contractOp.getRhs().getDefiningOp()->getContext(),
-            vecTy.getShape());
+        auto sizesOrFailure = getReadRegionSizes(
+            contractOp.getRhs().getDefiningOp()->getContext(), permMap, vecTy,
+            indexVals.size());
+        if (failed(sizesOrFailure))
+          return rewriter.notifyMatchFailure(
+              contractOp,
+              "Unsupported RHS read permutation map for online packing.");
+        SmallVector<OpFoldResult> sizes = *sizesOrFailure;
         auto subview = memref::SubViewOp::create(rewriter, loc, srcBuffRhs,
                                                  indexVals, sizes, strides);
         auto bufferType = MemRefType::get({16, (16 * blockingFactor)}, ipType);
