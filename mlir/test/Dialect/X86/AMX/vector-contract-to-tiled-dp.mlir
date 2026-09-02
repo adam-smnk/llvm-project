@@ -2338,3 +2338,180 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+// Regression test for a crash (out-of-bounds operand access) previously hit
+// when the RHS operand is read through a memref.expand_shape wrapping the
+// reduction-tiled subview. The pattern now follows such reshape ops down to
+// the underlying subview to locate the reduction induction variable, so the
+// rewrite succeeds instead of crashing or bailing out.
+
+!vecA = vector<16x32xbf16>
+!vecB = vector<32x16xbf16>
+!vecC = vector<16x16xf32>
+!memrefB = memref<64x64xbf16>
+!memrefC = memref<16x64x32xbf16>
+
+#map = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map1 = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map2 = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+func.func @rhs_via_expand_shape(%arg0: memref<16x32xf32>, %arg1: !memrefB, %arg2: !memrefC) {
+  %cst = arith.constant 0.000000e+00 : bf16
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  %c32 = arith.constant 32 : index
+  %c64 = arith.constant 64 : index
+  %cst_1 = arith.constant 0.000000e+00 : f32
+  %0 = vector.transfer_read %arg0[%c0, %c0], %cst_1 {in_bounds = [true, true]} : memref<16x32xf32>, !vecC
+  %1 = vector.transfer_read %arg0[%c0, %c16], %cst_1 {in_bounds = [true, true]} : memref<16x32xf32>, !vecC
+  %2:2 = scf.for %arg3 = %c0 to %c64 step %c32 iter_args(%arg4 = %0, %arg5 = %1) -> (!vecC, !vecC) {
+    %subview = memref.subview %arg1[%c0, %arg3] [16, 32] [1, 1] : !memrefB to memref<16x32xbf16, strided<[64, 1], offset: ?>>
+    %expand_shape = memref.expand_shape %subview [[0], [1, 2]] output_shape [16, 1, 32] : memref<16x32xbf16, strided<[64, 1], offset: ?>> into memref<16x1x32xbf16, strided<[64, 32, 1], offset: ?>>
+    %3 = vector.transfer_read %expand_shape[%c0, %c0, %c0], %cst {in_bounds = [true, true], permutation_map = #map} : memref<16x1x32xbf16, strided<[64, 32, 1], offset: ?>>, !vecA
+    %subview_1 = memref.subview %arg2[%c0, %arg3, %c0] [16, 64, 32] [1, 1, 1] : !memrefC to memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>
+    %4 = vector.transfer_read %subview_1[%c0, %c0, %c0], %cst {in_bounds = [true, true]} : memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>, !vecB
+    %5 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %3, %4, %arg4 : !vecA, !vecB into !vecC
+    %6 = vector.transfer_read %subview_1[%c0, %c0, %c16], %cst {in_bounds = [true, true]} : memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>, !vecB
+    %7 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %3, %6, %arg5 : !vecA, !vecB into !vecC
+    scf.yield %5, %7 : !vecC, !vecC
+  }
+  vector.transfer_write %2#0, %arg0[%c0, %c0] {in_bounds = [true, true]} : !vecC, memref<16x32xf32>
+  vector.transfer_write %2#1, %arg0[%c0, %c16] {in_bounds = [true, true]} : !vecC, memref<16x32xf32>
+  return
+}
+
+// CHECK-LABEL: @rhs_via_expand_shape
+// CHECK-COUNT-2: x86.amx.tile_zero : !x86.amx.tile<16x16xf32>
+// CHECK: scf.for
+// CHECK: x86.amx.tile_load
+// CHECK: x86.amx.tile_mulf
+// CHECK: x86.amx.tile_store
+// CHECK-NOT: vector.contract
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.x86.vector_contract_to_amx_dot_product
+    } : !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// The RHS source is wrapped by two view ops (memref.cast then
+// memref.expand_shape) before the subview that carries the reduction
+// induction variable. The chain-following logic must handle any number of
+// supported view ops between the read and the subview.
+
+!vecA = vector<16x32xbf16>
+!vecB = vector<32x16xbf16>
+!vecC = vector<16x16xf32>
+!memrefB = memref<64x64xbf16>
+!memrefC = memref<16x64x32xbf16>
+
+#map = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map1 = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map2 = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+func.func @rhs_via_cast_and_expand_shape(%arg0: memref<16x32xf32>, %arg1: !memrefB, %arg2: !memrefC) {
+  %cst = arith.constant 0.000000e+00 : bf16
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  %c32 = arith.constant 32 : index
+  %c64 = arith.constant 64 : index
+  %cst_1 = arith.constant 0.000000e+00 : f32
+  %0 = vector.transfer_read %arg0[%c0, %c0], %cst_1 {in_bounds = [true, true]} : memref<16x32xf32>, !vecC
+  %1 = vector.transfer_read %arg0[%c0, %c16], %cst_1 {in_bounds = [true, true]} : memref<16x32xf32>, !vecC
+  %2:2 = scf.for %arg3 = %c0 to %c64 step %c32 iter_args(%arg4 = %0, %arg5 = %1) -> (!vecC, !vecC) {
+    %subview = memref.subview %arg1[%c0, %arg3] [16, 32] [1, 1] : !memrefB to memref<16x32xbf16, strided<[64, 1], offset: ?>>
+    %cast = memref.cast %subview : memref<16x32xbf16, strided<[64, 1], offset: ?>> to memref<16x32xbf16, strided<[64, 1], offset: ?>>
+    %expand_shape = memref.expand_shape %cast [[0], [1, 2]] output_shape [16, 1, 32] : memref<16x32xbf16, strided<[64, 1], offset: ?>> into memref<16x1x32xbf16, strided<[64, 32, 1], offset: ?>>
+    %3 = vector.transfer_read %expand_shape[%c0, %c0, %c0], %cst {in_bounds = [true, true], permutation_map = #map} : memref<16x1x32xbf16, strided<[64, 32, 1], offset: ?>>, !vecA
+    %subview_1 = memref.subview %arg2[%c0, %arg3, %c0] [16, 64, 32] [1, 1, 1] : !memrefC to memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>
+    %4 = vector.transfer_read %subview_1[%c0, %c0, %c0], %cst {in_bounds = [true, true]} : memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>, !vecB
+    %5 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %3, %4, %arg4 : !vecA, !vecB into !vecC
+    %6 = vector.transfer_read %subview_1[%c0, %c0, %c16], %cst {in_bounds = [true, true]} : memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>, !vecB
+    %7 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %3, %6, %arg5 : !vecA, !vecB into !vecC
+    scf.yield %5, %7 : !vecC, !vecC
+  }
+  vector.transfer_write %2#0, %arg0[%c0, %c0] {in_bounds = [true, true]} : !vecC, memref<16x32xf32>
+  vector.transfer_write %2#1, %arg0[%c0, %c16] {in_bounds = [true, true]} : !vecC, memref<16x32xf32>
+  return
+}
+
+// CHECK-LABEL: @rhs_via_cast_and_expand_shape
+// CHECK-COUNT-2: x86.amx.tile_zero : !x86.amx.tile<16x16xf32>
+// CHECK: scf.for
+// CHECK: x86.amx.tile_load
+// CHECK: x86.amx.tile_mulf
+// CHECK: x86.amx.tile_store
+// CHECK-NOT: vector.contract
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.x86.vector_contract_to_amx_dot_product
+    } : !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Negative test: the RHS source memref is not read from a memref.subview at
+// all, and the memref.alloc providing it has a dynamic size operand equal to
+// the reduction induction variable. memref.alloc is not a supported "view"
+// op, so it must not be misread as a subview offset -- the pattern must
+// decline to rewrite rather than misclone or crash.
+
+!vecA = vector<16x32xbf16>
+!vecB = vector<32x16xbf16>
+!vecC = vector<16x16xf32>
+!memrefC = memref<16x64x32xbf16>
+
+#map = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map1 = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map2 = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+func.func @negative_rhs_via_dynamic_alloc(%arg0: memref<16x32xf32>, %arg2: !memrefC) {
+  %cst = arith.constant 0.000000e+00 : bf16
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  %c32 = arith.constant 32 : index
+  %c64 = arith.constant 64 : index
+  %cst_1 = arith.constant 0.000000e+00 : f32
+  %0 = vector.transfer_read %arg0[%c0, %c0], %cst_1 {in_bounds = [true, true]} : memref<16x32xf32>, !vecC
+  %1 = vector.transfer_read %arg0[%c0, %c16], %cst_1 {in_bounds = [true, true]} : memref<16x32xf32>, !vecC
+  %2:2 = scf.for %arg3 = %c0 to %c64 step %c32 iter_args(%arg4 = %0, %arg5 = %1) -> (!vecC, !vecC) {
+    %alloc = memref.alloc(%arg3) : memref<?x32xbf16>
+    %3 = vector.transfer_read %alloc[%c0, %c0], %cst {in_bounds = [true, true]} : memref<?x32xbf16>, !vecA
+    %subview_1 = memref.subview %arg2[%c0, %arg3, %c0] [16, 64, 32] [1, 1, 1] : !memrefC to memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>
+    %4 = vector.transfer_read %subview_1[%c0, %c0, %c0], %cst {in_bounds = [true, true]} : memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>, !vecB
+    %5 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %3, %4, %arg4 : !vecA, !vecB into !vecC
+    %6 = vector.transfer_read %subview_1[%c0, %c0, %c16], %cst {in_bounds = [true, true]} : memref<16x64x32xbf16, strided<[2048, 32, 1], offset: ?>>, !vecB
+    %7 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %3, %6, %arg5 : !vecA, !vecB into !vecC
+    scf.yield %5, %7 : !vecC, !vecC
+  }
+  vector.transfer_write %2#0, %arg0[%c0, %c0] {in_bounds = [true, true]} : !vecC, memref<16x32xf32>
+  vector.transfer_write %2#1, %arg0[%c0, %c16] {in_bounds = [true, true]} : !vecC, memref<16x32xf32>
+  return
+}
+
+// CHECK-LABEL: @negative_rhs_via_dynamic_alloc
+// CHECK-NOT: x86.amx
+// CHECK: vector.contract
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.x86.vector_contract_to_amx_dot_product
+    } : !transform.any_op
+    transform.yield
+  }
+}

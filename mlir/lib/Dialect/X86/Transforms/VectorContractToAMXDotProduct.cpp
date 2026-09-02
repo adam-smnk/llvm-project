@@ -21,6 +21,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::vector;
 using namespace mlir::x86;
@@ -212,28 +214,96 @@ static LogicalResult validateContractOps(OpBuilder &rewriter,
   return success();
 }
 
-// Returns the loop index position to get mapped during the
-// MemRef type clone.
-static unsigned getIndexPosition(Value operand, scf::ForOp loop) {
-  Value iv = loop.getInductionVar();
+// Checks for supported view-like ops when traversing operand chains to locate
+// the source buffer.
+static bool isSupportedMemrefViewOp(Operation *op) {
+  return isa<memref::ExpandShapeOp, memref::CollapseShapeOp, memref::CastOp>(
+      op);
+}
 
+// Finds the memref.subview that, possibly through a chain of view-like ops,
+// provides `op`'s source.
+// Returns the chain of ops from `op` up to (but excluding) the subview,
+// plus the subview itself, if the source is found.
+static FailureOr<std::pair<SmallVector<Operation *>, memref::SubViewOp>>
+getViewChainToSubview(Operation *op) {
+  SmallVector<Operation *> chain;
+  Operation *cur = op;
+  while (cur && !isa<memref::SubViewOp>(cur)) {
+    if (cur->getNumOperands() != 1 || !isSupportedMemrefViewOp(cur))
+      return failure();
+    chain.push_back(cur);
+    cur = cur->getOperand(0).getDefiningOp();
+  }
+  if (!cur)
+    return failure();
+
+  return std::make_pair(chain, cast<memref::SubViewOp>(cur));
+}
+
+// Returns the position of loop's induction variable among subview's
+// dynamic offsets, if present.
+static std::optional<unsigned>
+getInductionVarOffsetPos(memref::SubViewOp subview, scf::ForOp loop) {
+  Value iv = loop.getInductionVar();
+  for (auto it : llvm::enumerate(subview.getOffsets()))
+    if (it.value() == iv)
+      return it.index();
+  return std::nullopt;
+}
+
+// Returns the loop index position for mapping, if the operand is sourced from
+// a memref.subview and loop's induction variable is one of its offsets.
+static std::optional<unsigned> getIndexPosition(Value operand,
+                                                scf::ForOp loop) {
   Value srcBuff;
   llvm::TypeSwitch<Operation *>(operand.getDefiningOp())
       .Case<TransferReadOp, LoadOp>(
           [&](auto readOp) { srcBuff = readOp.getOperand(0); });
 
-  auto subview = srcBuff.getDefiningOp<memref::SubViewOp>();
-  if (!subview)
-    return 0;
+  Operation *defOp = srcBuff ? srcBuff.getDefiningOp() : nullptr;
+  if (!defOp)
+    return std::nullopt;
 
-  auto offsets = subview.getOffsets();
+  auto chainAndSubview = getViewChainToSubview(defOp);
+  if (failed(chainAndSubview))
+    return std::nullopt;
 
-  for (auto it : llvm::enumerate(offsets)) {
-    if (it.value() == iv)
-      return it.index();
+  return getInductionVarOffsetPos(chainAndSubview->second, loop);
+}
+
+// Clones `op`'s def-chain down to (and including) the memref.subview that
+// ultimately provides its source memref, applying every (loop, replacement)
+// substitution in `substitutions` whose induction variable is one of that
+// subview's dynamic offsets. `op` may be the subview itself, or be reached
+// from it through a chain of single-operand "view" ops (e.g.
+// memref.expand_shape, memref.collapse_shape) -- this keeps the
+// induction-variable remapping correct even when the source memref is
+// packed/reshaped before being read by a vector.contract operand.
+static Operation *cloneWithRemappedInductionVars(
+    OpBuilder &rewriter, Operation *op,
+    ArrayRef<std::pair<scf::ForOp, Value>> substitutions) {
+  auto chainAndSubview = getViewChainToSubview(op);
+  if (failed(chainAndSubview))
+    return rewriter.clone(*op);
+
+  auto &[chain, subview] = *chainAndSubview;
+
+  IRMapping subviewMapping;
+  for (auto &sub : substitutions) {
+    if (auto pos = getInductionVarOffsetPos(subview, sub.first))
+      subviewMapping.map(subview.getOffsets()[*pos], sub.second);
   }
 
-  return 0;
+  Operation *prevClone = rewriter.clone(*subview, subviewMapping);
+  Value prevOriginalResult = subview->getResult(0);
+  for (Operation *wrapOp : llvm::reverse(chain)) {
+    IRMapping wrapMapping;
+    wrapMapping.map(prevOriginalResult, prevClone->getResult(0));
+    prevClone = rewriter.clone(*wrapOp, wrapMapping);
+    prevOriginalResult = wrapOp->getResult(0);
+  }
+  return prevClone;
 }
 
 // Creates amx.tile_loads.
@@ -550,16 +620,12 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
       rewriter, loc, lowerBound, upperBound, step, loopItrArgs,
       [&](OpBuilder &rewriterNewInnerLoop, Location locNewInnerLoop,
           Value ivNewInnerLoop, ValueRange iterArgsNewInnerLoop) {
-        IRMapping mapping;
+        SmallVector<std::pair<scf::ForOp, Value>> lhsSubs;
         if (outerLoop)
-          mapping.map(vectorOpLhs->getOperand(
-                          getIndexPosition(contractOp.getLhs(), outerLoop) + 1),
-                      ivOuterLoop);
-
-        mapping.map(vectorOpLhs->getOperand(
-                        getIndexPosition(contractOp.getLhs(), innerLoop) + 1),
-                    ivNewInnerLoop);
-        auto lhsClone = rewriterNewInnerLoop.clone(*vectorOpLhs, mapping);
+          lhsSubs.push_back({outerLoop, ivOuterLoop});
+        lhsSubs.push_back({innerLoop, ivNewInnerLoop});
+        Operation *lhsClone = cloneWithRemappedInductionVars(
+            rewriterNewInnerLoop, vectorOpLhs, lhsSubs);
 
         Value indxToStoreInBuffer = c0;
         Value indxToLoadFromBuffer = c0;
@@ -617,35 +683,18 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
             }
           }
         }
-        IRMapping rhsMapping;
-
         Value matB;
         Operation *rhsOp = vectorOpRhs;
 
         // Clone for the subview type operations
         if (rhsOp->getNumOperands() > 0) {
+          SmallVector<std::pair<scf::ForOp, Value>> rhsSubs;
+          if (outerLoop)
+            rhsSubs.push_back({outerLoop, ivOuterLoop});
+          rhsSubs.push_back({innerLoop, ivNewInnerLoop});
 
-          if (outerLoop) {
-            int64_t outerPos = getIndexPosition(contractOp.getRhs(), outerLoop);
-
-            if (outerPos >= 0) {
-              unsigned operandIdx = static_cast<unsigned>(outerPos + 1);
-
-              if (operandIdx < rhsOp->getNumOperands())
-                rhsMapping.map(rhsOp->getOperand(operandIdx), ivOuterLoop);
-            }
-          }
-
-          int64_t innerPos = getIndexPosition(contractOp.getRhs(), innerLoop);
-
-          if (innerPos >= 0) {
-            unsigned operandIdx = static_cast<unsigned>(innerPos + 1);
-
-            if (operandIdx < rhsOp->getNumOperands())
-              rhsMapping.map(rhsOp->getOperand(operandIdx), ivNewInnerLoop);
-          }
-
-          auto rhsClone = rewriterNewInnerLoop.clone(*rhsOp, rhsMapping);
+          Operation *rhsClone = cloneWithRemappedInductionVars(
+              rewriterNewInnerLoop, rhsOp, rhsSubs);
           matB = rhsClone->getResult(0);
 
         } else {
@@ -1142,6 +1191,20 @@ struct VectorContractToAMXDotProduct
             contractOp, "Coudn't find the pair vector contract ");
     }
 
+    // Locate the reduction induction variable among the LHS/RHS source offsets
+    // for later remapping.
+    scf::ForOp reductionInnerLoop = loopLists[0];
+    scf::ForOp reductionOuterLoop =
+        loopLists.size() == 2 ? loopLists[1] : nullptr;
+    if (!getIndexPosition(contractOp.getLhs(), reductionInnerLoop) ||
+        !getIndexPosition(contractOp.getRhs(), reductionInnerLoop) ||
+        (reductionOuterLoop &&
+         (!getIndexPosition(contractOp.getLhs(), reductionOuterLoop) ||
+          !getIndexPosition(contractOp.getRhs(), reductionOuterLoop))))
+      return rewriter.notifyMatchFailure(
+          contractOp, "Could not locate the reduction induction variable in "
+                      "the LHS/RHS source memref.subview offsets.");
+
     scf::ForOp innerLoop;
     scf::ForOp outerLoop;
 
@@ -1224,16 +1287,10 @@ struct VectorContractToAMXDotProduct
             memref::AllocaOp::create(rewriter, outerLoop.getLoc(), bufferType);
 
         // First Shuffling outside the reduction loops
-        IRMapping rhsMapping;
-        rhsMapping.map(
-            vectorOpRhs->getOperand(
-                getIndexPosition(contractOp.getRhs(), outerLoop) + 1),
-            outerLoop.getLowerBound());
-        rhsMapping.map(
-            vectorOpRhs->getOperand(
-                getIndexPosition(contractOp.getRhs(), innerLoop) + 1),
-            innerLoop.getLowerBound());
-        auto rhsClone = rewriter.clone(*vectorOpRhs, rhsMapping);
+        Operation *rhsClone = cloneWithRemappedInductionVars(
+            rewriter, vectorOpRhs,
+            {{outerLoop, outerLoop.getLowerBound()},
+             {innerLoop, innerLoop.getLowerBound()}});
 
         Value quotient_batch = arith::DivUIOp::create(
             rewriter, outerLoop.getLoc(), outerLoop.getLowerBound(),
@@ -1373,12 +1430,8 @@ struct VectorContractToAMXDotProduct
             memref::AllocaOp::create(rewriter, innerLoop.getLoc(), bufferType);
 
         // First Shuffling outside the reduction loops
-        IRMapping rhsMapping;
-        rhsMapping.map(
-            vectorOpRhs->getOperand(
-                getIndexPosition(contractOp.getRhs(), innerLoop) + 1),
-            innerLoop.getLowerBound());
-        auto rhsClone = rewriter.clone(*vectorOpRhs, rhsMapping);
+        Operation *rhsClone = cloneWithRemappedInductionVars(
+            rewriter, vectorOpRhs, {{innerLoop, innerLoop.getLowerBound()}});
 
         Value quotient_k = arith::DivUIOp::create(rewriter, innerLoop.getLoc(),
                                                   innerLoop.getLowerBound(),
