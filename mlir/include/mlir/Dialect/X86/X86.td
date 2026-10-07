@@ -846,6 +846,9 @@ def TileLoadOp : AMX_Op<"tile_load", [
     With the write memory effect, each `x86.amx.tile_load` operation serves as
     a compilation hint to use a separate tile register.
 
+    With `non_temporal`, the load hints that the data will not be reused soon
+    ("tileloaddt1"), keeping streamed operands from evicting reused ones.
+
     Example:
 
     ```mlir
@@ -858,7 +861,8 @@ def TileLoadOp : AMX_Op<"tile_load", [
   }];
   let arguments = (ins Arg<AnyMemRef, "load base", [MemRead]>:$base,
                    Variadic<Index>:$indices,
-                   Optional<Index>:$stride);
+                   Optional<Index>:$stride,
+                   UnitAttr:$non_temporal);
   let results = (outs AnyAMXTile:$res);
   let builders = [
     OpBuilder<(ins "Type":$res, "Value":$base, "ValueRange":$indices)>
@@ -872,14 +876,16 @@ def TileLoadOp : AMX_Op<"tile_load", [
     }
 
     std::string getIntrinsicName() {
-      return "llvm.x86.tileloadd64.internal";
+      return getNonTemporal() ? "llvm.x86.tileloaddt164.internal"
+                              : "llvm.x86.tileloadd64.internal";
     }
     SmallVector<Value> getIntrinsicOperands(
         ::mlir::ArrayRef<Value> operands,
         const ::mlir::LLVMTypeConverter &typeConverter,
         ::mlir::RewriterBase &rewriter);
   }];
-  let assemblyFormat = "$base `[` $indices `]` (`,` $stride^ )? attr-dict"
+  let assemblyFormat = "(`non_temporal` $non_temporal^)? $base `[` $indices `]` "
+                       "(`,` $stride^ )? attr-dict"
                        "`:` type($base) `into` qualified(type($res))";
   let hasVerifier = 1;
 }

@@ -3,7 +3,7 @@
 // CHECK-LABEL: muli(
 // CHECK: llvm.call_intrinsic "llvm.x86.tilezero.internal"
 // CHECK: llvm.call_intrinsic "llvm.x86.tileloadd64.internal"
-// CHECK: llvm.call_intrinsic "llvm.x86.tileloadd64.internal"
+// CHECK: llvm.call_intrinsic "llvm.x86.tileloaddt164.internal"
 // CHECK: llvm.call_intrinsic "llvm.x86.tdpbuud.internal"
 // CHECK: llvm.call_intrinsic "llvm.x86.tilestored64.internal"
 // CHECK: llvm.call_intrinsic "llvm.x86.tdpbssd.internal"
@@ -16,7 +16,7 @@ func.func @muli(%arg0: memref<?x?xi8>, %arg1: memref<?x?xi32>) {
   %0 = arith.constant 0 : index
   %1 = x86.amx.tile_zero : !x86.amx.tile<16x64xi8>
   %2 = x86.amx.tile_load %arg0[%0, %0] : memref<?x?xi8> into !x86.amx.tile<16x64xi8>
-  %3 = x86.amx.tile_load %arg1[%0, %0] : memref<?x?xi32> into !x86.amx.tile<16x16xi32>
+  %3 = x86.amx.tile_load non_temporal %arg1[%0, %0] : memref<?x?xi32> into !x86.amx.tile<16x16xi32>
   %4 = x86.amx.tile_muli %1 zext, %2 zext, %3 : !x86.amx.tile<16x64xi8>, !x86.amx.tile<16x64xi8>, !x86.amx.tile<16x16xi32>
   x86.amx.tile_store %arg1[%0, %0], %4 : memref<?x?xi32>, !x86.amx.tile<16x16xi32>
   %5 = x86.amx.tile_muli %1, %2, %3 : !x86.amx.tile<16x64xi8>, !x86.amx.tile<16x64xi8>, !x86.amx.tile<16x16xi32>
