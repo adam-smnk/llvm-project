@@ -1156,6 +1156,13 @@ struct VectorContractToAMXDotProduct
               contractOp, "The input acc should be a zero constant or "
                           "transfer_read for all contracts");
 
+        Value resultChain = contractionUsersAfterYield(contract.getResult());
+        if (!resultChain ||
+            isa<vector::ContractionOp>(*resultChain.getUsers().begin()))
+          return rewriter.notifyMatchFailure(
+              contractOp, "The accumulation continues in another contract "
+                          "after the reduction loop.");
+
         ops.push_back(contract);
       }
     }

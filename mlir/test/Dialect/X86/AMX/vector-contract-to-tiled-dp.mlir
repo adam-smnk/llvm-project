@@ -1019,6 +1019,109 @@ module attributes {transform.with_named_sequence} {
 
 // -----
 
+// The accumulation continues in contractions after the reduction loop (e.g.
+// a K remainder): not supported.
+
+!vecAB = vector<16x16x4xi8>
+!vecC = vector<16x16xi32>
+!memrefA = memref<16x16x4xi8, strided<[320, 4, 1], offset: ?>>
+!memrefB = memref<16x32x4xi8, strided<[512, 4, 1], offset: ?>>
+!memrefC = memref<16x32xi32, strided<[128, 1], offset: ?>>
+
+#map = affine_map<(d0, d1, d2, d3) -> (d1, d3, d0)>
+#map1 = affine_map<(d0, d1, d2, d3) -> (d3, d2, d0)>
+#map2 = affine_map<(d0, d1, d2, d3) -> (d1, d2)>
+
+func.func @negative_matmul_int8_loop_acc_continues_in_contract(%arg0: memref<64x80x4xi8>, %arg1: memref<80x128x4xi8>, %arg2: memref<64x128xi32>) {
+  %0 = ub.poison : i32
+  %1 = ub.poison : i8
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c64 = arith.constant 64 : index
+  %c128 = arith.constant 128 : index
+  %c16 = arith.constant 16 : index
+  %c32 = arith.constant 32 : index
+  scf.for %arg3 = %c0 to %c64 step %c16 {
+    scf.for %arg4 = %c0 to %c128 step %c32 {
+
+      %subview = memref.subview %arg2[%arg3, %arg4] [16, 32] [1, 1] :
+                memref<64x128xi32> to !memrefC
+      %2 = vector.transfer_read %subview[%c0, %c0], %0 {in_bounds = [true, true]} :
+                !memrefC, !vecC
+      %3 = vector.transfer_read %subview[%c0, %c16], %0 {in_bounds = [true, true]} :
+                !memrefC, !vecC
+
+      %r:2 = scf.for %b = %c0 to %c2 step %c1 iter_args(%acc0 = %2, %acc1 = %3) -> (!vecC, !vecC) {
+      %4:2 = scf.for %arg5 = %c0 to %c64 step %c16 iter_args(%arg6 = %acc0, %arg7 = %acc1) -> (!vecC, !vecC) {
+
+        %subview_0 = memref.subview %arg0[%arg3, %arg5, 0] [16, 16, 4] [1, 1, 1] :
+                memref<64x80x4xi8> to !memrefA
+        %subview_1 = memref.subview %arg1[%arg5, %arg4, 0] [16, 32, 4] [1, 1, 1] :
+                memref<80x128x4xi8> to !memrefB
+        %5 = vector.transfer_read %subview_0[%c0, %c0, %c0], %1 {in_bounds = [true, true, true]} :
+                !memrefA, !vecAB
+        %6 = vector.transfer_read %subview_1[%c0, %c0, %c0], %1 {in_bounds = [true, true, true]} :
+                !memrefB, !vecAB
+        %7 = vector.transfer_read %subview_1[%c0, %c16, %c0], %1 {in_bounds = [true, true, true]} :
+                !memrefB, !vecAB
+
+        %8 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types =
+                ["reduction", "parallel", "parallel", "reduction"], kind = #vector.kind<add>}
+                %5, %6, %arg6 {unroll_shape = array<i64: 4, 16, 16, 16>} : !vecAB, !vecAB into !vecC
+        %9 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types =
+                ["reduction", "parallel", "parallel", "reduction"], kind = #vector.kind<add>}
+                %5, %7, %arg7 {unroll_shape = array<i64: 4, 16, 16, 16>} : !vecAB, !vecAB into !vecC
+
+        scf.yield %8, %9 : !vecC, !vecC
+      }
+
+      %subview_2 = memref.subview %arg0[%arg3, 64, 0] [16, 16, 4] [1, 1, 1] :
+              memref<64x80x4xi8> to !memrefA
+      %subview_3 = memref.subview %arg1[64, %arg4, 0] [16, 32, 4] [1, 1, 1] :
+              memref<80x128x4xi8> to !memrefB
+      %10 = vector.transfer_read %subview_2[%c0, %c0, %c0], %1 {in_bounds = [true, true, true]} :
+              !memrefA, !vecAB
+      %11 = vector.transfer_read %subview_3[%c0, %c0, %c0], %1 {in_bounds = [true, true, true]} :
+              !memrefB, !vecAB
+      %12 = vector.transfer_read %subview_3[%c0, %c16, %c0], %1 {in_bounds = [true, true, true]} :
+              !memrefB, !vecAB
+      %13 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types =
+              ["reduction", "parallel", "parallel", "reduction"], kind = #vector.kind<add>}
+              %10, %11, %4#0 {unroll_shape = array<i64: 4, 16, 16, 16>} : !vecAB, !vecAB into !vecC
+      %14 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types =
+              ["reduction", "parallel", "parallel", "reduction"], kind = #vector.kind<add>}
+              %10, %12, %4#1 {unroll_shape = array<i64: 4, 16, 16, 16>} : !vecAB, !vecAB into !vecC
+      scf.yield %13, %14 : !vecC, !vecC
+      }
+
+      vector.transfer_write %r#1, %subview[%c0, %c16] {in_bounds = [true, true]} :
+                !vecC, !memrefC
+      vector.transfer_write %r#0, %subview[%c0, %c0] {in_bounds = [true, true]} :
+                !vecC, !memrefC
+    }
+  }
+
+  return
+}
+
+// CHECK-LABEL: @negative_matmul_int8_loop_acc_continues_in_contract
+// CHECK-NOT: x86.amx
+// CHECK-COUNT-4: vector.contract
+// CHECK-NOT: x86.amx
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.x86.vector_contract_to_amx_dot_product
+    } : !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
 !vecA = vector<1x16x32xbf16>
 !vecB = vector<1x32x16xbf16>
 !vecC = vector<16x16xf32>
