@@ -460,7 +460,11 @@ createTiledDp(OpBuilder &rewriter, Location loc,
                    indxToStoreInBuffer, indxToLoadFromMatB);
   }
 
-  // Iterate over the contraction operations and compute the tiled dot-product.
+  // Load every input tile before the first dot-product: live together, the
+  // tiles get their own registers, so the loads of one operand need not wait
+  // for the dot-products still reading another (tile registers are not
+  // renamed).
+  SmallVector<std::pair<amx::TileLoadOp, amx::TileLoadOp>> operandTiles;
   for (size_t i = 0; i < ops.size(); i++) {
 
     Operation *readOpLhs = ops[i].getLhs().getDefiningOp();
@@ -484,6 +488,12 @@ createTiledDp(OpBuilder &rewriter, Location loc,
                                  true, offset, isVnni);
       readsToTileLoads.try_emplace(readOpRhs, tilesRhs);
     }
+    operandTiles.emplace_back(tilesLhs, tilesRhs);
+  }
+
+  // Iterate over the contraction operations and compute the tiled dot-product.
+  for (size_t i = 0; i < ops.size(); i++) {
+    auto [tilesLhs, tilesRhs] = operandTiles[i];
 
     auto accTileType = amx::TileType::get({16, 16}, opType);
 
