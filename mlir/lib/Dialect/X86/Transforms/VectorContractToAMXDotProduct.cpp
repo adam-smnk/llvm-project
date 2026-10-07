@@ -533,6 +533,46 @@ createTiledDp(OpBuilder &rewriter, Location loc,
   return accumulators;
 }
 
+// Conservative upper bound on the L1 data cache size of AMX-capable cores.
+static constexpr int64_t kL1CacheSizeUpperBound = 64 * 1024;
+
+// Whether the operand data read by the contractions over all iterations of the
+// reduction loops surely overflows L1. The operand tiles then stream through
+// the loops rather than being reused from L1.
+static bool operandsOverflowL1(ArrayRef<vector::ContractionOp> ops,
+                               ArrayRef<scf::ForOp> loops) {
+  int64_t tripCount = 1;
+  for (auto loop : loops) {
+    std::optional<APInt> count = loop.getStaticTripCount();
+    if (!count)
+      return false;
+    tripCount *= count->getSExtValue();
+  }
+  llvm::SmallPtrSet<Value, 8> operands;
+  int64_t bytes = 0;
+  for (vector::ContractionOp op : ops) {
+    for (Value operand : {op.getLhs(), op.getRhs()}) {
+      if (!operands.insert(operand).second)
+        continue;
+      auto type = cast<VectorType>(operand.getType());
+      bytes += type.getNumElements() * type.getElementTypeBitWidth() / 8;
+    }
+  }
+  return bytes * tripCount > kL1CacheSizeUpperBound;
+}
+
+// Hints the operand tile loads in `loop` non-temporal, so that the streamed
+// operands do not evict the reused data. Tiles of the online packing buffer
+// are reused and keep the default.
+// TODO: Hint only the operand not reused across the innermost loop instead
+// of all operands.
+static void setOperandTileLoadsNontemporal(scf::ForOp loop) {
+  loop.walk([](amx::TileLoadOp load) {
+    if (!load.getBase().getDefiningOp<memref::AllocaOp>())
+      load.setNontemporal(true);
+  });
+}
+
 static SmallVector<Value> createTileZeros(OpBuilder &rewriter, Location loc,
                                           Type opType, scf::ForOp outerLoop,
                                           int64_t size) {
@@ -1255,6 +1295,7 @@ struct VectorContractToAMXDotProduct
     scf::ForOp outerLoop;
 
     scf::ForOp newLoop;
+    scf::ForOp newLoopNonSpill;
     // Case 2a: Reduction loop depth is 2.
     if (loopLists.size() == 2) {
       outerLoop = loopLists[1];
@@ -1361,7 +1402,7 @@ struct VectorContractToAMXDotProduct
                        ipType, blockingFactor, packedBuffer, rem);
 
         // First Set of Loops
-        auto newLoopNonSpill = scf::ForOp::create(
+        newLoopNonSpill = scf::ForOp::create(
             rewriter, outerLoop.getLoc(), outerLoop.getLowerBound(),
             spillOuterLoop, outerLoop.getStep(), loopItrArgs,
             [&](OpBuilder &rewriterOuterLoop, Location locOuterLoop,
@@ -1498,7 +1539,7 @@ struct VectorContractToAMXDotProduct
         performShuffle(rewriter, innerLoop.getLoc(), rhsClone->getResult(0),
                        ipType, blockingFactor, packedBuffer, rem);
 
-        auto newLoopNonSpill = createLoops(
+        newLoopNonSpill = createLoops(
             rewriter, innerLoop.getLoc(), innerLoop.getLowerBound(),
             spillInnerLoop, innerLoop.getStep(), loopItrArgs, ipType, opType,
             blockingFactor, isVnni, vectorOpLhs, vectorOpRhs, contractOp,
@@ -1517,6 +1558,12 @@ struct VectorContractToAMXDotProduct
       // This helps the final store back to the acc uses the same code for
       // the both reduction loop depth 1 or 2.
       outerLoop = innerLoop;
+    }
+
+    if (operandsOverflowL1(ops, loopLists)) {
+      for (scf::ForOp loop : {newLoopNonSpill, newLoop})
+        if (loop)
+          setOperandTileLoadsNontemporal(loop);
     }
 
     // Copy the amx tile accumulation results to a MemRef buffer, add the

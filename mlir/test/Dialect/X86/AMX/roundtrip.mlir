@@ -38,6 +38,19 @@ func.func @tzero(%arg0: memref<?x?xbf16>) {
   return
 }
 
+// CHECK-LABEL: tload_nontemporal
+// CHECK: x86.amx.tile_load nontemporal %{{.*}}[%{{.*}}, %{{.*}}] : memref<?x?xbf16> into !x86.amx.tile<16x32xbf16>
+// CHECK: x86.amx.tile_load nontemporal %{{.*}}[%{{.*}}], %{{.*}} : memref<?xbf16> into !x86.amx.tile<16x32xbf16>
+func.func @tload_nontemporal(%stride: index, %arg0: memref<?x?xbf16>,
+    %arg1: memref<?xbf16>) {
+  %0 = arith.constant 0 : index
+  %1 = x86.amx.tile_load nontemporal %arg0[%0, %0] : memref<?x?xbf16> into !x86.amx.tile<16x32xbf16>
+  %2 = x86.amx.tile_load nontemporal %arg1[%0], %stride : memref<?xbf16> into !x86.amx.tile<16x32xbf16>
+  x86.amx.tile_store %arg0[%0, %0], %1 : memref<?x?xbf16>, !x86.amx.tile<16x32xbf16>
+  x86.amx.tile_store %arg1[%0], %2, %stride : memref<?xbf16>, !x86.amx.tile<16x32xbf16>
+  return
+}
+
 // CHECK-LABEL: tmulf
 // CHECK: %[[x:.*]] = x86.amx.tile_load %{{.*}}[%{{.*}}, %{{.*}}] : memref<?x?xbf16> into !x86.amx.tile<16x32xbf16>
 // CHECK: %[[z:.*]] = x86.amx.tile_load %{{.*}}[%{{.*}}, %{{.*}}] : memref<?x?xf32> into !x86.amx.tile<16x16xf32>
