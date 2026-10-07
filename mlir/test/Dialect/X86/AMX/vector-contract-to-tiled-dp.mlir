@@ -914,10 +914,9 @@ func.func @matmul_int8_loop(%arg0: memref<64x64x4xi8>, %arg1: memref<64x128x4xi8
 // CHECK-LABEL: @matmul_int8_loop
 // CHECK-2: x86.amx.tile_zero : !x86.amx.tile<16x16xi32>
 // CHECK: scf.for {{.*}} -> (!x86.amx.tile<16x16xi32>, !x86.amx.tile<16x16xi32>) {
-// CHECK-COUNT-2: x86.amx.tile_load %
-// CHECK: x86.amx.tile_muli
-// CHECK: x86.amx.tile_load %
-// CHECK: x86.amx.tile_muli
+// CHECK-COUNT-3: x86.amx.tile_load non_temporal
+// CHECK-NOT: x86.amx.tile_load
+// CHECK-COUNT-2: x86.amx.tile_muli
 // CHECK: scf.yield {{.*}} !x86.amx.tile<16x16xi32>, !x86.amx.tile<16x16xi32>
 // CHECK-NOT: scf.for {{.*}} vector<16x16xi32>, vector<16x16xi32>
 // CHECK-NOT: vector.contract
@@ -1003,10 +1002,10 @@ func.func @matmul_int8_loop_vnni_offsets(%arg0: memref<64x64x4xi8>, %arg1: memre
 // CHECK-DAG: %[[C64:.+]] = arith.constant 64 : index
 // CHECK-DAG: %[[LHS:.+]] = memref.collapse_shape %{{.+}} {{\[}}[0], [1, 2]] : memref<16x32x4xi8, strided<[256, 4, 1], offset: ?>> into memref<16x128xi8
 // CHECK-DAG: %[[RHS:.+]] = memref.collapse_shape %{{.+}} {{\[}}[0], [1, 2]] : memref<16x32x4xi8, strided<[512, 4, 1], offset: ?>> into memref<16x128xi8
-// CHECK: x86.amx.tile_load %[[LHS]][%[[C0]], %[[C64]]] {{.*}} !x86.amx.tile<16x64xi8>
-// CHECK: x86.amx.tile_load %[[RHS]][%[[C0]], %[[C0]]] {{.*}} !x86.amx.tile<16x64xi8>
+// CHECK: x86.amx.tile_load non_temporal %[[LHS]][%[[C0]], %[[C64]]] {{.*}} !x86.amx.tile<16x64xi8>
+// CHECK: x86.amx.tile_load non_temporal %[[RHS]][%[[C0]], %[[C0]]] {{.*}} !x86.amx.tile<16x64xi8>
+// CHECK: x86.amx.tile_load non_temporal %[[RHS]][%[[C0]], %[[C64]]] {{.*}} !x86.amx.tile<16x64xi8>
 // CHECK: x86.amx.tile_muli
-// CHECK: x86.amx.tile_load %[[RHS]][%[[C0]], %[[C64]]] {{.*}} !x86.amx.tile<16x64xi8>
 // CHECK: x86.amx.tile_muli
 // CHECK-NOT: vector.contract
 
