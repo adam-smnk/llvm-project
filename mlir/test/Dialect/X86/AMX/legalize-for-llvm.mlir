@@ -199,3 +199,20 @@ func.func @strides_explicit(%stride: index,
   x86.amx.tile_store %arg2[%0, %0], %3, %c64 : memref<32x32xf32, strided<[64, 1]>>, !x86.amx.tile<16x16xf32>
   return
 }
+
+// CHECK-LABEL: tile_load_nontemporal(
+// CHECK-SAME:    %[[STRIDE:.+]]: index
+// CHECK: %[[STRIDE_I64:.+]] = builtin.unrealized_conversion_cast %[[STRIDE]] : index to i64
+// CHECK: llvm.call_intrinsic "llvm.x86.tileloaddt164.internal"
+// CHECK: %[[LOAD_STRIDE_SCALE:.+]] = llvm.mlir.constant(1 : i64) : i64
+// CHECK: %[[LOAD_STRIDE:.+]] = llvm.mul %[[LOAD_STRIDE_SCALE]], %[[STRIDE_I64]]
+// CHECK: llvm.call_intrinsic "llvm.x86.tileloaddt164.internal"(%{{.+}}, %{{.+}}, %{{.+}}, %[[LOAD_STRIDE]]
+func.func @tile_load_nontemporal(%stride: index,
+    %arg0: memref<16x64xi8>, %arg1: memref<?xi8>) {
+  %0 = arith.constant 0 : index
+  %1 = x86.amx.tile_load nontemporal %arg0[%0, %0] : memref<16x64xi8> into !x86.amx.tile<16x64xi8>
+  %2 = x86.amx.tile_load nontemporal %arg1[%0], %stride : memref<?xi8> into !x86.amx.tile<16x64xi8>
+  x86.amx.tile_store %arg0[%0, %0], %1 : memref<16x64xi8>, !x86.amx.tile<16x64xi8>
+  x86.amx.tile_store %arg1[%0], %2, %stride : memref<?xi8>, !x86.amx.tile<16x64xi8>
+  return
+}

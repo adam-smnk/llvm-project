@@ -23,6 +23,17 @@ func.func @amx_tile_load_store(%base: memref<?x?xi8>, %out: memref<?x?xi8>,
   return
 }
 
+// CHECK-LABEL: define void @amx_tile_load_nontemporal
+func.func @amx_tile_load_nontemporal(%base: memref<?x?xi8>,
+    %out: memref<?x?xi8>, %idx: index)
+{
+  // CHECK: call x86_amx @llvm.x86.tileloaddt164.internal
+  // CHECK: call void @llvm.x86.tilestored64.internal
+  %val = x86.amx.tile_load nontemporal %base[%idx, %idx] : memref<?x?xi8> into !x86.amx.tile<16x64xi8>
+  x86.amx.tile_store %out[%idx, %idx], %val : memref<?x?xi8>, !x86.amx.tile<16x64xi8>
+  return
+}
+
 // CHECK-LABEL: define void @amx_tile_load_store_strided
 func.func @amx_tile_load_store_strided(%base: memref<?xi8>, %out: memref<?xi8>,
     %idx: index, %stride: index)
