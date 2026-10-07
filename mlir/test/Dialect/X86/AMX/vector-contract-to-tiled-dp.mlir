@@ -672,11 +672,15 @@ func.func @matmul_int8_loop(%arg0: memref<64x64x4xi8>, %arg1: memref<64x128x4xi8
   return
 }
 
+// The operands read by the 4 reduction steps fit in L1: their tiles may be
+// reused and keep the default temporal loads.
 // CHECK-LABEL: @matmul_int8_loop
 // CHECK-2: x86.amx.tile_zero : !x86.amx.tile<16x16xi32>
 // CHECK: scf.for {{.*}} -> (!x86.amx.tile<16x16xi32>, !x86.amx.tile<16x16xi32>) {
-// CHECK-3: x86.amx.tile_load
-// CHECK-2: x86.amx.tile_muli
+// CHECK-COUNT-2: x86.amx.tile_load %
+// CHECK: x86.amx.tile_muli
+// CHECK: x86.amx.tile_load %
+// CHECK: x86.amx.tile_muli
 // CHECK: scf.yield {{.*}} !x86.amx.tile<16x16xi32>, !x86.amx.tile<16x16xi32>
 // CHECK-NOT: scf.for {{.*}} vector<16x16xi32>, vector<16x16xi32>
 // CHECK-NOT: vector.contract
@@ -1133,6 +1137,8 @@ func.func @online_packing_bf16_loop(%arg0: memref<16x64x96xbf16>, %arg1: memref<
   return %alloc : memref<64x128xf32>
 }
 
+// The operands read over the 48 reduction steps overflow L1: the LHS tiles are
+// streamed and loaded non-temporal, the tiles of the packed RHS are reused.
 // CHECK-LABEL: @online_packing_bf16_loop
 // CHECK-COUNT-4: x86.amx.tile_zero : !x86.amx.tile<16x16xf32>
 // CHECK-COUNT-4: scf.for {{.*}} -> (!x86.amx.tile<16x16xf32>, !x86.amx.tile<16x16xf32>, !x86.amx.tile<16x16xf32>, !x86.amx.tile<16x16xf32>) {
@@ -1140,7 +1146,8 @@ func.func @online_packing_bf16_loop(%arg0: memref<16x64x96xbf16>, %arg1: memref<
 // CHECK: vector.transfer_read {{.*}} vector<32xbf16>
 // CHECK: vector.shuffle{{.*}}[0, 32, 1, 33, 2, 34, 3, 35, 8, 40, 9, 41, 10, 42, 11, 43, 16, 48, 17, 49, 18, 50, 19, 51, 24, 56, 25, 57, 26, 58, 27, 59] : vector<32xbf16>, vector<32xbf16>
 // CHECK-NEXT: vector.shuffle{{.*}}[4, 36, 5, 37, 6, 38, 7, 39, 12, 44, 13, 45, 14, 46, 15, 47, 20, 52, 21, 53, 22, 54, 23, 55, 28, 60, 29, 61, 30, 62, 31, 63] : vector<32xbf16>, vector<32xbf16>
-// CHECK: x86.amx.tile_load
+// CHECK-COUNT-2: x86.amx.tile_load %alloca
+// CHECK: x86.amx.tile_load nontemporal %subview
 // CHECK: x86.amx.tile_mulf
 // CHECK: scf.yield {{.*}} : !x86.amx.tile<16x16xf32>, !x86.amx.tile<16x16xf32>, !x86.amx.tile<16x16xf32>, !x86.amx.tile<16x16xf32>
 // CHECK: vector.shuffle{{.*}}[0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23] : vector<16xf32>, vector<16xf32>
