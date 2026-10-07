@@ -274,7 +274,12 @@ static amx::TileLoadOp createTileLoads(OpBuilder &rewriter, Location loc,
                         cast<MemRefType>(srcBuff.getType()).getShape().back());
 
   amx::TileType tileType = amx::TileType::get({16, (16 * offset)}, ipType);
-  return amx::TileLoadOp::create(rewriter, loc, tileType, mat, indices);
+  auto load = amx::TileLoadOp::create(rewriter, loc, tileType, mat, indices);
+  // Operand tiles stream through the reduction: hint them non-temporal, as
+  // oneDNN's AMX kernels do, so they do not evict the reused data.
+  if (isVnni)
+    load.setNonTemporal(true);
+  return load;
 }
 
 static void performShuffle(OpBuilder &rewriter, Location loc, Value matB,
