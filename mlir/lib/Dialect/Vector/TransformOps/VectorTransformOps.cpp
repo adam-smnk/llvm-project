@@ -44,6 +44,31 @@ transform::ApplyVectorToLLVMConversionPatternsOp::verifyTypeConverter(
   return success();
 }
 
+void transform::ApplyVectorLinearizeConversionPatternsOp::populatePatterns(
+    TypeConverter &typeConverter, RewritePatternSet &patterns) {
+  ConversionTarget target(*getContext());
+  vector::populateVectorLinearizeBasePatterns(typeConverter, target, patterns);
+  if (getShuffleLikeOps())
+    vector::populateVectorLinearizeShuffleLikeOpsPatterns(typeConverter, target,
+                                                          patterns);
+}
+
+void transform::ApplyVectorLinearizeConversionPatternsOp::
+    populateConversionTargetRules(const TypeConverter &typeConverter,
+                                  ConversionTarget &conversionTarget) {
+  // The legality rules check types with a linearizing converter of their own.
+  TypeConverter linearizer;
+  vector::populateForVectorLinearize(linearizer, conversionTarget);
+}
+
+std::unique_ptr<TypeConverter>
+transform::ApplyVectorLinearizeConversionPatternsOp::getTypeConverter() {
+  auto typeConverter = std::make_unique<TypeConverter>();
+  ConversionTarget target(*getContext());
+  vector::populateForVectorLinearize(*typeConverter, target);
+  return typeConverter;
+}
+
 //===----------------------------------------------------------------------===//
 // Apply...PatternsOp
 //===----------------------------------------------------------------------===//

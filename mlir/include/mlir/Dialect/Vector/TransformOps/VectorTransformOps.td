@@ -37,6 +37,26 @@ def ApplyVectorToLLVMConversionPatternsOp : Op<Transform_Dialect,
   let assemblyFormat = "oilist(`reassociate_fp_reductions` `=` $reassociate_fp_reductions | `force_32bit_vector_indices` `=` $force_32bit_vector_indices | `use_vector_alignment` `=` $use_vector_alignment) attr-dict";
 }
 
+def ApplyVectorLinearizeConversionPatternsOp : Op<Transform_Dialect,
+    "apply_conversion_patterns.vector.linearize",
+    [DeclareOpInterfaceMethods<ConversionPatternDescriptorOpInterface,
+                               ["populateConversionTargetRules",
+                                "getTypeConverter"]>]> {
+  let description = [{
+    Collects patterns that linearize n-D (n >= 2) vector operations into 1-D
+    ones, with `vector.shape_cast`s between the two forms. The patterns bring
+    their own type converter and conversion target rules: only vector dialect,
+    ConstantLike and Vectorizable ops with n-D vector types are illegal.
+
+    - `shuffle_like_ops`: also linearizes ops such as `vector.extract` and
+      `vector.insert_strided_slice` into `vector.shuffle`s.
+  }];
+
+  let arguments = (ins
+      DefaultValuedAttr<BoolAttr, "false">:$shuffle_like_ops);
+  let assemblyFormat = "oilist(`shuffle_like_ops` `=` $shuffle_like_ops) attr-dict";
+}
+
 
 def ApplyCastAwayVectorLeadingOneDimPatternsOp : Op<Transform_Dialect,
     "apply_patterns.vector.cast_away_vector_leading_one_dim",
