@@ -412,3 +412,472 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+// Dimension scaling of parallel dims - scales are applied to contraction
+// results accumulated exactly in i32.
+
+func.func @scaled_contract_dim_scaling(
+    %A: tensor<8x16xi8>, %sA: tensor<8xf8E8M0FNU>,
+    %B: tensor<4x16xi8>, %sB: tensor<4xf8E8M0FNU>,
+    %C: tensor<8x4xf32>) -> tensor<8x4xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x16xi8>, tensor<8xf8E8M0FNU>, tensor<4x16xi8>, tensor<4xf8E8M0FNU>)
+      outs(%C : tensor<8x4xf32>) -> tensor<8x4xf32>
+  return %D : tensor<8x4xf32>
+}
+
+// CHECK-DAG: #[[$CONTRACT_A:.+]] = affine_map<(d0, d1, d2) -> (d0, d2)>
+// CHECK-DAG: #[[$CONTRACT_B:.+]] = affine_map<(d0, d1, d2) -> (d1, d2)>
+// CHECK-DAG: #[[$CONTRACT_C:.+]] = affine_map<(d0, d1, d2) -> (d0, d1)>
+// CHECK-DAG: #[[$SCALE_OUT:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK-DAG: #[[$SCALE_A:.+]] = affine_map<(d0, d1) -> (d0)>
+// CHECK-DAG: #[[$SCALE_B:.+]] = affine_map<(d0, d1) -> (d1)>
+
+// CHECK-LABEL: func @scaled_contract_dim_scaling
+//  CHECK-SAME:   %[[A:[a-zA-Z0-9]+]]: tensor<8x16xi8>
+//  CHECK-SAME:   %[[SA:[a-zA-Z0-9]+]]: tensor<8xf8E8M0FNU>
+//  CHECK-SAME:   %[[B:[a-zA-Z0-9]+]]: tensor<4x16xi8>
+//  CHECK-SAME:   %[[SB:[a-zA-Z0-9]+]]: tensor<4xf8E8M0FNU>
+//  CHECK-SAME:   %[[C:[a-zA-Z0-9]+]]: tensor<8x4xf32>
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<8x4xi32>
+//       CHECK:   %[[ZERO:.+]] = arith.constant 0 : i32
+//       CHECK:   %[[FILL:.+]] = linalg.fill ins(%[[ZERO]] : i32) outs(%[[EMPTY]] : tensor<8x4xi32>) -> tensor<8x4xi32>
+//       CHECK:   %[[CONTRACT:.+]] = linalg.contract
+//  CHECK-SAME:     indexing_maps = [#[[$CONTRACT_A]], #[[$CONTRACT_B]], #[[$CONTRACT_C]]]
+//  CHECK-SAME:     ins(%[[A]], %[[B]] : tensor<8x16xi8>, tensor<4x16xi8>)
+//  CHECK-SAME:     outs(%[[FILL]] : tensor<8x4xi32>)
+//       CHECK:   %[[SCALED:.+]] = linalg.generic
+//  CHECK-SAME:     indexing_maps = [#[[$SCALE_OUT]], #[[$SCALE_A]], #[[$SCALE_B]], #[[$SCALE_OUT]]]
+//  CHECK-SAME:     iterator_types = ["parallel", "parallel"]
+//  CHECK-SAME:     ins(%[[CONTRACT]], %[[SA]], %[[SB]] : tensor<8x4xi32>, tensor<8xf8E8M0FNU>, tensor<4xf8E8M0FNU>)
+//  CHECK-SAME:     outs(%[[C]] : tensor<8x4xf32>)
+//       CHECK:   ^bb0(%[[IN:.+]]: i32, %[[IN_SA:.+]]: f8E8M0FNU, %[[IN_SB:.+]]: f8E8M0FNU, %[[OUT:.+]]: f32):
+//       CHECK:     %[[IN_FP:.+]] = arith.sitofp %[[IN]] : i32 to f32
+//       CHECK:     %[[SA_EXT:.+]] = arith.extf %[[IN_SA]] : f8E8M0FNU to f32
+//       CHECK:     %[[MUL_SA:.+]] = arith.mulf %[[IN_FP]], %[[SA_EXT]] : f32
+//       CHECK:     %[[SB_EXT:.+]] = arith.extf %[[IN_SB]] : f8E8M0FNU to f32
+//       CHECK:     %[[MUL_SB:.+]] = arith.mulf %[[MUL_SA]], %[[SB_EXT]] : f32
+//       CHECK:     %[[ACC:.+]] = arith.addf %[[OUT]], %[[MUL_SB]] : f32
+//       CHECK:     linalg.yield %[[ACC]] : f32
+//       CHECK:   return %[[SCALED]] : tensor<8x4xf32>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.scaled_contract"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.structured.decompose_interface %0 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// MXFP4 block scaling of the reduction dim - the reduction dim is split into
+// blocks; the contraction reduces within blocks and the scaled block results
+// are reduced by the epilogue.
+
+func.func @scaled_contract_mxfp4(
+    %A: tensor<8x64xf4E2M1FN>, %sA: tensor<8x2xf8E8M0FNU>,
+    %B: tensor<4x64xf4E2M1FN>, %sB: tensor<4x2xf8E8M0FNU>,
+    %C: tensor<8x4xf32>) -> tensor<8x4xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x64xf4E2M1FN>, tensor<8x2xf8E8M0FNU>, tensor<4x64xf4E2M1FN>, tensor<4x2xf8E8M0FNU>)
+      outs(%C : tensor<8x4xf32>) -> tensor<8x4xf32>
+  return %D : tensor<8x4xf32>
+}
+
+// CHECK-DAG: #[[$CONTRACT_A:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d2, d3)>
+// CHECK-DAG: #[[$CONTRACT_B:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d2, d3)>
+// CHECK-DAG: #[[$CONTRACT_T:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+// CHECK-DAG: #[[$SCALE_T:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK-DAG: #[[$SCALE_A:.+]] = affine_map<(d0, d1, d2) -> (d0, d2)>
+// CHECK-DAG: #[[$SCALE_B:.+]] = affine_map<(d0, d1, d2) -> (d1, d2)>
+// CHECK-DAG: #[[$SCALE_OUT:.+]] = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+// CHECK-LABEL: func @scaled_contract_mxfp4
+//  CHECK-SAME:   %[[A:[a-zA-Z0-9]+]]: tensor<8x64xf4E2M1FN>
+//  CHECK-SAME:   %[[SA:[a-zA-Z0-9]+]]: tensor<8x2xf8E8M0FNU>
+//  CHECK-SAME:   %[[B:[a-zA-Z0-9]+]]: tensor<4x64xf4E2M1FN>
+//  CHECK-SAME:   %[[SB:[a-zA-Z0-9]+]]: tensor<4x2xf8E8M0FNU>
+//  CHECK-SAME:   %[[C:[a-zA-Z0-9]+]]: tensor<8x4xf32>
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<8x4x2xf32>
+//       CHECK:   %[[FILL:.+]] = linalg.fill {{.*}} outs(%[[EMPTY]] : tensor<8x4x2xf32>)
+//       CHECK:   %[[EXP_A:.+]] = tensor.expand_shape %[[A]] {{\[}}[0], [1, 2]] output_shape [8, 2, 32]
+//       CHECK:   %[[EXP_B:.+]] = tensor.expand_shape %[[B]] {{\[}}[0], [1, 2]] output_shape [4, 2, 32]
+//       CHECK:   %[[CONTRACT:.+]] = linalg.contract
+//  CHECK-SAME:     indexing_maps = [#[[$CONTRACT_A]], #[[$CONTRACT_B]], #[[$CONTRACT_T]]]
+//  CHECK-SAME:     ins(%[[EXP_A]], %[[EXP_B]] : tensor<8x2x32xf4E2M1FN>, tensor<4x2x32xf4E2M1FN>)
+//  CHECK-SAME:     outs(%[[FILL]] : tensor<8x4x2xf32>)
+//       CHECK:   %[[SCALED:.+]] = linalg.generic
+//  CHECK-SAME:     indexing_maps = [#[[$SCALE_T]], #[[$SCALE_A]], #[[$SCALE_B]], #[[$SCALE_OUT]]]
+//  CHECK-SAME:     iterator_types = ["parallel", "parallel", "reduction"]
+//  CHECK-SAME:     ins(%[[CONTRACT]], %[[SA]], %[[SB]] : tensor<8x4x2xf32>, tensor<8x2xf8E8M0FNU>, tensor<4x2xf8E8M0FNU>)
+//  CHECK-SAME:     outs(%[[C]] : tensor<8x4xf32>)
+//       CHECK:   ^bb0(%[[IN:.+]]: f32, %[[IN_SA:.+]]: f8E8M0FNU, %[[IN_SB:.+]]: f8E8M0FNU, %[[OUT:.+]]: f32):
+//       CHECK:     %[[SA_EXT:.+]] = arith.extf %[[IN_SA]] : f8E8M0FNU to f32
+//       CHECK:     %[[MUL_SA:.+]] = arith.mulf %[[IN]], %[[SA_EXT]] : f32
+//       CHECK:     %[[SB_EXT:.+]] = arith.extf %[[IN_SB]] : f8E8M0FNU to f32
+//       CHECK:     %[[MUL_SB:.+]] = arith.mulf %[[MUL_SA]], %[[SB_EXT]] : f32
+//       CHECK:     %[[ACC:.+]] = arith.addf %[[OUT]], %[[MUL_SB]] : f32
+//       CHECK:     linalg.yield %[[ACC]] : f32
+//       CHECK:   return %[[SCALED]] : tensor<8x4xf32>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.scaled_contract"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.structured.decompose_interface %0 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Nested block sizes on the reduction dim and block scaling of a parallel dim.
+// The dims are split into multiple block levels, scales and output are
+// reshaped accordingly. Mixed integer and floating-point inputs accumulate in
+// f32. Non-f8E8M0FNU scale of floating-point data is rounded to f8E8M0FNU
+// like in `arith.scaling_extf`.
+
+func.func @scaled_contract_nested_blocks(
+    %A: tensor<8x128xi8>, %sA: tensor<8x4xf8E8M0FNU>,
+    %B: tensor<4x128xf8E4M3FN>, %sB: tensor<2x2xf16>,
+    %C: tensor<8x4xf16>) -> tensor<8x4xf16> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n floordiv 2, k floordiv 64)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x128xi8>, tensor<8x4xf8E8M0FNU>, tensor<4x128xf8E4M3FN>, tensor<2x2xf16>)
+      outs(%C : tensor<8x4xf16>) -> tensor<8x4xf16>
+  return %D : tensor<8x4xf16>
+}
+
+// CHECK-DAG: #[[$CONTRACT_A:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d3, d4, d5)>
+// CHECK-DAG: #[[$CONTRACT_B:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d3, d4, d5)>
+// CHECK-DAG: #[[$CONTRACT_T:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3, d4)>
+// CHECK-DAG: #[[$SCALE_T:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>
+// CHECK-DAG: #[[$SCALE_A:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>
+// CHECK-DAG: #[[$SCALE_B:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d1, d3)>
+// CHECK-DAG: #[[$SCALE_OUT:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>
+
+// CHECK-LABEL: func @scaled_contract_nested_blocks
+//  CHECK-SAME:   %[[A:[a-zA-Z0-9]+]]: tensor<8x128xi8>
+//  CHECK-SAME:   %[[SA:[a-zA-Z0-9]+]]: tensor<8x4xf8E8M0FNU>
+//  CHECK-SAME:   %[[B:[a-zA-Z0-9]+]]: tensor<4x128xf8E4M3FN>
+//  CHECK-SAME:   %[[SB:[a-zA-Z0-9]+]]: tensor<2x2xf16>
+//  CHECK-SAME:   %[[C:[a-zA-Z0-9]+]]: tensor<8x4xf16>
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<8x2x2x2x2xf32>
+//       CHECK:   %[[FILL:.+]] = linalg.fill {{.*}} outs(%[[EMPTY]] : tensor<8x2x2x2x2xf32>)
+//       CHECK:   %[[EXP_A:.+]] = tensor.expand_shape %[[A]] {{\[}}[0], [1, 2, 3]] output_shape [8, 2, 2, 32]
+//       CHECK:   %[[EXP_B:.+]] = tensor.expand_shape %[[B]] {{\[}}[0, 1], [2, 3, 4]] output_shape [2, 2, 2, 2, 32]
+//       CHECK:   %[[CONTRACT:.+]] = linalg.contract
+//  CHECK-SAME:     indexing_maps = [#[[$CONTRACT_A]], #[[$CONTRACT_B]], #[[$CONTRACT_T]]]
+//  CHECK-SAME:     ins(%[[EXP_A]], %[[EXP_B]] : tensor<8x2x2x32xi8>, tensor<2x2x2x2x32xf8E4M3FN>)
+//  CHECK-SAME:     outs(%[[FILL]] : tensor<8x2x2x2x2xf32>)
+//       CHECK:   %[[EXP_C:.+]] = tensor.expand_shape %[[C]] {{\[}}[0], [1, 2]] output_shape [8, 2, 2]
+//       CHECK:   %[[EXP_SA:.+]] = tensor.expand_shape %[[SA]] {{\[}}[0], [1, 2]] output_shape [8, 2, 2]
+//       CHECK:   %[[SCALED:.+]] = linalg.generic
+//  CHECK-SAME:     indexing_maps = [#[[$SCALE_T]], #[[$SCALE_A]], #[[$SCALE_B]], #[[$SCALE_OUT]]]
+//  CHECK-SAME:     iterator_types = ["parallel", "parallel", "parallel", "reduction", "reduction"]
+//  CHECK-SAME:     ins(%[[CONTRACT]], %[[EXP_SA]], %[[SB]] : tensor<8x2x2x2x2xf32>, tensor<8x2x2xf8E8M0FNU>, tensor<2x2xf16>)
+//  CHECK-SAME:     outs(%[[EXP_C]] : tensor<8x2x2xf16>)
+//       CHECK:   ^bb0(%[[IN:.+]]: f32, %[[IN_SA:.+]]: f8E8M0FNU, %[[IN_SB:.+]]: f16, %[[OUT:.+]]: f16):
+//       CHECK:     %[[SA_EXT:.+]] = arith.extf %[[IN_SA]] : f8E8M0FNU to f32
+//       CHECK:     %[[MUL_SA:.+]] = arith.mulf %[[IN]], %[[SA_EXT]] : f32
+//       CHECK:     %[[SB_E8M0:.+]] = arith.truncf %[[IN_SB]] : f16 to f8E8M0FNU
+//       CHECK:     %[[SB_EXT:.+]] = arith.extf %[[SB_E8M0]] : f8E8M0FNU to f32
+//       CHECK:     %[[MUL_SB:.+]] = arith.mulf %[[MUL_SA]], %[[SB_EXT]] : f32
+//       CHECK:     %[[OUT_EXT:.+]] = arith.extf %[[OUT]] : f16 to f32
+//       CHECK:     %[[ACC:.+]] = arith.addf %[[OUT_EXT]], %[[MUL_SB]] : f32
+//       CHECK:     %[[RES:.+]] = arith.truncf %[[ACC]] : f32 to f16
+//       CHECK:     linalg.yield %[[RES]] : f16
+//       CHECK:   %[[COLLAPSED:.+]] = tensor.collapse_shape %[[SCALED]] {{\[}}[0], [1, 2]] : tensor<8x2x2xf16> into tensor<8x4xf16>
+//       CHECK:   return %[[COLLAPSED]] : tensor<8x4xf16>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.scaled_contract"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.structured.decompose_interface %0 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Block scale spanning the whole reduction dim, e.g., after tiling, is
+// broadcast. Tensor scaling with a scalar scale and transposed output.
+
+func.func @scaled_contract_uniform_block(
+    %A: tensor<8x32xf8E5M2>, %sA: tensor<8x1xf8E8M0FNU>,
+    %B: tensor<32x4xf8E5M2>, %sB: f8E8M0FNU,
+    %C: tensor<4x8xf32>) -> tensor<4x8xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (k, n)>,
+                       affine_map<(m, n, k) -> ()>,
+                       affine_map<(m, n, k) -> (n, m)>]
+      ins(%A, %sA, %B, %sB : tensor<8x32xf8E5M2>, tensor<8x1xf8E8M0FNU>, tensor<32x4xf8E5M2>, f8E8M0FNU)
+      outs(%C : tensor<4x8xf32>) -> tensor<4x8xf32>
+  return %D : tensor<4x8xf32>
+}
+
+// CHECK-DAG: #[[$CONTRACT_A:.+]] = affine_map<(d0, d1, d2) -> (d0, d2)>
+// CHECK-DAG: #[[$CONTRACT_B:.+]] = affine_map<(d0, d1, d2) -> (d2, d1)>
+// CHECK-DAG: #[[$CONTRACT_T:.+]] = affine_map<(d0, d1, d2) -> (d1, d0)>
+// CHECK-DAG: #[[$SCALE_OUT:.+]] = affine_map<(d0, d1) -> (d1, d0)>
+// CHECK-DAG: #[[$SCALE_A:.+]] = affine_map<(d0, d1) -> (d0, 0)>
+// CHECK-DAG: #[[$SCALE_B:.+]] = affine_map<(d0, d1) -> ()>
+
+// CHECK-LABEL: func @scaled_contract_uniform_block
+//  CHECK-SAME:   %[[A:[a-zA-Z0-9]+]]: tensor<8x32xf8E5M2>
+//  CHECK-SAME:   %[[SA:[a-zA-Z0-9]+]]: tensor<8x1xf8E8M0FNU>
+//  CHECK-SAME:   %[[B:[a-zA-Z0-9]+]]: tensor<32x4xf8E5M2>
+//  CHECK-SAME:   %[[SB:[a-zA-Z0-9]+]]: f8E8M0FNU
+//  CHECK-SAME:   %[[C:[a-zA-Z0-9]+]]: tensor<4x8xf32>
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<4x8xf32>
+//       CHECK:   %[[FILL:.+]] = linalg.fill {{.*}} outs(%[[EMPTY]] : tensor<4x8xf32>)
+//       CHECK:   %[[CONTRACT:.+]] = linalg.contract
+//  CHECK-SAME:     indexing_maps = [#[[$CONTRACT_A]], #[[$CONTRACT_B]], #[[$CONTRACT_T]]]
+//  CHECK-SAME:     ins(%[[A]], %[[B]] : tensor<8x32xf8E5M2>, tensor<32x4xf8E5M2>)
+//  CHECK-SAME:     outs(%[[FILL]] : tensor<4x8xf32>)
+//       CHECK:   %[[SCALED:.+]] = linalg.generic
+//  CHECK-SAME:     indexing_maps = [#[[$SCALE_OUT]], #[[$SCALE_A]], #[[$SCALE_B]], #[[$SCALE_OUT]]]
+//  CHECK-SAME:     iterator_types = ["parallel", "parallel"]
+//  CHECK-SAME:     ins(%[[CONTRACT]], %[[SA]], %[[SB]] : tensor<4x8xf32>, tensor<8x1xf8E8M0FNU>, f8E8M0FNU)
+//  CHECK-SAME:     outs(%[[C]] : tensor<4x8xf32>)
+//       CHECK:   return %[[SCALED]] : tensor<4x8xf32>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.scaled_contract"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.structured.decompose_interface %0 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Block scaling of a dynamic parallel dim is applied by the epilogue as is.
+// Accumulation and scaling of a wide output are performed in output precision.
+
+func.func @scaled_contract_dynamic_parallel_block(
+    %A: tensor<?x64xi8>, %sA: tensor<?x2xf8E8M0FNU>,
+    %B: tensor<4x64xi8>, %sB: tensor<4x2xf8E8M0FNU>,
+    %C: tensor<?x4xf64>) -> tensor<?x4xf64> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m floordiv 16, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<?x64xi8>, tensor<?x2xf8E8M0FNU>, tensor<4x64xi8>, tensor<4x2xf8E8M0FNU>)
+      outs(%C : tensor<?x4xf64>) -> tensor<?x4xf64>
+  return %D : tensor<?x4xf64>
+}
+
+// CHECK-DAG: #[[$SCALE_A:.+]] = affine_map<(d0, d1, d2) -> (d0 floordiv 16, d2)>
+
+// CHECK-LABEL: func @scaled_contract_dynamic_parallel_block
+//  CHECK-SAME:   %[[A:[a-zA-Z0-9]+]]: tensor<?x64xi8>
+//  CHECK-SAME:   %[[SA:[a-zA-Z0-9]+]]: tensor<?x2xf8E8M0FNU>
+//       CHECK:   %[[DIM:.+]] = tensor.dim %[[A]], %{{.+}} : tensor<?x64xi8>
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty(%[[DIM]]) : tensor<?x4x2xi32>
+//       CHECK:   %[[CONTRACT:.+]] = linalg.contract
+//  CHECK-SAME:     ins({{.*}} : tensor<?x2x32xi8>, tensor<4x2x32xi8>)
+//  CHECK-SAME:     -> tensor<?x4x2xi32>
+//       CHECK:   linalg.generic
+//  CHECK-SAME:     indexing_maps = [#{{.+}}, #[[$SCALE_A]], #{{.+}}, #{{.+}}]
+//  CHECK-SAME:     ins(%[[CONTRACT]], %[[SA]], %{{.+}} : tensor<?x4x2xi32>, tensor<?x2xf8E8M0FNU>, tensor<4x2xf8E8M0FNU>)
+//       CHECK:     arith.sitofp %{{.+}} : i32 to f64
+//       CHECK:     arith.extf %{{.+}} : f8E8M0FNU to f64
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.scaled_contract"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.structured.decompose_interface %0 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Tiling of the block scaled reduction dim with tile size being a multiple of
+// the block size followed by decomposition of the tiled op.
+
+func.func @scaled_contract_tiled(
+    %A: tensor<16x256xf8E4M3FN>, %sA: tensor<16x8xf8E8M0FNU>,
+    %B: tensor<16x256xf8E4M3FN>, %sB: tensor<16x8xf8E8M0FNU>,
+    %C: tensor<16x16xf32>) -> tensor<16x16xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<16x256xf8E4M3FN>, tensor<16x8xf8E8M0FNU>, tensor<16x256xf8E4M3FN>, tensor<16x8xf8E8M0FNU>)
+      outs(%C : tensor<16x16xf32>) -> tensor<16x16xf32>
+  return %D : tensor<16x16xf32>
+}
+
+// CHECK-LABEL: func @scaled_contract_tiled
+//       CHECK:   scf.for {{.*}} iter_args(%[[ACC:.+]] = %{{.+}}) -> (tensor<16x16xf32>)
+//       CHECK:     %[[SLICE_A:.+]] = tensor.extract_slice {{.*}} to tensor<16x64xf8E4M3FN>
+//       CHECK:     %[[SLICE_SA:.+]] = tensor.extract_slice {{.*}} to tensor<16x2xf8E8M0FNU>
+//       CHECK:     %[[SLICE_B:.+]] = tensor.extract_slice {{.*}} to tensor<16x64xf8E4M3FN>
+//       CHECK:     %[[SLICE_SB:.+]] = tensor.extract_slice {{.*}} to tensor<16x2xf8E8M0FNU>
+//       CHECK:     %[[SLICE_C:.+]] = tensor.extract_slice %[[ACC]]
+//       CHECK:     %[[EXP_A:.+]] = tensor.expand_shape %[[SLICE_A]] {{\[}}[0], [1, 2]] output_shape [16, 2, 32]
+//       CHECK:     %[[EXP_B:.+]] = tensor.expand_shape %[[SLICE_B]] {{\[}}[0], [1, 2]] output_shape [16, 2, 32]
+//       CHECK:     %[[CONTRACT:.+]] = linalg.contract
+//  CHECK-SAME:       ins(%[[EXP_A]], %[[EXP_B]] : tensor<16x2x32xf8E4M3FN>, tensor<16x2x32xf8E4M3FN>)
+//  CHECK-SAME:       -> tensor<16x16x2xf32>
+//       CHECK:     %[[SCALED:.+]] = linalg.generic
+//  CHECK-SAME:       iterator_types = ["parallel", "parallel", "reduction"]
+//  CHECK-SAME:       ins(%[[CONTRACT]], %[[SLICE_SA]], %[[SLICE_SB]] :
+//  CHECK-SAME:       outs(%[[SLICE_C]] : tensor<16x16xf32>)
+//       CHECK:     tensor.insert_slice %[[SCALED]] into %[[ACC]]
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.scaled_contract"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %tiled, %loop = transform.structured.tile_using_for %0 tile_sizes [0, 0, 64] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %1 = transform.structured.decompose_interface %tiled : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Unsupported decompositions fail gracefully without modifying the op.
+
+// Block scaling of a dynamic reduction dim.
+// CHECK-LABEL: func @scaled_contract_dynamic_reduction_block
+//  CHECK-NEXT:   linalg.scaled_contract
+func.func @scaled_contract_dynamic_reduction_block(
+    %A: tensor<8x?xf4E2M1FN>, %sA: tensor<8x?xf8E8M0FNU>,
+    %B: tensor<4x?xf4E2M1FN>, %sB: tensor<4x?xf8E8M0FNU>,
+    %C: tensor<8x4xf32>) -> tensor<8x4xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x?xf4E2M1FN>, tensor<8x?xf8E8M0FNU>, tensor<4x?xf4E2M1FN>, tensor<4x?xf8E8M0FNU>)
+      outs(%C : tensor<8x4xf32>) -> tensor<8x4xf32>
+  return %D : tensor<8x4xf32>
+}
+
+// Reduction dim size not divisible by the block size.
+// CHECK-LABEL: func @scaled_contract_partial_block
+//  CHECK-NEXT:   linalg.scaled_contract
+func.func @scaled_contract_partial_block(
+    %A: tensor<8x100xf4E2M1FN>, %sA: tensor<8x4xf8E8M0FNU>,
+    %B: tensor<4x100xf4E2M1FN>, %sB: tensor<4x4xf8E8M0FNU>,
+    %C: tensor<8x4xf32>) -> tensor<8x4xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x100xf4E2M1FN>, tensor<8x4xf8E8M0FNU>, tensor<4x100xf4E2M1FN>, tensor<4x4xf8E8M0FNU>)
+      outs(%C : tensor<8x4xf32>) -> tensor<8x4xf32>
+  return %D : tensor<8x4xf32>
+}
+
+// Block sizes of the reduction dim which do not divide each other.
+// CHECK-LABEL: func @scaled_contract_incompatible_blocks
+//  CHECK-NEXT:   linalg.scaled_contract
+func.func @scaled_contract_incompatible_blocks(
+    %A: tensor<8x96xf4E2M1FN>, %sA: tensor<8x3xf8E8M0FNU>,
+    %B: tensor<4x96xf4E2M1FN>, %sB: tensor<4x2xf8E8M0FNU>,
+    %C: tensor<8x4xf32>) -> tensor<8x4xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n, k floordiv 48)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x96xf4E2M1FN>, tensor<8x3xf8E8M0FNU>, tensor<4x96xf4E2M1FN>, tensor<4x2xf8E8M0FNU>)
+      outs(%C : tensor<8x4xf32>) -> tensor<8x4xf32>
+  return %D : tensor<8x4xf32>
+}
+
+// Scaling of every element along the reduction dim leaves nothing to contract.
+// CHECK-LABEL: func @scaled_contract_reduction_dim_scaling
+//  CHECK-NEXT:   linalg.scaled_contract
+func.func @scaled_contract_reduction_dim_scaling(
+    %A: tensor<8x16xi8>, %sA: tensor<16xf8E8M0FNU>,
+    %B: tensor<4x16xi8>, %sB: tensor<4xf8E8M0FNU>,
+    %C: tensor<8x4xf32>) -> tensor<8x4xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (k)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x16xi8>, tensor<16xf8E8M0FNU>, tensor<4x16xi8>, tensor<4xf8E8M0FNU>)
+      outs(%C : tensor<8x4xf32>) -> tensor<8x4xf32>
+  return %D : tensor<8x4xf32>
+}
+
+// Scale of floating-point data which cannot be rounded to f8E8M0FNU.
+// CHECK-LABEL: func @scaled_contract_unsupported_scale_type
+//  CHECK-NEXT:   linalg.scaled_contract
+func.func @scaled_contract_unsupported_scale_type(
+    %A: tensor<8x16xf8E4M3FN>, %sA: tensor<8xf8E5M2>,
+    %B: tensor<4x16xf8E4M3FN>, %sB: tensor<4xf8E8M0FNU>,
+    %C: tensor<8x4xf32>) -> tensor<8x4xf32> {
+  %D = linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : tensor<8x16xf8E4M3FN>, tensor<8xf8E5M2>, tensor<4x16xf8E4M3FN>, tensor<4xf8E8M0FNU>)
+      outs(%C : tensor<8x4xf32>) -> tensor<8x4xf32>
+  return %D : tensor<8x4xf32>
+}
+
+// Memref semantics.
+// CHECK-LABEL: func @scaled_contract_memref
+//  CHECK-NEXT:   linalg.scaled_contract
+func.func @scaled_contract_memref(
+    %A: memref<8x16xi8>, %sA: memref<8xf8E8M0FNU>,
+    %B: memref<4x16xi8>, %sB: memref<4xf8E8M0FNU>,
+    %C: memref<8x4xf32>) {
+  linalg.scaled_contract
+      indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                       affine_map<(m, n, k) -> (m)>,
+                       affine_map<(m, n, k) -> (n, k)>,
+                       affine_map<(m, n, k) -> (n)>,
+                       affine_map<(m, n, k) -> (m, n)>]
+      ins(%A, %sA, %B, %sB : memref<8x16xi8>, memref<8xf8E8M0FNU>, memref<4x16xi8>, memref<4xf8E8M0FNU>)
+      outs(%C : memref<8x4xf32>)
+  return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    transform.sequence %arg1 : !transform.any_op failures(suppress) {
+    ^bb0(%root: !transform.any_op):
+      %0 = transform.structured.match ops{["linalg.scaled_contract"]} in %root : (!transform.any_op) -> !transform.any_op
+      %1 = transform.structured.decompose_interface %0 : (!transform.any_op) -> !transform.any_op
+    }
+    transform.yield
+  }
+}
