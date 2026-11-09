@@ -1677,6 +1677,11 @@ SmallVector<StringRef> ScaledContractionOp::getTraitAttrNames() {
                                 getIteratorTypesAttrName()};
 }
 
+std::optional<SmallVector<int64_t, 4>>
+ScaledContractionOp::getIterationShapeToUnroll() {
+  return llvm::to_vector<4>(getStaticLoopRanges());
+}
+
 // Returns `true` if `index` is either within [0, maxIndex) or equal to
 // `poisonValue`.
 static bool isValidPositiveIndexOrPoison(int64_t index, int64_t poisonValue,

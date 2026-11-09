@@ -272,7 +272,8 @@ def Vector_ScaledContractionOp :
   Vector_Op<"scaled_contract", [
       IndexingMapOpInterface,
       Pure,
-      AllTypesMatch<["acc", "result"]>
+      AllTypesMatch<["acc", "result"]>,
+      DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getIterationShapeToUnroll"]>
     ]>,
     Arguments<(ins AnyVectorOfNonZeroRankNonI0Elem:$lhs,
                AnyFloatOrVectorOfNonZeroRankFloat:$lhs_scale,

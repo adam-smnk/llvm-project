@@ -407,6 +407,29 @@ def ApplyUnrollContractPatternsOp : Op<Transform_Dialect,
   }];
 }
 
+def ApplyUnrollScaledContractPatternsOp : Op<Transform_Dialect,
+    "apply_patterns.vector.unroll_scaled_contract",
+    [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let description = [{
+    Apply unroll patterns for `vector.scaled_contract` using the given shapes
+    as the target shape. If no `vector.scaled_contract` Op is present in the
+    target block, no unrolling takes place. Along dims with multiple scale
+    blocks, the target size must divide or be divisible by the block size,
+    otherwise no unrolling takes place.
+
+    This op assumes that the target `vector.scaled_contract` Op models a matrix
+    multiplication. Generalising this Op to other cases is left as a TODO.
+  }];
+
+  let arguments = (ins I64Attr:$m,
+                       I64Attr:$n,
+                       I64Attr:$k);
+
+  let assemblyFormat = [{
+    `[` $m `,` $n `,` $k `]` attr-dict
+  }];
+}
+
 def ApplyUnrollToElementsPatternsOp : Op<Transform_Dialect,
     "apply_patterns.vector.unroll_to_elements",
     [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {

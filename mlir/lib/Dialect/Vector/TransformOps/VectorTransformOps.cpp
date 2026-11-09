@@ -215,19 +215,17 @@ void transform::ApplyUnrollFromElementsPatternsOp::populatePatterns(
   vector::populateVectorFromElementsUnrollPatterns(patterns);
 }
 
-void transform::ApplyUnrollContractPatternsOp::populatePatterns(
-    RewritePatternSet &patterns) {
-  int64_t m = getM();
-  int64_t n = getN();
-  int64_t k = getK();
-
+/// Returns options unrolling matmul-like `OpTy` ops into `[m, n, k]` tiles.
+template <typename OpTy>
+static vector::UnrollVectorOptions getMatmulUnrollOptions(int64_t m, int64_t n,
+                                                          int64_t k) {
   auto nativeShapeFn =
       [m, n, k](Operation *op) -> std::optional<SmallVector<int64_t>> {
     return SmallVector<int64_t>({m, n, k});
   };
 
   auto constraint = [](Operation *op) {
-    auto contract = dyn_cast<vector::ContractionOp>(op);
+    auto contract = dyn_cast<OpTy>(op);
     if (!contract)
       return failure();
 
@@ -244,10 +242,23 @@ void transform::ApplyUnrollContractPatternsOp::populatePatterns(
     return success();
   };
 
+  return vector::UnrollVectorOptions()
+      .setNativeShapeFn(nativeShapeFn)
+      .setFilterConstraint(constraint);
+}
+
+void transform::ApplyUnrollContractPatternsOp::populatePatterns(
+    RewritePatternSet &patterns) {
   vector::populateVectorContractUnrollPatterns(
-      patterns, vector::UnrollVectorOptions()
-                    .setNativeShapeFn(nativeShapeFn)
-                    .setFilterConstraint(constraint));
+      patterns,
+      getMatmulUnrollOptions<vector::ContractionOp>(getM(), getN(), getK()));
+}
+
+void transform::ApplyUnrollScaledContractPatternsOp::populatePatterns(
+    RewritePatternSet &patterns) {
+  vector::populateVectorScaledContractUnrollPatterns(
+      patterns, getMatmulUnrollOptions<vector::ScaledContractionOp>(
+                    getM(), getN(), getK()));
 }
 
 void transform::ApplyUnrollToElementsPatternsOp::populatePatterns(

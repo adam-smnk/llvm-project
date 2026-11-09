@@ -355,6 +355,13 @@ void populateVectorContractUnrollPatterns(RewritePatternSet &patterns,
                                           const UnrollVectorOptions &options,
                                           PatternBenefit benefit = 1);
 
+/// Unrolls `vector.scaled_contract` ops into tiles of the native shape. Along
+/// dims with multiple scale blocks, the tile size must divide or be divisible
+/// by the block size.
+void populateVectorScaledContractUnrollPatterns(
+    RewritePatternSet &patterns, const UnrollVectorOptions &options,
+    PatternBenefit benefit = 1);
+
 /// Unrolls 2 or more dimensional `vector.to_elements` ops by unrolling the
 /// outermost dimension of the operand.
 void populateVectorToElementsUnrollPatterns(RewritePatternSet &patterns,

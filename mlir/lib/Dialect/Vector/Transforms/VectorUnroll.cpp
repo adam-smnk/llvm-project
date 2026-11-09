@@ -280,6 +280,77 @@ struct OffsetMapInfo {
   }
 };
 
+/// Extracts the slice of `operand` indexed by the projected permutation `map`
+/// for the tile of the iteration space at `offsets` with `tileShape`.
+static Value extractTileSlice(PatternRewriter &rewriter, Location loc,
+                              Value operand, AffineMap map,
+                              ArrayRef<int64_t> offsets,
+                              ArrayRef<int64_t> tileShape) {
+  SmallVector<int64_t> operandOffsets = applyPermutationMap(map, offsets);
+  SmallVector<int64_t> operandShape = applyPermutationMap(map, tileShape);
+  SmallVector<int64_t> operandStrides(operandOffsets.size(), 1);
+  return rewriter.createOrFold<vector::ExtractStridedSliceOp>(
+      loc, operand, operandOffsets, operandShape, operandStrides);
+}
+
+/// Unrolls a contraction-like `op` into tiles of its iteration space. The
+/// operands other than the accumulator are sliced by `sliceOperand`. Tiles
+/// along reduction dims accumulate into the same accumulator slice in turn.
+static LogicalResult unrollContractionLike(
+    PatternRewriter &rewriter, Operation *op, ArrayRef<int64_t> originalSize,
+    ArrayRef<int64_t> targetShape, ArrayRef<int64_t> loopOrder,
+    unsigned accIndex, AffineMap accMap,
+    function_ref<Value(unsigned, ArrayRef<int64_t>)> sliceOperand) {
+  auto dstVecType = dyn_cast<VectorType>(op->getResult(0).getType());
+  if (!dstVecType)
+    return rewriter.notifyMatchFailure(op, "expected vector result");
+
+  Location loc = op->getLoc();
+  llvm::MapVector<SmallVector<int64_t>, Value,
+                  llvm::DenseMap<SmallVector<int64_t>, unsigned, OffsetMapInfo>>
+      accCache;
+
+  for (SmallVector<int64_t> offsets :
+       StaticTileOffsetRange(originalSize, targetShape, loopOrder)) {
+    SmallVector<Value> slicesOperands(op->getNumOperands());
+    for (unsigned index = 0, e = op->getNumOperands(); index < e; ++index) {
+      if (index != accIndex)
+        slicesOperands[index] = sliceOperand(index, offsets);
+    }
+
+    SmallVector<int64_t> accOffsets =
+        applyPermutationMap(accMap, ArrayRef<int64_t>(offsets));
+    // If a version of the accumulator has already been computed, use it
+    // otherwise extract the first version from the original operand.
+    auto *accIt = accCache.find(accOffsets);
+    if (accIt != accCache.end())
+      slicesOperands[accIndex] = accIt->second;
+    else
+      slicesOperands[accIndex] =
+          extractTileSlice(rewriter, loc, op->getOperand(accIndex), accMap,
+                           offsets, targetShape);
+
+    SmallVector<int64_t> dstShape = applyPermutationMap(accMap, targetShape);
+    auto targetType = VectorType::get(dstShape, dstVecType.getElementType());
+    Operation *newOp = cloneOpWithOperandsAndTypes(rewriter, loc, op,
+                                                   slicesOperands, targetType);
+
+    // Save the accumulated value until all the loops are unrolled since
+    // reduction loops keep updating the accumulator.
+    accCache[accOffsets] = newOp->getResult(0);
+  }
+  // Assemble back the accumulator into a single vector.
+  Value result = arith::ConstantOp::create(rewriter, loc, dstVecType,
+                                           rewriter.getZeroAttr(dstVecType));
+  for (const auto &it : accCache) {
+    SmallVector<int64_t> dstStrides(it.first.size(), 1);
+    result = rewriter.createOrFold<vector::InsertStridedSliceOp>(
+        loc, it.second, result, it.first, dstStrides);
+  }
+  rewriter.replaceOp(op, result);
+  return success();
+}
+
 struct UnrollContractionPattern
     : public OpRewritePattern<vector::ContractionOp> {
   UnrollContractionPattern(MLIRContext *context,
@@ -293,81 +364,98 @@ struct UnrollContractionPattern
     auto targetShape = getTargetShape(options, contractOp);
     if (!targetShape)
       return failure();
-    auto dstVecType = cast<VectorType>(contractOp.getResultType());
     SmallVector<int64_t> originalSize = *contractOp.getIterationShapeToUnroll();
-
-    Location loc = contractOp.getLoc();
-    unsigned accIndex = vector::ContractionOp::getAccOperandIndex();
-    AffineMap dstAffineMap = contractOp.getIndexingMapsArray()[accIndex];
-    llvm::MapVector<
-        SmallVector<int64_t>, Value,
-        llvm::DenseMap<SmallVector<int64_t>, unsigned, OffsetMapInfo>>
-        accCache;
-
     SmallVector<int64_t> loopOrder = getUnrollOrder(
         contractOp.getIteratorTypes().size(), contractOp, options);
+    SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+    unsigned accIndex = vector::ContractionOp::getAccOperandIndex();
 
-    for (SmallVector<int64_t> offsets :
-         StaticTileOffsetRange(originalSize, *targetShape, loopOrder)) {
-      SmallVector<Value> slicesOperands(contractOp.getNumOperands());
+    return unrollContractionLike(
+        rewriter, contractOp, originalSize, *targetShape, loopOrder, accIndex,
+        maps[accIndex], [&](unsigned index, ArrayRef<int64_t> offsets) {
+          return extractTileSlice(rewriter, contractOp.getLoc(),
+                                  contractOp->getOperand(index), maps[index],
+                                  offsets, *targetShape);
+        });
+  }
 
-      // Helper to compute the new shape of each operand and extract the slice.
-      auto extractOperand = [&](unsigned index, Value operand,
-                                AffineMap permutationMap,
-                                ArrayRef<int64_t> operandOffets) {
-        SmallVector<int64_t> operandShape = applyPermutationMap(
-            permutationMap, ArrayRef<int64_t>(*targetShape));
-        SmallVector<int64_t> operandStrides(operandOffets.size(), 1);
-        slicesOperands[index] =
-            rewriter.createOrFold<vector::ExtractStridedSliceOp>(
-                loc, operand, operandOffets, operandShape, operandStrides);
-      };
+private:
+  vector::UnrollVectorOptions options;
+};
 
-      // Extract the new lhs operand.
-      AffineMap lhsPermutationMap = contractOp.getIndexingMapsArray()[0];
-      SmallVector<int64_t> lhsOffets =
-          applyPermutationMap(lhsPermutationMap, ArrayRef<int64_t>(offsets));
-      extractOperand(0, contractOp.getLhs(), lhsPermutationMap, lhsOffets);
+/// Unrolls vector.scaled_contract. Each tile uses the slices of the scales
+/// covering its data. Along block scaled dims, tile boundaries must coincide
+/// with block boundaries or tiles must evenly divide a block, such that each
+/// tile remains a valid scaled contraction.
+struct UnrollScaledContractionPattern
+    : public OpRewritePattern<vector::ScaledContractionOp> {
+  UnrollScaledContractionPattern(MLIRContext *context,
+                                 const vector::UnrollVectorOptions &options,
+                                 PatternBenefit benefit = 1)
+      : OpRewritePattern<vector::ScaledContractionOp>(context, benefit),
+        options(options) {}
 
-      // Extract the new rhs operand.
-      AffineMap rhsPermutationMap = contractOp.getIndexingMapsArray()[1];
-      SmallVector<int64_t> rhsOffets =
-          applyPermutationMap(rhsPermutationMap, ArrayRef<int64_t>(offsets));
-      extractOperand(1, contractOp.getRhs(), rhsPermutationMap, rhsOffets);
+  LogicalResult matchAndRewrite(vector::ScaledContractionOp op,
+                                PatternRewriter &rewriter) const override {
+    auto targetShape = getTargetShape(options, op);
+    if (!targetShape)
+      return failure();
+    SmallVector<int64_t> originalSize = *op.getIterationShapeToUnroll();
 
-      AffineMap accPermutationMap = contractOp.getIndexingMapsArray()[2];
-      SmallVector<int64_t> accOffets =
-          applyPermutationMap(accPermutationMap, ArrayRef<int64_t>(offsets));
-      // If a version of the accumulator has already been computed, use it
-      // otherwise extract the first version from the original operand.
-      auto *accIt = accCache.find(accOffets);
-      if (accIt != accCache.end())
-        slicesOperands[2] = accIt->second;
-      else
-        extractOperand(2, contractOp.getAcc(), accPermutationMap, accOffets);
-
-      SmallVector<int64_t> dstShape =
-          applyPermutationMap(dstAffineMap, ArrayRef<int64_t>(*targetShape));
-      auto targetType = VectorType::get(dstShape, dstVecType.getElementType());
-      Operation *newOp = cloneOpWithOperandsAndTypes(
-          rewriter, loc, contractOp, slicesOperands, targetType);
-
-      SmallVector<int64_t> dstOffets =
-          applyPermutationMap(dstAffineMap, ArrayRef<int64_t>(offsets));
-      // Save the accumulated value untill all the loops are unrolled since
-      // reduction loop keep updating the accumulator.
-      accCache[dstOffets] = newOp->getResult(0);
+    // A dim with a single block reuses one scale in every tile.
+    auto isSingleBlock = [&](unsigned dim, int64_t blockSize) {
+      return originalSize[dim] <= blockSize;
+    };
+    SmallVector<OpOperand *> scales = op.getScaleOperands();
+    for (OpOperand *scale : scales) {
+      for (AffineExpr expr : op.getMatchingIndexingMap(scale).getResults()) {
+        auto [dim, blockSize] =
+            *vector::ScaledContractionOp::getScaleDimAndBlockSize(expr);
+        int64_t tileSize = (*targetShape)[dim];
+        if (!isSingleBlock(dim, blockSize) && tileSize % blockSize != 0 &&
+            blockSize % tileSize != 0)
+          return rewriter.notifyMatchFailure(
+              op, "expected tile size to divide or be divisible by the block "
+                  "size");
+      }
     }
-    // Assemble back the accumulator into a single vector.
-    Value result = arith::ConstantOp::create(rewriter, loc, dstVecType,
-                                             rewriter.getZeroAttr(dstVecType));
-    for (const auto &it : accCache) {
-      SmallVector<int64_t> dstStrides(it.first.size(), 1);
-      result = rewriter.createOrFold<vector::InsertStridedSliceOp>(
-          loc, it.second, result, it.first, dstStrides);
-    }
-    rewriter.replaceOp(contractOp, result);
-    return success();
+
+    Location loc = op.getLoc();
+    SmallVector<int64_t> loopOrder =
+        getUnrollOrder(op.getIteratorTypes().size(), op, options);
+    SmallVector<AffineMap> maps = op.getIndexingMapsArray();
+    auto sliceOperand = [&](unsigned index,
+                            ArrayRef<int64_t> offsets) -> Value {
+      Value operand = op->getOperand(index);
+      if (!isa<VectorType>(operand.getType()))
+        return operand;
+      if (!llvm::is_contained(scales, &op->getOpOperand(index)))
+        return extractTileSlice(rewriter, loc, operand, maps[index], offsets,
+                                *targetShape);
+
+      SmallVector<int64_t> scaleOffsets;
+      SmallVector<int64_t> scaleShape;
+      for (AffineExpr expr : maps[index].getResults()) {
+        auto [dim, blockSize] =
+            *vector::ScaledContractionOp::getScaleDimAndBlockSize(expr);
+        if (blockSize > 1 && isSingleBlock(dim, blockSize)) {
+          scaleOffsets.push_back(0);
+          scaleShape.push_back(1);
+          continue;
+        }
+        scaleOffsets.push_back(offsets[dim] / blockSize);
+        scaleShape.push_back(
+            std::max<int64_t>((*targetShape)[dim] / blockSize, 1));
+      }
+      SmallVector<int64_t> strides(scaleOffsets.size(), 1);
+      return rewriter.createOrFold<vector::ExtractStridedSliceOp>(
+          loc, operand, scaleOffsets, scaleShape, strides);
+    };
+
+    unsigned accIndex = op.getAccMutable().getOperandNumber();
+    return unrollContractionLike(rewriter, op, originalSize, *targetShape,
+                                 loopOrder, accIndex, maps[accIndex],
+                                 sliceOperand);
   }
 
 private:
@@ -1751,16 +1839,17 @@ private:
 void mlir::vector::populateVectorUnrollPatterns(
     RewritePatternSet &patterns, const UnrollVectorOptions &options,
     PatternBenefit benefit) {
-  patterns.add<UnrollTransferReadPattern, UnrollTransferWritePattern,
-               UnrollContractionPattern, UnrollElementwisePattern,
-               UnrollReductionPattern, UnrollMultiReductionPattern,
-               UnrollTransposePattern, UnrollGatherPattern, UnrollLoadPattern,
-               UnrollStorePattern, UnrollBroadcastPattern, UnrollFromElements,
-               UnrollToElements, UnrollStepPattern, UnrollShapeCastPattern,
-               UnrollCreateMaskPattern, UnrollConstantMaskPattern,
-               UnrollBitCastPattern, UnrollInterleavePattern,
-               UnrollDeinterleavePattern>(patterns.getContext(), options,
-                                          benefit);
+  patterns
+      .add<UnrollTransferReadPattern, UnrollTransferWritePattern,
+           UnrollContractionPattern, UnrollScaledContractionPattern,
+           UnrollElementwisePattern, UnrollReductionPattern,
+           UnrollMultiReductionPattern, UnrollTransposePattern,
+           UnrollGatherPattern, UnrollLoadPattern, UnrollStorePattern,
+           UnrollBroadcastPattern, UnrollFromElements, UnrollToElements,
+           UnrollStepPattern, UnrollShapeCastPattern, UnrollCreateMaskPattern,
+           UnrollConstantMaskPattern, UnrollBitCastPattern,
+           UnrollInterleavePattern, UnrollDeinterleavePattern>(
+          patterns.getContext(), options, benefit);
 }
 
 void mlir::vector::populateVectorContractUnrollPatterns(
@@ -1768,6 +1857,13 @@ void mlir::vector::populateVectorContractUnrollPatterns(
     PatternBenefit benefit) {
   patterns.add<UnrollContractionPattern>(patterns.getContext(), options,
                                          benefit);
+}
+
+void mlir::vector::populateVectorScaledContractUnrollPatterns(
+    RewritePatternSet &patterns, const UnrollVectorOptions &options,
+    PatternBenefit benefit) {
+  patterns.add<UnrollScaledContractionPattern>(patterns.getContext(), options,
+                                               benefit);
 }
 
 void mlir::vector::populateVectorToElementsUnrollPatterns(
