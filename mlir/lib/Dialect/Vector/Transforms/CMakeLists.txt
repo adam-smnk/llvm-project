@@ -3,6 +3,7 @@ set(LLVM_OPTIONAL_SOURCES
   )
 
 add_mlir_dialect_library(MLIRVectorTransforms
+  DecomposeVectorScaledContract.cpp
   IndexedAccessOpInterfaceImpl.cpp
   LowerVectorBitCast.cpp
   LowerVectorBroadcast.cpp

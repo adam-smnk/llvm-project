@@ -110,6 +110,11 @@ void transform::ApplyVectorReductionToContractPatternsOp::populatePatterns(
   vector::populateVectorReductionToContractPatterns(patterns);
 }
 
+void transform::ApplyDecomposeScaledContractPatternsOp::populatePatterns(
+    RewritePatternSet &patterns) {
+  vector::populateVectorScaledContractDecompositionPatterns(patterns);
+}
+
 void transform::ApplyLowerCreateMaskPatternsOp::populatePatterns(
     RewritePatternSet &patterns) {
   vector::populateVectorMaskOpLoweringPatterns(patterns);

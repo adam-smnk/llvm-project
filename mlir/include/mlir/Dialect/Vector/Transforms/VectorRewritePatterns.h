@@ -245,6 +245,22 @@ void populateBreakDownVectorReductionPatterns(
 void populateVectorInsertExtractStridedSliceDecompositionPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit = 1);
 
+/// Populate `patterns` with the following patterns.
+///
+/// [DecomposeScaledContractByBlocks]
+/// =================================
+/// Decomposes vector.scaled_contract following the OCP Microscaling dot
+/// product definition into a contraction of the unscaled inputs within scale
+/// blocks, followed by scaling and reduction of the partial results. Preserves
+/// the low-precision contraction for further lowering when possible.
+///
+/// [DecomposeScaledContractByPrescaling]
+/// =====================================
+/// Decomposes vector.scaled_contract into scaling of the inputs followed by a
+/// contraction. Applies to all scaling schemes and serves as a fallback.
+void populateVectorScaledContractDecompositionPatterns(
+    RewritePatternSet &patterns, PatternBenefit benefit = 1);
+
 /// Populate `patterns` with a pattern to breaks down 1-D extract_strided_slice
 /// ops into a chain of Extract ops to extract each element from the source, and
 /// then a chain of Insert ops to insert to the target vector.

@@ -1086,6 +1086,622 @@ func.func @contraction_one_sided_reduction(%arg0: vector<4x3xf32>,
 
 // -----
 
+func.func @scaled_contract_num_operands(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x2xf8E8M0FNU>,
+                                        %B: vector<8x64xf8E4M3FN>, %C: vector<4x8xf32>) {
+  %0 = vector.scaled_contract {
+    indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                     affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                     affine_map<(m, n, k) -> (n, k)>,
+                     affine_map<(m, n, k) -> (m, n)>],
+    iterator_types = ["parallel", "parallel", "reduction"]}
+    // expected-error@+1 {{expected 5 operands}}
+    %A, %sA, %B, %C
+    : vector<4x64xf8E4M3FN>, vector<4x2xf8E8M0FNU>, vector<8x64xf8E4M3FN> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+func.func @scaled_contract_missing_iterator_types(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x2xf8E8M0FNU>,
+                                                  %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                                  %C: vector<4x8xf32>) {
+  // expected-error@+1 {{'vector.scaled_contract' expected "iterator_types" array attribute}}
+  %0 = vector.scaled_contract {} %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+func.func @scaled_contract_non_string_iterator_types(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x2xf8E8M0FNU>,
+                                                     %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                                     %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected "iterator_types" to be an array of strings}}
+  %0 = vector.scaled_contract {
+    indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                     affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                     affine_map<(m, n, k) -> (n, k)>,
+                     affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                     affine_map<(m, n, k) -> (m, n)>],
+    iterator_types = [0, 1, 2]}
+    %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+func.func @scaled_contract_non_map_indexing_maps(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x2xf8E8M0FNU>,
+                                                 %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                                 %C: vector<4x8xf32>) {
+  // expected-error@+1 {{attribute 'indexing_maps' failed to satisfy constraint: AffineMap array attribute}}
+  %0 = vector.scaled_contract {
+    indexing_maps = ["a", "b", "c", "d", "e"],
+    iterator_types = ["parallel", "parallel", "reduction"]}
+    %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n) -> (m)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_scale_map_num_dims(%A: vector<4x64xf8E4M3FN>, %sA: vector<4xf32>,
+                                              %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                              %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 1 to have 3 number of inputs}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4xf32>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+func.func @scaled_contract_num_indexing_maps(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x2xf8E8M0FNU>,
+                                             %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                             %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected an indexing map for each operand}}
+  %0 = vector.scaled_contract {
+    indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                     affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                     affine_map<(m, n, k) -> (n, k)>,
+                     affine_map<(m, n, k) -> (m, n)>],
+    iterator_types = ["parallel", "parallel", "reduction"]}
+    %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_integer_output(%A: vector<4x64xi8>, %sA: vector<4x2xf8E8M0FNU>,
+                                          %B: vector<8x64xi8>, %sB: vector<8x2xf8E8M0FNU>,
+                                          %C: vector<4x8xi32>) {
+  // expected-error@+1 {{operand #4 must be floating-point or vector of floating-point values}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xi8>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xi8>, vector<8x2xf8E8M0FNU> into vector<4x8xi32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_integer_scale(%A: vector<4x64xi8>, %sA: vector<4x2xi8>,
+                                         %B: vector<8x64xi8>, %sB: vector<8x2xf8E8M0FNU>,
+                                         %C: vector<4x8xf32>) {
+  // expected-error@+1 {{operand #1 must be floating-point or vector of floating-point values}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xi8>, vector<4x2xi8>,
+      vector<8x64xi8>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(k) -> (k)>,
+                   affine_map<(k) -> ()>,
+                   affine_map<(k) -> (k)>,
+                   affine_map<(k) -> ()>,
+                   affine_map<(k) -> ()>],
+  iterator_types = ["reduction"]
+}
+func.func @scaled_contract_0d_acc(%A: vector<32xf8E4M3FN>, %sA: f32, %B: vector<32xf8E4M3FN>,
+                                  %sB: f32, %C: vector<f32>) {
+  // expected-error@+1 {{operand #4 must be floating-point or vector of floating-point values}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<32xf8E4M3FN>, f32, vector<32xf8E4M3FN>, f32 into vector<f32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, k) -> (m, k)>,
+                   affine_map<(m, k) -> ()>,
+                   affine_map<(m, k) -> (m, k)>,
+                   affine_map<(m, k) -> ()>,
+                   affine_map<(m, k) -> (m)>],
+  iterator_types = ["parallel", "reduction"]
+}
+func.func @scaled_contract_index_elements(%A: vector<4x32xindex>, %sA: f32, %B: vector<4x32xindex>,
+                                          %sB: f32, %C: vector<4xf32>) {
+  // expected-error@+1 {{expected lhs and rhs element types to be integer or floating-point}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x32xindex>, f32, vector<4x32xindex>, f32 into vector<4xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_mixed_int_float(%A: vector<4x64xi8>, %sA: vector<4x2xf8E8M0FNU>,
+                                           %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                           %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected lhs and rhs element types to be the same or floating-point types with bitwidth of at most 8}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xi8>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_mixed_wide_floats(%A: vector<4x64xf16>, %sA: vector<4x2xf8E8M0FNU>,
+                                             %B: vector<8x64xbf16>, %sB: vector<8x2xf8E8M0FNU>,
+                                             %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected lhs and rhs element types to be the same or floating-point types with bitwidth of at most 8}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf16>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xbf16>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_input_wider_than_output(%A: vector<4x64xf32>, %sA: vector<4x2xf8E8M0FNU>,
+                                                   %B: vector<8x64xf32>, %sB: vector<8x2xf8E8M0FNU>,
+                                                   %C: vector<4x8xf16>) {
+  // expected-error@+1 {{expected lhs and rhs element type bitwidth to be no greater than result element type bitwidth}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf32>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xf32>, vector<8x2xf8E8M0FNU> into vector<4x8xf16>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_scale_wider_than_output(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x2xf32>,
+                                                   %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                                   %C: vector<4x8xf16>) {
+  // expected-error@+1 {{expected scale element type bitwidth to be no greater than result element type bitwidth}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x2xf32>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf16>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_scalable(%A: vector<[4]x64xf8E4M3FN>, %sA: vector<[4]xf8E8M0FNU>,
+                                    %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf8E8M0FNU>,
+                                    %C: vector<[4]x8xf32>) {
+  // expected-error@+1 {{scalable vectors are not supported}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<[4]x64xf8E4M3FN>, vector<[4]xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8xf8E8M0FNU> into vector<[4]x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_scale_rank(%A: vector<4x64xf8E4M3FN>, %sA: vector<2xf8E8M0FNU>,
+                                      %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                      %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 1 to have 1 number of outputs}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_scalar_scale_with_dims(%A: vector<4x64xf8E4M3FN>, %sA: f32,
+                                                  %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                                  %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 1 to have 0 number of outputs}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, f32,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k floordiv 2)>,
+                   affine_map<(m, n, k) -> (m)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_non_permutation_data_map(%A: vector<4x32xf8E4M3FN>, %sA: vector<4xf32>,
+                                                    %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                                    %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 0 to be a projected permutation of its inputs}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x32xf8E4M3FN>, vector<4xf32>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_parallel_dim_not_in_acc(%A: vector<4x64xf8E4M3FN>, %sA: vector<4xf32>,
+                                                   %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                                   %C: vector<4xf32>) {
+  // expected-error@+1 {{parallel dim at index 1 must appear in the accumulator}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4xf32>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n, k)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_reduction_dim_in_acc(%A: vector<4x64xf8E4M3FN>, %sA: vector<4xf32>,
+                                                %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                                %C: vector<4x8x64xf32>) {
+  // expected-error@+1 {{reduction dim at index 2 must not appear in the accumulator}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4xf32>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8x64xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_one_sided_reduction(%A: vector<4x64xf8E4M3FN>, %sA: vector<4xf32>,
+                                               %B: vector<8xf8E4M3FN>, %sB: vector<8xf32>,
+                                               %C: vector<4x8xf32>) {
+  // expected-error@+1 {{reduction dim at index 2 must appear in both LHS and RHS}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4xf32>,
+      vector<8xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n) -> (m)>,
+                   affine_map<(m, n) -> (m)>,
+                   affine_map<(m, n) -> (n)>,
+                   affine_map<(m, n) -> (n)>,
+                   affine_map<(m, n) -> (m, n)>],
+  iterator_types = ["parallel", "parallel"]
+}
+func.func @scaled_contract_no_contracting_dim(%A: vector<4xf8E4M3FN>, %sA: vector<4xf32>,
+                                              %B: vector<8xf8E4M3FN>, %sB: vector<8xf32>,
+                                              %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected at least one contracting dimension pair}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4xf8E4M3FN>, vector<4xf32>,
+      vector<8xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_acc_shape(%A: vector<4x64xf8E4M3FN>, %sA: vector<4xf32>,
+                                     %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                     %C: vector<4x4xf32>) {
+  // expected-error@+1 {{invalid accumulator/result vector shape, expected: 'vector<4x8xf32>'}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4xf32>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x4xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k mod 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_unsupported_scale_expr(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x32xf8E8M0FNU>,
+                                                  %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                                  %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 1 results to be a dim or a dim floordiv a positive constant}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x32xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, 0)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_constant_scale_expr(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x1xf8E8M0FNU>,
+                                               %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                               %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 1 results to be a dim or a dim floordiv a positive constant}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x1xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv -32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_negative_block_size(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x2xf8E8M0FNU>,
+                                               %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                               %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 1 results to be a dim or a dim floordiv a positive constant}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (k floordiv 32, k)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_duplicate_scale_dim(%A: vector<4x64xf8E4M3FN>, %sA: vector<2x64xf8E8M0FNU>,
+                                               %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                               %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 1 to use each dim at most once}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<2x64xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_scale_dim_not_in_input(%A: vector<4x64xf8E4M3FN>, %sA: vector<8xf32>,
+                                                  %B: vector<8x64xf8E4M3FN>, %sB: vector<8xf32>,
+                                                  %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected indexing map 1 to only use dims of indexing map 0}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<8xf32>,
+      vector<8x64xf8E4M3FN>, vector<8xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_dim_scale_size(%A: vector<4x64xf8E4M3FN>, %sA: vector<4xf32>,
+                                          %B: vector<8x64xf8E4M3FN>, %sB: vector<4xf32>,
+                                          %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected scale operand 3 dim 0 to have size 8, but got 4}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4xf32>,
+      vector<8x64xf8E4M3FN>, vector<4xf32> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_block_scale_size(%A: vector<4x64xf8E4M3FN>, %sA: vector<4x3xf8E8M0FNU>,
+                                            %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                            %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected scale operand 1 dim 1 of size 3 to scale full blocks of size 32 of input dim of size 64}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x64xf8E4M3FN>, vector<4x3xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_partial_block(%A: vector<4x48xf8E4M3FN>, %sA: vector<4x2xf8E8M0FNU>,
+                                         %B: vector<8x48xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                         %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected scale operand 1 dim 1 of size 2 to scale full blocks of size 32 of input dim of size 48}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x48xf8E4M3FN>, vector<4x2xf8E8M0FNU>,
+      vector<8x48xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
+#scaled_contraction_trait = {
+  indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                   affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (n, k)>,
+                   affine_map<(m, n, k) -> (n, k floordiv 32)>,
+                   affine_map<(m, n, k) -> (m, n)>],
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+func.func @scaled_contract_single_scale_exceeds_block(%A: vector<4x48xf8E4M3FN>, %sA: vector<4x1xf8E8M0FNU>,
+                                                      %B: vector<8x48xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+                                                      %C: vector<4x8xf32>) {
+  // expected-error@+1 {{expected scale operand 1 dim 1 of size 1 to scale full blocks of size 32 of input dim of size 48}}
+  %0 = vector.scaled_contract #scaled_contraction_trait %A, %sA, %B, %sB, %C
+    : vector<4x48xf8E4M3FN>, vector<4x1xf8E8M0FNU>,
+      vector<8x48xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<4x8xf32>
+  return
+}
+
+// -----
+
 func.func @create_mask_0d_no_operands() {
   %c1 = arith.constant 1 : index
   // expected-error@+1 {{must specify exactly one operand for 0-D create_mask}}

@@ -921,6 +921,79 @@ void vector::ContractionOp::build(OpBuilder &builder, OperationState &result,
         arith::FastMathFlagsAttr::get(builder.getContext(), fastMathFlags));
 }
 
+/// Converts the iterator types attribute parsed as an array of strings into an
+/// array of IteratorType attributes. This is needed, because tests still use
+/// the old format when 'iterator_types' attribute is represented as an array of
+/// strings.
+// TODO: Remove this conversion once tests are fixed.
+static ParseResult convertParsedIteratorTypes(OpAsmParser &parser, SMLoc loc,
+                                              OperationState &result,
+                                              StringAttr attrName) {
+  auto iteratorTypes =
+      dyn_cast_or_null<ArrayAttr>(result.attributes.get(attrName));
+  if (!iteratorTypes) {
+    return parser.emitError(loc)
+           << "expected " << attrName << " array attribute";
+  }
+
+  SmallVector<Attribute> iteratorTypeAttrs;
+
+  for (Attribute attr : iteratorTypes) {
+    auto s = dyn_cast<StringAttr>(attr);
+    if (!s)
+      return parser.emitError(loc)
+             << "expected " << attrName << " to be an array of strings";
+    auto maybeIteratorType = symbolizeIteratorType(s.getValue());
+    if (!maybeIteratorType.has_value())
+      return parser.emitError(loc)
+             << "unexpected iterator_type (" << s.getValue() << ")";
+
+    iteratorTypeAttrs.push_back(
+        IteratorTypeAttr::get(parser.getContext(), maybeIteratorType.value()));
+  }
+  result.attributes.set(attrName,
+                        parser.getBuilder().getArrayAttr(iteratorTypeAttrs));
+  return success();
+}
+
+/// Collects all attributes of `op` into `allAttrs` and returns the dictionary
+/// of its trait attributes `traitAttrNames` to be printed in front of operands.
+/// Iterator types are converted into the string representation, see
+/// `convertParsedIteratorTypes`. Trait attributes for which `isElided` returns
+/// true are not printed.
+static DictionaryAttr
+getPrintedTraitAttrs(Operation *op, ArrayRef<StringRef> traitAttrNames,
+                     StringAttr iteratorTypesAttrName, NamedAttrList &allAttrs,
+                     function_ref<bool(NamedAttribute)> isElided) {
+  MLIRContext *ctx = op->getContext();
+  llvm::StringSet<> traitAttrsSet;
+  traitAttrsSet.insert_range(traitAttrNames);
+  allAttrs.append(op->getRawDictionaryAttrs());
+  op->getName().walkInherentAttrs(op, [&](StringRef name, Attribute &attr) {
+    allAttrs.append(name, attr);
+  });
+  SmallVector<NamedAttribute, 8> attrs;
+  for (auto attr : allAttrs) {
+    if (attr.getName() == iteratorTypesAttrName) {
+      auto iteratorTypes =
+          llvm::cast<ArrayAttr>(attr.getValue())
+              .getAsValueRange<IteratorTypeAttr, IteratorType>();
+      SmallVector<Attribute> iteratorTypeNames =
+          llvm::map_to_vector(iteratorTypes, [&](IteratorType t) -> Attribute {
+            return StringAttr::get(ctx, stringifyIteratorType(t));
+          });
+
+      attrs.emplace_back(iteratorTypesAttrName,
+                         ArrayAttr::get(ctx, iteratorTypeNames));
+    } else if (traitAttrsSet.count(attr.getName().strref()) > 0) {
+      if (isElided && isElided(attr))
+        continue;
+      attrs.push_back(attr);
+    }
+  }
+  return DictionaryAttr::get(ctx, attrs);
+}
+
 ParseResult ContractionOp::parse(OpAsmParser &parser, OperationState &result) {
   OpAsmParser::UnresolvedOperand lhsInfo;
   OpAsmParser::UnresolvedOperand rhsInfo;
@@ -946,30 +1019,9 @@ ParseResult ContractionOp::parse(OpAsmParser &parser, OperationState &result) {
   result.attributes.append(dictAttr.getValue().begin(),
                            dictAttr.getValue().end());
 
-  // Convert array of string into an array of IteratyType enums. This is needed,
-  // because tests still use the old format when 'iterator_types' attribute is
-  // represented as an array of strings.
-  // TODO: Remove this conversion once tests are fixed.
-  auto iteratorTypes = dyn_cast_or_null<ArrayAttr>(
-      result.attributes.get(getIteratorTypesAttrName(result.name)));
-  if (!iteratorTypes) {
-    return parser.emitError(loc)
-           << "expected " << getIteratorTypesAttrName(result.name)
-           << " array attribute";
-  }
-
-  SmallVector<Attribute> iteratorTypeAttrs;
-
-  for (StringRef s : iteratorTypes.getAsValueRange<StringAttr>()) {
-    auto maybeIteratorType = symbolizeIteratorType(s);
-    if (!maybeIteratorType.has_value())
-      return parser.emitError(loc) << "unexpected iterator_type (" << s << ")";
-
-    iteratorTypeAttrs.push_back(
-        IteratorTypeAttr::get(parser.getContext(), maybeIteratorType.value()));
-  }
-  result.attributes.set(getIteratorTypesAttrName(result.name),
-                        parser.getBuilder().getArrayAttr(iteratorTypeAttrs));
+  if (failed(convertParsedIteratorTypes(parser, loc, result,
+                                        getIteratorTypesAttrName(result.name))))
+    return failure();
 
   if (!result.attributes.get(getKindAttrName(result.name))) {
     result.addAttribute(
@@ -996,40 +1048,15 @@ ParseResult ContractionOp::parse(OpAsmParser &parser, OperationState &result) {
 void ContractionOp::print(OpAsmPrinter &p) {
   // TODO: Unify printing code with linalg ops.
   auto attrNames = getTraitAttrNames();
-  llvm::StringSet<> traitAttrsSet;
-  traitAttrsSet.insert_range(attrNames);
-  NamedAttrList allAttrs(getOperation()->getRawDictionaryAttrs());
-  getOperation()->getName().walkInherentAttrs(
-      getOperation(),
-      [&](StringRef name, Attribute &attr) { allAttrs.append(name, attr); });
-  SmallVector<NamedAttribute, 8> attrs;
-  for (auto attr : allAttrs) {
-    if (attr.getName() == getIteratorTypesAttrName()) {
-      auto iteratorTypes =
-          llvm::cast<ArrayAttr>(attr.getValue())
-              .getAsValueRange<IteratorTypeAttr, IteratorType>();
-      // Convert IteratorType enums into the string representation. This is
-      // needed, because tests still use the old format when 'iterator_types'
-      // attribute is represented as an array of strings.
-      // TODO: Remove this conversion once tests are fixed.
-      SmallVector<Attribute> iteratorTypeNames =
-          llvm::map_to_vector(iteratorTypes, [&](IteratorType t) -> Attribute {
-            return StringAttr::get(getContext(), stringifyIteratorType(t));
-          });
-
-      attrs.emplace_back(getIteratorTypesAttrName(),
-                         ArrayAttr::get(getContext(), iteratorTypeNames));
-    } else if (traitAttrsSet.count(attr.getName().strref()) > 0) {
-      // Omit fastmath when it equals the default (none) to keep output clean.
-      if (attr.getName() == getFastmathAttrName() &&
-          llvm::cast<arith::FastMathFlagsAttr>(attr.getValue()).getValue() ==
-              arith::FastMathFlags::none)
-        continue;
-      attrs.push_back(attr);
-    }
-  }
-
-  auto dictAttr = DictionaryAttr::get(getContext(), attrs);
+  NamedAttrList allAttrs;
+  DictionaryAttr dictAttr = getPrintedTraitAttrs(
+      getOperation(), attrNames, getIteratorTypesAttrName(), allAttrs,
+      [&](NamedAttribute attr) {
+        // Omit fastmath when it equals the default (none) to keep output clean.
+        return attr.getName() == getFastmathAttrName() &&
+               llvm::cast<arith::FastMathFlagsAttr>(attr.getValue())
+                       .getValue() == arith::FastMathFlags::none;
+      });
   p << " " << dictAttr << " " << getLhs() << ", ";
   p << getRhs() << ", " << getAcc();
 
@@ -1050,8 +1077,8 @@ static bool verifyDimMap(VectorType lhsType, VectorType rhsType,
 }
 
 static LogicalResult verifyOutputShape(
-    ContractionOp op, VectorType lhsType, VectorType rhsType, Type accType,
-    Type resType,
+    Operation *op, AffineMap lhsMap, AffineMap rhsMap, AffineMap resMap,
+    VectorType lhsType, VectorType rhsType, Type accType, Type resType,
     const std::vector<std::pair<int64_t, int64_t>> &contractingDimMap,
     const std::vector<std::pair<int64_t, int64_t>> &batchDimMap) {
   DenseSet<int64_t> lhsContractingDimSet;
@@ -1082,22 +1109,20 @@ static LogicalResult verifyOutputShape(
   if (expectedResultDims.empty()) {
     // No batch or free dimension implies a scalar result.
     if (llvm::isa<VectorType>(resType) || llvm::isa<VectorType>(accType))
-      return op.emitOpError("invalid accumulator/result vector shape");
+      return op->emitOpError("invalid accumulator/result vector shape");
   } else {
     // At least one batch or free dimension implies a vector result.
     auto resVectorType = llvm::dyn_cast<VectorType>(resType);
     auto accVectorType = llvm::dyn_cast<VectorType>(accType);
     if (!resVectorType || !accVectorType)
-      return op.emitOpError("invalid accumulator/result vector shape");
+      return op->emitOpError("invalid accumulator/result vector shape");
 
     // Infer expected result vector type. Lhs + rhs map and lhs + rhs vector
     // types fully define the result vector type. This assumes the affine maps
     // are well-formed, which must have been verified already.
-    MLIRContext *ctx = op.getContext();
-    AffineMap lhsMap = op.getIndexingMapsArray()[0];
-    AffineMap rhsMap = op.getIndexingMapsArray()[1];
+    MLIRContext *ctx = op->getContext();
     if (getUnusedDimsBitVector({lhsMap, rhsMap}).any())
-      return op.emitOpError(
+      return op->emitOpError(
           "expected all dimensions to be either a LHS or a RHS dimension");
     SmallVector<AffineExpr, 4> extents(lhsMap.getNumInputs());
     for (auto pair :
@@ -1111,10 +1136,9 @@ static LogicalResult verifyOutputShape(
       }
     }
     if (!llvm::all_of(extents, [](AffineExpr e) { return e; }))
-      return op.emitOpError("expected all dimensions to get an extent as "
-                            "either a LHS or a RHS dimension");
+      return op->emitOpError("expected all dimensions to get an extent as "
+                             "either a LHS or a RHS dimension");
 
-    AffineMap resMap = op.getIndexingMapsArray()[2];
     auto extentsMap = AffineMap::get(/*dimCount=*/extents.size(),
                                      /*symbolCount=*/0, extents, ctx);
     // Compose the resMap with the extentsMap, which is a constant map.
@@ -1131,7 +1155,7 @@ static LogicalResult verifyOutputShape(
         VectorType::get(expectedShape, resVectorType.getElementType(),
                         resVectorType.getScalableDims());
     if (resVectorType != expected || accVectorType != expected)
-      return op.emitOpError(
+      return op->emitOpError(
                  "invalid accumulator/result vector shape, expected: ")
              << expected;
   }
@@ -1141,19 +1165,102 @@ static LogicalResult verifyOutputShape(
 // Find a one-sided reduction dim, i.e. a reduction dim that is present in only
 // one of the inputs.
 static std::optional<int64_t>
-getOneSidedReductionDim(vector::ContractionOp *contract) {
-  auto maps = contract->getIndexingMapsArray();
-  AffineMap lhsMap = maps[0];
-  AffineMap rhsMap = maps[1];
-
-  for (auto [dim, attr] : llvm::enumerate(contract->getIteratorTypes())) {
-    auto iteratorType = cast<vector::IteratorTypeAttr>(attr).getValue();
+getOneSidedReductionDim(AffineMap lhsMap, AffineMap rhsMap,
+                        ArrayRef<IteratorType> iteratorTypes) {
+  for (auto [dim, iteratorType] : llvm::enumerate(iteratorTypes)) {
     if (iteratorType == vector::IteratorType::reduction &&
         (!lhsMap.isFunctionOfDim(dim) || !rhsMap.isFunctionOfDim(dim)))
       return dim;
   }
 
   return std::nullopt;
+}
+
+static int64_t getResultIndex(AffineMap map, AffineExpr targetExpr) {
+  for (int64_t i = 0, e = map.getNumResults(); i < e; ++i)
+    if (targetExpr == map.getResult(i))
+      return i;
+  return -1;
+}
+
+// For every contraction `dim` for which:
+//  * the corresponding iteratory type matches `targetIteratorType`,
+// returns a pair: <lhsIdx, rhsIdx>, where:
+//  * {lhs|rhs}Idx is the index of `dim` in the (result of) indexing map for
+//    {lhs|rhs}.
+static std::vector<std::pair<int64_t, int64_t>>
+getDimPairForIterTy(AffineMap lhsMap, AffineMap rhsMap,
+                    ArrayRef<IteratorType> iteratorTypes,
+                    IteratorType targetIteratorType) {
+  std::vector<std::pair<int64_t, int64_t>> dimMap;
+  for (auto [dim, iteratorType] : llvm::enumerate(iteratorTypes)) {
+    if (iteratorType != targetIteratorType)
+      continue;
+    // Search lhs/rhs map results for 'targetExpr'.
+    auto targetExpr = getAffineDimExpr(dim, lhsMap.getContext());
+    int64_t lhsDim = getResultIndex(lhsMap, targetExpr);
+    int64_t rhsDim = getResultIndex(rhsMap, targetExpr);
+    if (lhsDim >= 0 && rhsDim >= 0)
+      dimMap.emplace_back(lhsDim, rhsDim);
+  }
+  return dimMap;
+}
+
+/// Verifies that the indexing map at `index` has `numIterators` inputs, no
+/// symbols, and that the number of map outputs equals the rank of the
+/// associated operand.
+static LogicalResult verifyIndexingMapRank(Operation *op, unsigned index,
+                                           AffineMap map, Type operandType,
+                                           unsigned numIterators) {
+  if (map.getNumSymbols() != 0)
+    return op->emitOpError("expected indexing map ")
+           << index << " to have no symbols";
+  auto vectorType = llvm::dyn_cast<VectorType>(operandType);
+  unsigned rank = vectorType ? vectorType.getShape().size() : 0;
+  // Verify that the map has the right number of inputs, outputs, and indices.
+  // This also correctly accounts for (..) -> () for rank-0 results.
+  if (map.getNumDims() != numIterators)
+    return op->emitOpError("expected indexing map ")
+           << index << " to have " << numIterators << " number of inputs";
+  if (map.getNumResults() != rank)
+    return op->emitOpError("expected indexing map ")
+           << index << " to have " << rank << " number of outputs";
+  return success();
+}
+
+/// Verifies the contraction of `lhs` and `rhs` into `acc` described by their
+/// indexing maps and the iterator types.
+static LogicalResult
+verifyContractionDims(Operation *op, AffineMap lhsMap, AffineMap rhsMap,
+                      AffineMap accMap, VectorType lhsType, VectorType rhsType,
+                      Type accType, Type resType,
+                      ArrayRef<IteratorType> iteratorTypes) {
+  // TODO: For better code re-use, unify this with linalg.contract.
+  auto dimIdx = getOneSidedReductionDim(lhsMap, rhsMap, iteratorTypes);
+  if (dimIdx.has_value())
+    return op->emitOpError("reduction dim at index ")
+           << dimIdx.value() << " must appear in both LHS and RHS";
+
+  auto contractingDimMap = getDimPairForIterTy(lhsMap, rhsMap, iteratorTypes,
+                                               IteratorType::reduction);
+  auto batchDimMap = getDimPairForIterTy(lhsMap, rhsMap, iteratorTypes,
+                                         IteratorType::parallel);
+
+  // Verify at least one contracting dimension pair was specified.
+  if (contractingDimMap.empty())
+    return op->emitOpError("expected at least one contracting dimension pair");
+
+  // Verify contracting dimension map was properly constructed.
+  if (!verifyDimMap(lhsType, rhsType, contractingDimMap))
+    return op->emitOpError("invalid contracting dimension map");
+
+  // Verify batch dimension map was properly constructed.
+  if (!verifyDimMap(lhsType, rhsType, batchDimMap))
+    return op->emitOpError("invalid batch dimension map");
+
+  // Verify 'accType' and 'resType' shape.
+  return verifyOutputShape(op, lhsMap, rhsMap, accMap, lhsType, rhsType,
+                           accType, resType, contractingDimMap, batchDimMap);
 }
 
 LogicalResult ContractionOp::verify() {
@@ -1174,52 +1281,20 @@ LogicalResult ContractionOp::verify() {
   // Verify that each index map has 'numIterators' inputs, no symbols, and
   // that the number of map outputs equals the rank of its associated
   // vector operand.
+  SmallVector<AffineMap, 4> indexingMaps = getIndexingMapsArray();
   unsigned numIterators = getIteratorTypes().getValue().size();
-  for (const auto &it : llvm::enumerate(getIndexingMapsArray())) {
-    auto index = it.index();
-    auto map = it.value();
-    if (map.getNumSymbols() != 0)
-      return emitOpError("expected indexing map ")
-             << index << " to have no symbols";
-    auto vectorType = llvm::dyn_cast<VectorType>(getOperand(index).getType());
-    unsigned rank = vectorType ? vectorType.getShape().size() : 0;
-    // Verify that the map has the right number of inputs, outputs, and indices.
-    // This also correctly accounts for (..) -> () for rank-0 results.
-    if (map.getNumDims() != numIterators)
-      return emitOpError("expected indexing map ")
-             << index << " to have " << numIterators << " number of inputs";
-    if (map.getNumResults() != rank)
-      return emitOpError("expected indexing map ")
-             << index << " to have " << rank << " number of outputs";
+  for (auto [index, map] : llvm::enumerate(indexingMaps)) {
+    if (failed(verifyIndexingMapRank(
+            *this, index, map, getOperand(index).getType(), numIterators)))
+      return failure();
     if (!map.isProjectedPermutation())
       return emitOpError("expected indexing map ")
              << index << " to be a projected permutation of its inputs";
   }
 
-  // TODO: For better code re-use, unify this with linalg.contract.
-  auto dimIdx = getOneSidedReductionDim(this);
-  if (dimIdx.has_value())
-    return emitOpError("reduction dim at index ")
-           << dimIdx.value() << " must appear in both LHS and RHS";
-
-  auto contractingDimMap = getContractingDimMap();
-  auto batchDimMap = getBatchDimMap();
-
-  // Verify at least one contracting dimension pair was specified.
-  if (contractingDimMap.empty())
-    return emitOpError("expected at least one contracting dimension pair");
-
-  // Verify contracting dimension map was properly constructed.
-  if (!verifyDimMap(lhsType, rhsType, contractingDimMap))
-    return emitOpError("invalid contracting dimension map");
-
-  // Verify batch dimension map was properly constructed.
-  if (!verifyDimMap(lhsType, rhsType, batchDimMap))
-    return emitOpError("invalid batch dimension map");
-
-  // Verify 'accType' and 'resType' shape.
-  if (failed(verifyOutputShape(*this, lhsType, rhsType, accType, resType,
-                               contractingDimMap, batchDimMap)))
+  if (failed(verifyContractionDims(*this, indexingMaps[0], indexingMaps[1],
+                                   indexingMaps[2], lhsType, rhsType, accType,
+                                   resType, getIteratorTypesArray())))
     return failure();
 
   if (!getKindAttr()) {
@@ -1279,43 +1354,16 @@ SmallVector<StringRef> ContractionOp::getTraitAttrNames() {
                                 getFastmathAttrName()};
 }
 
-static int64_t getResultIndex(AffineMap map, AffineExpr targetExpr) {
-  for (int64_t i = 0, e = map.getNumResults(); i < e; ++i)
-    if (targetExpr == map.getResult(i))
-      return i;
-  return -1;
-}
-
-// For every contraction `dim` for which:
-//  * the corresponding iteratory type matches `targetIteratorType`,
-// returns a pair: <lhsIdx, rhsIdx>, where:
-//  * {lhs|rhs}Idx is the index of `dim` in the (result of) indexing map for
-//    {lhs|rhs}.
-static std::vector<std::pair<int64_t, int64_t>>
-getDimPairForIterTy(ContractionOp *contract, IteratorType targetIteratorType) {
-  SmallVector<AffineMap, 4> indexingMaps(contract->getIndexingMapsArray());
-  ArrayAttr iteratorTypes = contract->getIteratorTypes();
-  std::vector<std::pair<int64_t, int64_t>> dimMap;
-  for (const auto &it : llvm::enumerate(iteratorTypes)) {
-    auto iteratorType = llvm::cast<IteratorTypeAttr>(it.value()).getValue();
-    if (iteratorType != targetIteratorType)
-      continue;
-    // Search lhs/rhs map results for 'targetExpr'.
-    auto targetExpr = getAffineDimExpr(it.index(), contract->getContext());
-    int64_t lhsDim = getResultIndex(indexingMaps[0], targetExpr);
-    int64_t rhsDim = getResultIndex(indexingMaps[1], targetExpr);
-    if (lhsDim >= 0 && rhsDim >= 0)
-      dimMap.emplace_back(lhsDim, rhsDim);
-  }
-  return dimMap;
-}
-
 std::vector<std::pair<int64_t, int64_t>> ContractionOp::getContractingDimMap() {
-  return getDimPairForIterTy(this, IteratorType::reduction);
+  SmallVector<AffineMap, 4> indexingMaps = getIndexingMapsArray();
+  return getDimPairForIterTy(indexingMaps[0], indexingMaps[1],
+                             getIteratorTypesArray(), IteratorType::reduction);
 }
 
 std::vector<std::pair<int64_t, int64_t>> ContractionOp::getBatchDimMap() {
-  return getDimPairForIterTy(this, IteratorType::parallel);
+  SmallVector<AffineMap, 4> indexingMaps = getIndexingMapsArray();
+  return getDimPairForIterTy(indexingMaps[0], indexingMaps[1],
+                             getIteratorTypesArray(), IteratorType::parallel);
 }
 
 void ContractionOp::getIterationBounds(
@@ -1420,6 +1468,213 @@ void ContractionOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                                 MLIRContext *context) {
   results.add<CanonicalizeContractAdd<arith::AddIOp>,
               CanonicalizeContractAdd<arith::AddFOp>>(context);
+}
+
+//===----------------------------------------------------------------------===//
+// ScaledContractionOp
+//===----------------------------------------------------------------------===//
+
+void ScaledContractionOp::build(OpBuilder &builder, OperationState &result,
+                                Value lhs, Value lhsScale, Value rhs,
+                                Value rhsScale, Value acc,
+                                ArrayRef<ArrayRef<AffineExpr>> indexingExprs,
+                                ArrayRef<IteratorType> iteratorTypes) {
+  build(builder, result, acc.getType(), lhs, lhsScale, rhs, rhsScale, acc,
+        builder.getAffineMapArrayAttr(
+            AffineMap::inferFromExprList(indexingExprs, builder.getContext())),
+        builder.getArrayAttr(llvm::map_to_vector(
+            iteratorTypes, [&](IteratorType t) -> mlir::Attribute {
+              return IteratorTypeAttr::get(builder.getContext(), t);
+            })));
+}
+
+ParseResult ScaledContractionOp::parse(OpAsmParser &parser,
+                                       OperationState &result) {
+  SmallVector<OpAsmParser::UnresolvedOperand, 5> operandsInfo;
+  SmallVector<Type, 5> types;
+  Type resultType;
+  SMLoc loc = parser.getCurrentLocation();
+  SMLoc operandsLoc;
+  DictionaryAttr dictAttr;
+  if (parser.parseAttribute(dictAttr) ||
+      parser.getCurrentLocation(&operandsLoc) ||
+      parser.parseOperandList(operandsInfo))
+    return failure();
+  if (operandsInfo.size() != 5)
+    return parser.emitError(operandsLoc, "expected 5 operands");
+  SMLoc typesLoc;
+  if (parser.parseOptionalAttrDict(result.attributes) ||
+      parser.getCurrentLocation(&typesLoc) || parser.parseColonTypeList(types))
+    return failure();
+  if (types.size() != 4)
+    return parser.emitError(typesLoc, "expected 4 operand types");
+  if (parser.parseKeywordType("into", resultType))
+    return failure();
+  types.push_back(resultType);
+  if (parser.resolveOperands(operandsInfo, types, typesLoc, result.operands))
+    return failure();
+  result.addTypes(resultType);
+  result.attributes.append(dictAttr.getValue().begin(),
+                           dictAttr.getValue().end());
+  return convertParsedIteratorTypes(parser, loc, result,
+                                    getIteratorTypesAttrName(result.name));
+}
+
+void ScaledContractionOp::print(OpAsmPrinter &p) {
+  SmallVector<StringRef> attrNames = getTraitAttrNames();
+  NamedAttrList allAttrs;
+  DictionaryAttr dictAttr = getPrintedTraitAttrs(
+      getOperation(), attrNames, getIteratorTypesAttrName(), allAttrs, nullptr);
+  p << " " << dictAttr << " ";
+  p.printOperands(getOperands());
+  p.printOptionalAttrDict(allAttrs.getAttrs(), attrNames);
+  p << " : " << getLhs().getType() << ", " << getLhsScale().getType() << ", "
+    << getRhs().getType() << ", " << getRhsScale().getType() << " into "
+    << getResultType();
+}
+
+std::optional<std::pair<unsigned, int64_t>>
+ScaledContractionOp::getScaleDimAndBlockSize(AffineExpr expr) {
+  if (auto dimExpr = dyn_cast<AffineDimExpr>(expr))
+    return std::make_pair(dimExpr.getPosition(), int64_t{1});
+  auto binExpr = dyn_cast<AffineBinaryOpExpr>(expr);
+  if (!binExpr || binExpr.getKind() != AffineExprKind::FloorDiv)
+    return std::nullopt;
+  auto dimExpr = dyn_cast<AffineDimExpr>(binExpr.getLHS());
+  auto blockSize = dyn_cast<AffineConstantExpr>(binExpr.getRHS());
+  if (!dimExpr || !blockSize || blockSize.getValue() <= 0)
+    return std::nullopt;
+  return std::make_pair(dimExpr.getPosition(), blockSize.getValue());
+}
+
+LogicalResult ScaledContractionOp::verify() {
+  SmallVector<AffineMap, 4> indexingMaps = getIndexingMapsArray();
+  if (indexingMaps.size() != getNumOperands())
+    return emitOpError("expected an indexing map for each operand");
+
+  VectorType lhsType = getLhsType();
+  VectorType rhsType = getRhsType();
+  Type lhsElemType = lhsType.getElementType();
+  Type rhsElemType = rhsType.getElementType();
+  auto resElemType = cast<FloatType>(getElementTypeOrSelf(getResultType()));
+
+  // Verify element types.
+  for (Type elemType : {lhsElemType, rhsElemType}) {
+    if (!elemType.isIntOrFloat())
+      return emitOpError(
+          "expected lhs and rhs element types to be integer or floating-point");
+    if (isa<IntegerType>(elemType) && !elemType.isSignlessInteger())
+      return emitOpError("only supports signless integer types");
+    if (elemType.getIntOrFloatBitWidth() > resElemType.getWidth())
+      return emitOpError("expected lhs and rhs element type bitwidth to be no "
+                         "greater than result element type bitwidth");
+  }
+  auto isNarrowFloat = [](Type type) {
+    auto floatType = dyn_cast<FloatType>(type);
+    return floatType && floatType.getWidth() <= 8;
+  };
+  if (lhsElemType != rhsElemType &&
+      (!isNarrowFloat(lhsElemType) || !isNarrowFloat(rhsElemType)))
+    return emitOpError("expected lhs and rhs element types to be the same or "
+                       "floating-point types with bitwidth of at most 8");
+  for (OpOperand *scale : getScaleOperands()) {
+    if (getElementTypeOrSelf(scale->get()).getIntOrFloatBitWidth() >
+        resElemType.getWidth())
+      return emitOpError("expected scale element type bitwidth to be no "
+                         "greater than result element type bitwidth");
+  }
+  for (Type type : getOperandTypes()) {
+    auto vectorType = dyn_cast<VectorType>(type);
+    if (vectorType && vectorType.isScalable())
+      return emitOpError("scalable vectors are not supported");
+  }
+
+  // Verify indexing maps of all operands. Maps of lhs, rhs and acc must be
+  // projected permutations.
+  unsigned numIterators = getIteratorTypes().size();
+  for (auto [index, map] : llvm::enumerate(indexingMaps)) {
+    if (failed(verifyIndexingMapRank(
+            *this, index, map, getOperand(index).getType(), numIterators)))
+      return failure();
+  }
+  for (OpOperand *operand :
+       {&getLhsMutable(), &getRhsMutable(), &getAccMutable()}) {
+    unsigned index = operand->getOperandNumber();
+    if (!indexingMaps[index].isProjectedPermutation())
+      return emitOpError("expected indexing map ")
+             << index << " to be a projected permutation of its inputs";
+  }
+
+  // Verify that parallel dims are exactly the dims present in the accumulator.
+  SmallVector<IteratorType> iteratorTypes = getIteratorTypesArray();
+  AffineMap accMap = getMatchingIndexingMap(&getAccMutable());
+  for (auto [dim, iteratorType] : llvm::enumerate(iteratorTypes)) {
+    bool isInAcc = accMap.isFunctionOfDim(dim);
+    if (iteratorType == IteratorType::parallel && !isInAcc)
+      return emitOpError("parallel dim at index ")
+             << dim << " must appear in the accumulator";
+    if (iteratorType == IteratorType::reduction && isInAcc)
+      return emitOpError("reduction dim at index ")
+             << dim << " must not appear in the accumulator";
+  }
+
+  if (failed(verifyContractionDims(
+          *this, getMatchingIndexingMap(&getLhsMutable()),
+          getMatchingIndexingMap(&getRhsMutable()), accMap, lhsType, rhsType,
+          getAccType(), getResultType(), iteratorTypes)))
+    return failure();
+
+  // Verify scaling schemes described by the scale indexing maps.
+  for (auto [data, scale] :
+       llvm::zip_equal(getDataOperands(), getScaleOperands())) {
+    AffineMap dataMap = getMatchingIndexingMap(data);
+    AffineMap scaleMap = getMatchingIndexingMap(scale);
+    ArrayRef<int64_t> dataShape = getShape(data);
+    ArrayRef<int64_t> scaleShape = getShape(scale);
+    unsigned scaleIndex = scale->getOperandNumber();
+    llvm::SmallBitVector seenDims(numIterators);
+    for (auto [pos, expr] : llvm::enumerate(scaleMap.getResults())) {
+      std::optional<std::pair<unsigned, int64_t>> dimAndBlockSize =
+          getScaleDimAndBlockSize(expr);
+      if (!dimAndBlockSize)
+        return emitOpError("expected indexing map ")
+               << scaleIndex << " results to be a dim or a dim floordiv a "
+               << "positive constant";
+      auto [dim, blockSize] = *dimAndBlockSize;
+      if (seenDims.test(dim))
+        return emitOpError("expected indexing map ")
+               << scaleIndex << " to use each dim at most once";
+      seenDims.set(dim);
+
+      std::optional<unsigned> dataPos =
+          dataMap.getResultPosition(getAffineDimExpr(dim, getContext()));
+      if (!dataPos)
+        return emitOpError("expected indexing map ")
+               << scaleIndex << " to only use dims of indexing map "
+               << data->getOperandNumber();
+
+      int64_t dataSize = dataShape[*dataPos];
+      int64_t scaleSize = scaleShape[pos];
+      if (blockSize == 1 && scaleSize != dataSize)
+        return emitOpError("expected scale operand ")
+               << scaleIndex << " dim " << pos << " to have size " << dataSize
+               << ", but got " << scaleSize;
+      if (blockSize > 1 && dataSize != blockSize * scaleSize &&
+          (scaleSize != 1 || dataSize > blockSize))
+        return emitOpError("expected scale operand ")
+               << scaleIndex << " dim " << pos << " of size " << scaleSize
+               << " to scale full blocks of size " << blockSize
+               << " of input dim of size " << dataSize;
+    }
+  }
+
+  // Delayed calling of IndexingMapOpInterface::verifyImpl.
+  return cast<IndexingMapOpInterface>(this->getOperation()).verifyImpl();
+}
+
+SmallVector<StringRef> ScaledContractionOp::getTraitAttrNames() {
+  return SmallVector<StringRef>{getIndexingMapsAttrName(),
+                                getIteratorTypesAttrName()};
 }
 
 // Returns `true` if `index` is either within [0, maxIndex) or equal to

@@ -43,6 +43,10 @@ def AnyVectorOfNonI0Elem : VectorOfAnyRankOf<[
 def AnyVectorOfNonZeroRankNonI0Elem : VectorOfNonZeroRankOf<[
     Type<CPred<"!$_self.isInteger(0)">, "non-zero-bitwidth type">]>;
 
+// Floating-point scalar or vector of rank >= 1 with floating-point elements.
+def AnyFloatOrVectorOfNonZeroRankFloat :
+    AnyTypeOf<[AnyFloat, VectorOfNonZeroRankOf<[AnyFloat]>]>;
+
 // TODO: Add an attribute to specify a different algebra with operators other
 // than the current set: {*, +}.
 def Vector_ContractionOp :
@@ -260,6 +264,180 @@ def Vector_ContractionOp :
   }];
 
   let hasCanonicalizer = 1;
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+def Vector_ScaledContractionOp :
+  Vector_Op<"scaled_contract", [
+      IndexingMapOpInterface,
+      Pure,
+      AllTypesMatch<["acc", "result"]>
+    ]>,
+    Arguments<(ins AnyVectorOfNonZeroRankNonI0Elem:$lhs,
+               AnyFloatOrVectorOfNonZeroRankFloat:$lhs_scale,
+               AnyVectorOfNonZeroRankNonI0Elem:$rhs,
+               AnyFloatOrVectorOfNonZeroRankFloat:$rhs_scale,
+               AnyFloatOrVectorOfNonZeroRankFloat:$acc,
+               AffineMapArrayAttr:$indexing_maps,
+               Vector_IteratorTypeArrayAttr:$iterator_types)>,
+    Results<(outs AnyFloatOrVectorOfNonZeroRankFloat:$result)> {
+  let summary = "vector scaled contraction operation";
+  let description = [{
+    Extends the semantics of `vector.contract` with scale operands for the lhs
+    and rhs inputs. Computes the sum of products of the scaled lhs and rhs
+    elements along contracting dimension pairs, adds this intermediate result
+    to the accumulator argument, and returns a result of the same type as the
+    accumulator.
+
+    The semantics of contracting inputs `A` and `B` with scales `scale_A` and
+    `scale_B` on top of `C` to produce output `D` is given by:
+
+      `D[H] = (SUM_{(I ∪ J) \ H} (A[I] * scale_A[I]) * (B[J] * scale_B[J])) + C[H]`
+
+    The `lhs`, `rhs` and `acc` operands together with their indexing maps and
+    the iterator types follow the `vector.contract` semantics. In addition,
+    parallel dimensions are exactly the dimensions present in the accumulator.
+    The combining kind is always `add`.
+
+    The accumulator and result element type must be floating-point. The lhs
+    and rhs element types must be either the same type, or floating-point types
+    with bitwidth of at most 8, e.g., `f8E5M2` and `f8E4M3FN`. The scale
+    element types must be floating-point. The bitwidth of the input and scale
+    element types must be no greater than the result element type bitwidth.
+    Integer types must be signless and are interpreted as signed.
+
+    Each scale indexing map describes the scaling scheme of the corresponding
+    input. Scale indexing maps may only use dimensions present in the indexing
+    map of the corresponding input. A dimension absent from the scale indexing
+    map indicates that a single scale value is reused along that dimension.
+    The following scaling schemes are supported:
+
+    | Scale map result | Scheme    | Scale dim size                          |
+    | ---------------- | --------- | --------------------------------------- |
+    | none             | tensor    | scalar scale                            |
+    | `d`              | dimension | `size(d)`                               |
+    | `d floordiv B`   | block     | `size(d) / B`, or 1 if `size(d) <= B`   |
+
+    Block scaling uses one scale value for every `B` contiguous elements along
+    `d`. The size of `d` must either be a multiple of `B`, or be no greater
+    than `B` in which case a single scale value is used for the whole
+    dimension. Partial blocks are not supported.
+
+    Inputs and scales are promoted to a precision of at least the result
+    element type. Similarly to the OCP Microscaling dot product definition, the
+    order of operations and the internal precision are implementation-defined.
+
+    Example:
+
+    ```mlir
+    // MXFP8 matmul with transposed B and block scaling along the contracting
+    // dimension with block size 32.
+    #scaled_contraction_accesses = [
+      affine_map<(m, n, k) -> (m, k)>,
+      affine_map<(m, n, k) -> (m, k floordiv 32)>,
+      affine_map<(m, n, k) -> (n, k)>,
+      affine_map<(m, n, k) -> (n, k floordiv 32)>,
+      affine_map<(m, n, k) -> (m, n)>
+    ]
+    #scaled_contraction_trait = {
+      indexing_maps = #scaled_contraction_accesses,
+      iterator_types = ["parallel", "parallel", "reduction"]
+    }
+    %0 = vector.scaled_contract #scaled_contraction_trait
+      %a, %scale_a, %b, %scale_b, %c
+      : vector<16x64xf8E5M2>, vector<16x2xf8E8M0FNU>,
+        vector<32x64xf8E4M3FN>, vector<32x2xf8E8M0FNU> into vector<16x32xf32>
+
+    // NVFP4 matmul with block size 16 and expanded block dimension `kb`.
+    #scaled_contraction_accesses = [
+      affine_map<(m, n, ko, kb) -> (m, ko, kb)>,
+      affine_map<(m, n, ko, kb) -> (m, ko)>,
+      affine_map<(m, n, ko, kb) -> (n, ko, kb)>,
+      affine_map<(m, n, ko, kb) -> (n, ko)>,
+      affine_map<(m, n, ko, kb) -> (m, n)>
+    ]
+    #scaled_contraction_trait = {
+      indexing_maps = #scaled_contraction_accesses,
+      iterator_types = ["parallel", "parallel", "reduction", "reduction"]
+    }
+    %1 = vector.scaled_contract #scaled_contraction_trait
+      %a, %scale_a, %b, %scale_b, %c
+      : vector<16x4x16xf4E2M1FN>, vector<16x4xf8E4M3FN>,
+        vector<32x4x16xf4E2M1FN>, vector<32x4xf8E4M3FN> into vector<16x32xf32>
+
+    // Dot product with a single scale per input (tensor scaling).
+    #scaled_contraction_accesses = [
+      affine_map<(k) -> (k)>,
+      affine_map<(k) -> ()>,
+      affine_map<(k) -> (k)>,
+      affine_map<(k) -> ()>,
+      affine_map<(k) -> ()>
+    ]
+    #scaled_contraction_trait = {
+      indexing_maps = #scaled_contraction_accesses,
+      iterator_types = ["reduction"]
+    }
+    %2 = vector.scaled_contract #scaled_contraction_trait
+      %a, %scale_a, %b, %scale_b, %c
+      : vector<32xi8>, f32, vector<32xi8>, f32 into f32
+    ```
+  }];
+  let builders = [
+    OpBuilder<(ins "Value":$lhs, "Value":$lhsScale, "Value":$rhs,
+      "Value":$rhsScale, "Value":$acc,
+      "ArrayRef<ArrayRef<AffineExpr>>":$indexingExprs,
+      "ArrayRef<IteratorType>":$iteratorTypes)>
+  ];
+  let extraClassDeclaration = [{
+    VectorType getLhsType() {
+      return ::llvm::cast<VectorType>(getLhs().getType());
+    }
+    VectorType getRhsType() {
+      return ::llvm::cast<VectorType>(getRhs().getType());
+    }
+    Type getAccType() { return getAcc().getType(); }
+    Type getResultType() { return getResult().getType(); }
+    SmallVector<StringRef> getTraitAttrNames();
+
+    /// Returns the iteration dim and the block size of a scale indexing map
+    /// result `d` or `d floordiv B`. Dimension scaling `d` has block size 1.
+    /// Returns std::nullopt for other expressions.
+    static std::optional<std::pair<unsigned, int64_t>>
+    getScaleDimAndBlockSize(AffineExpr expr);
+
+    /// Returns the data operands of the inputs: `{lhs, rhs}`.
+    SmallVector<OpOperand *> getDataOperands() {
+      return {&getLhsMutable(), &getRhsMutable()};
+    }
+
+    /// Returns the scale operands of the inputs: `{lhs_scale, rhs_scale}`.
+    SmallVector<OpOperand *> getScaleOperands() {
+      return {&getLhsScaleMutable(), &getRhsScaleMutable()};
+    }
+
+    llvm::SmallVector<::mlir::AffineMap, 4> getIndexingMapsArray() {
+      return llvm::to_vector<4>(getIndexingMaps().getAsValueRange<::mlir::AffineMapAttr>());
+    }
+
+    SmallVector<IteratorType> getIteratorTypesArray() {
+      auto range =
+          getIteratorTypes()
+              .template getAsValueRange<IteratorTypeAttr, IteratorType>();
+      return {range.begin(), range.end()};
+    }
+
+    //===------------------------------------------------------------------===//
+    // IndexingMapOpInterface interface methods implementation.
+    //===------------------------------------------------------------------===//
+    ArrayRef<int64_t> getShape(OpOperand * opOperand) {
+      Type t = opOperand->get().getType();
+      if (auto vt = dyn_cast<VectorType>(t))
+        return vt.getShape();
+      return {};
+    }
+  }];
+
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
 }

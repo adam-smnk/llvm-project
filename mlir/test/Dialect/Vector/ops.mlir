@@ -465,6 +465,148 @@ func.func @contraction_matmul_scalable(%A: vector<8x1xf32>, %B: vector<1x[32]xf3
   return %res : vector<8x[32]xf32>
 }
 
+#scaled_contraction_mx_accesses = [
+  affine_map<(m, n, k) -> (m, k)>,
+  affine_map<(m, n, k) -> (m, k floordiv 32)>,
+  affine_map<(m, n, k) -> (n, k)>,
+  affine_map<(m, n, k) -> (n, k floordiv 32)>,
+  affine_map<(m, n, k) -> (m, n)>
+]
+#scaled_contraction_mx_trait = {
+  indexing_maps = #scaled_contraction_mx_accesses,
+  iterator_types = ["parallel", "parallel", "reduction"]
+}
+// CHECK-LABEL: @scaled_contract_block_scaling
+func.func @scaled_contract_block_scaling(
+    %A: vector<16x64xf8E5M2>, %sA: vector<16x2xf8E8M0FNU>,
+    %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+    %C: vector<16x8xf32>) -> vector<16x8xf32> {
+  // CHECK: %[[X:.*]] = vector.scaled_contract {indexing_maps = [#{{.*}}, #{{.*}}, #{{.*}}, #{{.*}}, #{{.*}}], iterator_types = ["parallel", "parallel", "reduction"]} %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : vector<16x64xf8E5M2>, vector<16x2xf8E8M0FNU>, vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<16x8xf32>
+  %0 = vector.scaled_contract #scaled_contraction_mx_trait %A, %sA, %B, %sB, %C
+    : vector<16x64xf8E5M2>, vector<16x2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<16x8xf32>
+  // CHECK: return %[[X]] : vector<16x8xf32>
+  return %0 : vector<16x8xf32>
+}
+
+// CHECK-LABEL: @scaled_contract_extra_attrs
+func.func @scaled_contract_extra_attrs(
+    %A: vector<16x64xf8E5M2>, %sA: vector<16x2xf8E8M0FNU>,
+    %B: vector<8x64xf8E4M3FN>, %sB: vector<8x2xf8E8M0FNU>,
+    %C: vector<16x8xf32>) -> vector<16x8xf32> {
+  // CHECK: vector.scaled_contract {indexing_maps = [#{{.*}}, #{{.*}}, #{{.*}}, #{{.*}}, #{{.*}}], iterator_types = ["parallel", "parallel", "reduction"]} %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} {first_attr = 1 : i32, second_attr = "string"} : vector<16x64xf8E5M2>, vector<16x2xf8E8M0FNU>, vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<16x8xf32>
+  %0 = vector.scaled_contract #scaled_contraction_mx_trait %A, %sA, %B, %sB, %C
+    {first_attr = 1 : i32, second_attr = "string"}
+    : vector<16x64xf8E5M2>, vector<16x2xf8E8M0FNU>,
+      vector<8x64xf8E4M3FN>, vector<8x2xf8E8M0FNU> into vector<16x8xf32>
+  return %0 : vector<16x8xf32>
+}
+
+// CHECK-LABEL: @scaled_contract_single_block
+func.func @scaled_contract_single_block(
+    %A: vector<16x24xf8E5M2>, %sA: vector<16x1xf8E8M0FNU>,
+    %B: vector<8x24xf8E5M2>, %sB: vector<8x1xf8E8M0FNU>,
+    %C: vector<16x8xf32>) -> vector<16x8xf32> {
+  // CHECK: vector.scaled_contract {{.*}} : vector<16x24xf8E5M2>, vector<16x1xf8E8M0FNU>, vector<8x24xf8E5M2>, vector<8x1xf8E8M0FNU> into vector<16x8xf32>
+  %0 = vector.scaled_contract #scaled_contraction_mx_trait %A, %sA, %B, %sB, %C
+    : vector<16x24xf8E5M2>, vector<16x1xf8E8M0FNU>,
+      vector<8x24xf8E5M2>, vector<8x1xf8E8M0FNU> into vector<16x8xf32>
+  return %0 : vector<16x8xf32>
+}
+
+// CHECK-LABEL: @scaled_contract_expanded_block
+func.func @scaled_contract_expanded_block(
+    %A: vector<16x4x16xf4E2M1FN>, %sA: vector<16x4xf8E4M3FN>,
+    %B: vector<8x4x16xf4E2M1FN>, %sB: vector<8x4xf8E4M3FN>,
+    %C: vector<16x8xf32>) -> vector<16x8xf32> {
+  // CHECK: vector.scaled_contract {{.*}} iterator_types = ["parallel", "parallel", "reduction", "reduction"]} {{.*}} : vector<16x4x16xf4E2M1FN>, vector<16x4xf8E4M3FN>, vector<8x4x16xf4E2M1FN>, vector<8x4xf8E4M3FN> into vector<16x8xf32>
+  %0 = vector.scaled_contract {
+    indexing_maps = [affine_map<(m, n, ko, kb) -> (m, ko, kb)>,
+                     affine_map<(m, n, ko, kb) -> (m, ko)>,
+                     affine_map<(m, n, ko, kb) -> (n, ko, kb)>,
+                     affine_map<(m, n, ko, kb) -> (n, ko)>,
+                     affine_map<(m, n, ko, kb) -> (m, n)>],
+    iterator_types = ["parallel", "parallel", "reduction", "reduction"]}
+    %A, %sA, %B, %sB, %C
+    : vector<16x4x16xf4E2M1FN>, vector<16x4xf8E4M3FN>,
+      vector<8x4x16xf4E2M1FN>, vector<8x4xf8E4M3FN> into vector<16x8xf32>
+  return %0 : vector<16x8xf32>
+}
+
+// CHECK-LABEL: @scaled_contract_transposed_scale
+func.func @scaled_contract_transposed_scale(
+    %A: vector<16x64xf8E4M3FN>, %sA: vector<16x2xf8E8M0FNU>,
+    %B: vector<64x8xf8E4M3FN>, %sB: vector<2x8xf8E8M0FNU>,
+    %C: vector<16x8xbf16>) -> vector<16x8xbf16> {
+  // CHECK: vector.scaled_contract {{.*}} : vector<16x64xf8E4M3FN>, vector<16x2xf8E8M0FNU>, vector<64x8xf8E4M3FN>, vector<2x8xf8E8M0FNU> into vector<16x8xbf16>
+  %0 = vector.scaled_contract {
+    indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                     affine_map<(m, n, k) -> (m, k floordiv 32)>,
+                     affine_map<(m, n, k) -> (k, n)>,
+                     affine_map<(m, n, k) -> (k floordiv 32, n)>,
+                     affine_map<(m, n, k) -> (m, n)>],
+    iterator_types = ["parallel", "parallel", "reduction"]}
+    %A, %sA, %B, %sB, %C
+    : vector<16x64xf8E4M3FN>, vector<16x2xf8E8M0FNU>,
+      vector<64x8xf8E4M3FN>, vector<2x8xf8E8M0FNU> into vector<16x8xbf16>
+  return %0 : vector<16x8xbf16>
+}
+
+// CHECK-LABEL: @scaled_contract_dim_scaling
+func.func @scaled_contract_dim_scaling(
+    %A: vector<16x64xi8>, %sA: vector<16xf32>,
+    %B: vector<8x64xi8>, %sB: vector<8xf32>,
+    %C: vector<16x8xf32>) -> vector<16x8xf32> {
+  // CHECK: vector.scaled_contract {{.*}} : vector<16x64xi8>, vector<16xf32>, vector<8x64xi8>, vector<8xf32> into vector<16x8xf32>
+  %0 = vector.scaled_contract {
+    indexing_maps = [affine_map<(m, n, k) -> (m, k)>,
+                     affine_map<(m, n, k) -> (m)>,
+                     affine_map<(m, n, k) -> (n, k)>,
+                     affine_map<(m, n, k) -> (n)>,
+                     affine_map<(m, n, k) -> (m, n)>],
+    iterator_types = ["parallel", "parallel", "reduction"]}
+    %A, %sA, %B, %sB, %C
+    : vector<16x64xi8>, vector<16xf32>,
+      vector<8x64xi8>, vector<8xf32> into vector<16x8xf32>
+  return %0 : vector<16x8xf32>
+}
+
+// CHECK-LABEL: @scaled_contract_tensor_scaling_to_scalar
+func.func @scaled_contract_tensor_scaling_to_scalar(
+    %A: vector<32xf8E4M3FN>, %sA: f16, %B: vector<32xf8E4M3FN>, %sB: f16,
+    %C: f32) -> f32 {
+  // CHECK: vector.scaled_contract {{.*}} iterator_types = ["reduction"]} {{.*}} : vector<32xf8E4M3FN>, f16, vector<32xf8E4M3FN>, f16 into f32
+  %0 = vector.scaled_contract {
+    indexing_maps = [affine_map<(k) -> (k)>,
+                     affine_map<(k) -> ()>,
+                     affine_map<(k) -> (k)>,
+                     affine_map<(k) -> ()>,
+                     affine_map<(k) -> ()>],
+    iterator_types = ["reduction"]}
+    %A, %sA, %B, %sB, %C
+    : vector<32xf8E4M3FN>, f16, vector<32xf8E4M3FN>, f16 into f32
+  return %0 : f32
+}
+
+// CHECK-LABEL: @scaled_contract_batch
+func.func @scaled_contract_batch(
+    %A: vector<2x16x64xf4E2M1FN>, %sA: vector<2x16x4xf8E8M0FNU>,
+    %B: vector<2x8x64xf4E2M1FN>, %sB: vector<2x8x4xf8E8M0FNU>,
+    %C: vector<2x16x8xf32>) -> vector<2x16x8xf32> {
+  // CHECK: vector.scaled_contract {{.*}} iterator_types = ["parallel", "parallel", "parallel", "reduction"]} {{.*}} : vector<2x16x64xf4E2M1FN>, vector<2x16x4xf8E8M0FNU>, vector<2x8x64xf4E2M1FN>, vector<2x8x4xf8E8M0FNU> into vector<2x16x8xf32>
+  %0 = vector.scaled_contract {
+    indexing_maps = [affine_map<(b, m, n, k) -> (b, m, k)>,
+                     affine_map<(b, m, n, k) -> (b, m, k floordiv 16)>,
+                     affine_map<(b, m, n, k) -> (b, n, k)>,
+                     affine_map<(b, m, n, k) -> (b, n, k floordiv 16)>,
+                     affine_map<(b, m, n, k) -> (b, m, n)>],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]}
+    %A, %sA, %B, %sB, %C
+    : vector<2x16x64xf4E2M1FN>, vector<2x16x4xf8E8M0FNU>,
+      vector<2x8x64xf4E2M1FN>, vector<2x8x4xf8E8M0FNU> into vector<2x16x8xf32>
+  return %0 : vector<2x16x8xf32>
+}
+
 // CHECK-LABEL: @create_vector_mask
 func.func @create_vector_mask() {
   // CHECK:      %[[C2:.*]] = arith.constant 2 : index

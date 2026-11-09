@@ -213,6 +213,22 @@ def ApplyLowerContractionPatternsOp : Op<Transform_Dialect,
   }];
 }
 
+def ApplyDecomposeScaledContractPatternsOp : Op<Transform_Dialect,
+    "apply_patterns.vector.decompose_scaled_contract",
+    [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let description = [{
+    Indicates that vector.scaled_contract operations should be decomposed into
+    a contraction and standard vector operations applying the scales.
+
+    This populates the patterns from
+    `populateVectorScaledContractDecompositionPatterns`, i.e.:
+    * `DecomposeScaledContractByBlocks`
+    * `DecomposeScaledContractByPrescaling`
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 def ApplyLowerCreateMaskPatternsOp : Op<Transform_Dialect,
     "apply_patterns.vector.lower_create_mask",
     [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
